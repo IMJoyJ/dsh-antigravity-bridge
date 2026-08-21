@@ -1,0 +1,756 @@
+// Copyright 2026 Google LLC
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+edition = "2024";
+
+package antigravity.localharness;
+
+import "google/antigravity/proto/content.proto";
+
+enum LifecycleHook {
+  LIFECYCLE_HOOK_UNSPECIFIED = 0;
+  LIFECYCLE_HOOK_ON_SESSION_START = 1;
+  LIFECYCLE_HOOK_ON_SESSION_END = 2;
+  LIFECYCLE_HOOK_PRE_TURN = 3;
+  LIFECYCLE_HOOK_POST_TURN = 4;
+  LIFECYCLE_HOOK_PRE_TOOL = 5;
+  LIFECYCLE_HOOK_POST_TOOL = 6;
+  LIFECYCLE_HOOK_ON_TOOL_ERROR = 7;
+}
+enum AgentBehavior {
+  AGENT_BEHAVIOR_UNSPECIFIED = 0;
+  AGENT_BEHAVIOR_AUTONOMOUS = 1;
+  AGENT_BEHAVIOR_INTERACTIVE = 2;
+}
+enum ModelType {
+  MODEL_TYPE_UNSPECIFIED = 0;
+  MODEL_TYPE_TEXT = 1;
+  MODEL_TYPE_IMAGE = 2;
+}
+enum Modality {
+  MODALITY_UNSPECIFIED = 0;
+  TEXT = 1;
+  IMAGE = 2;
+  VIDEO = 3;
+  AUDIO = 4;
+  DOCUMENT = 5;
+}
+enum PolicyDecision {
+  POLICY_DECISION_UNSPECIFIED = 0;
+  POLICY_DECISION_ALLOW = 1;
+  POLICY_DECISION_DENY = 2;
+  POLICY_DECISION_ASK_USER = 3;
+}
+enum PolicyEvaluationOutcome {
+  POLICY_EVALUATION_OUTCOME_UNSPECIFIED = 0;
+  POLICY_EVALUATION_OUTCOME_ALLOW = 1;
+  POLICY_EVALUATION_OUTCOME_DENY = 2;
+  POLICY_EVALUATION_OUTCOME_NO_MATCH = 3;
+}
+message InputConfig {
+  string storage_directory = 1;
+  uint32 port = 2;
+  string bind_address = 3 [default = "localhost"];
+  .antigravity.localharness.ClientInfo client_info = 4;
+  map<string, string> env = 5;
+}
+message InitializeConversationEvent {
+  .antigravity.localharness.HarnessConfig config = 1;
+}
+message ClientInfo {
+  string language = 1;
+  string version = 2;
+  string language_version = 3;
+  string os = 4;
+  string os_version = 5;
+}
+message HarnessConfig {
+  enum SessionContinuationMode {
+    SESSION_CONTINUATION_MODE_UNSPECIFIED = 0;
+    RESUME = 1;
+    CREATE_OR_RESUME = 2;
+    CREATE_ONLY = 3;
+  }
+  string cascade_id = 1;
+  .antigravity.localharness.HarnessConfig.SessionContinuationMode
+      session_continuation_mode = 19;
+  .antigravity.localharness.SystemInstructions system_instructions = 4;
+  repeated .antigravity.localharness.Tool tools = 5;
+  .antigravity.localharness.HarnessSideTools harness_side_tools = 6;
+  uint32 compaction_threshold = 7;
+  repeated .antigravity.localharness.Workspace workspaces = 8;
+  repeated string skills_paths = 9;
+  string finish_tool_schema_json = 10;
+  bytes initial_trajectory = 11;
+  string app_data_dir = 12;
+  repeated .antigravity.localharness.McpServerConfig mcp_servers = 14;
+  repeated .antigravity.localharness.ModelConfig models = 15;
+  repeated .antigravity.localharness.LifecycleHook enabled_hooks = 16;
+  repeated .antigravity.localharness.CustomAgent custom_subagents = 17;
+  .antigravity.localharness.ToolOutputTruncation tool_output_truncation = 18;
+  .antigravity.localharness.RetryConfig retry_config = 20;
+  .antigravity.localharness.PolicyConfig policy_config = 21;
+  .antigravity.localharness.AgentBehavior agent_behavior = 22;
+  .antigravity.localharness.BudgetConfig budget_config = 23;
+  extensions 1000 to 1999;
+  extensions 2000 to max;
+}
+message ModelAPIRetryConfig {
+  uint32 max_retries = 1;
+  uint32 initial_sleep_duration_ms = 2;
+  double exponential_multiplier = 3;
+  double jitter_range = 4;
+}
+message ModelOutputRetryConfig {
+  uint32 max_retries = 1;
+}
+message RetryConfig {
+  .antigravity.localharness.ModelAPIRetryConfig api_retry = 1;
+  .antigravity.localharness.ModelOutputRetryConfig model_output_retry = 2;
+}
+message Workspace {
+  oneof workspace_type {
+    .antigravity.localharness.FilesystemWorkspace filesystem_workspace = 1;
+  }
+}
+message FilesystemWorkspace {
+  string directory = 1;
+}
+message GeminiModelOptions {
+  string thinking_level = 1;
+  string service_tier = 2;
+}
+message GeminiAPIEndpoint {
+  string base_url = 1;
+  map<string, string> http_headers = 2;
+  string api_key = 3;
+  .antigravity.localharness.GeminiModelOptions options = 4;
+}
+message VertexEndpoint {
+  string base_url = 1;
+  map<string, string> http_headers = 2;
+  string project = 3;
+  string location = 4;
+  .antigravity.localharness.GeminiModelOptions options = 5;
+  string api_key = 6;
+}
+message ModelConfig {
+  oneof endpoint {
+    .antigravity.localharness.GeminiAPIEndpoint gemini_api_endpoint = 3;
+    .antigravity.localharness.VertexEndpoint vertex_endpoint = 4;
+    .antigravity.localharness.GemmaEndpoint gemma_endpoint = 6;
+    .antigravity.localharness.CustomEndpoint custom_endpoint = 7;
+  }
+  string name = 1;
+  repeated .antigravity.localharness.ModelType types = 2;
+}
+message GemmaEndpoint {
+  string base_url = 1;
+}
+message CustomEndpoint {
+  string backend_type = 1;
+  string config_json = 2;
+}
+message SystemInstructions {
+  oneof type {
+    .antigravity.localharness.CustomSystemInstructions custom = 1;
+    .antigravity.localharness.AppendedSystemInstructions appended = 2;
+  }
+}
+message CustomSystemInstructions {
+  message Part {
+    oneof part {
+      string text = 1;
+      .antigravity.localharness.CustomSystemInstructions
+          .SystemInstructionTemplate template = 2;
+    }
+  }
+  message SystemInstructionTemplate {
+    message Arg {
+      string name = 1;
+      string value = 2;
+    }
+    string template_name = 1;
+    repeated .antigravity.localharness.CustomSystemInstructions
+        .SystemInstructionTemplate.Arg args = 2;
+  }
+  repeated .antigravity.localharness.CustomSystemInstructions.Part part = 1;
+}
+message AppendedSystemInstructions {
+  message Section {
+    string title = 1;
+    string content = 2;
+  }
+  string custom_identity = 1;
+  repeated .antigravity.localharness.AppendedSystemInstructions.Section
+      appended_sections = 2;
+}
+message Tool {
+  string name = 1;
+  string description = 2;
+  string parameters_json_schema = 3;
+  string response_json_schema = 4;
+  bool defer_loading = 5;
+  extensions 1000 to 1999;
+  extensions 2000 to max;
+}
+message HarnessSideTools {
+  .antigravity.localharness.FindToolConfig find = 1;
+  .antigravity.localharness.RunCommandToolConfig run_command = 2;
+  .antigravity.localharness.SubagentsConfig subagents = 3;
+  .antigravity.localharness.UserQuestionsConfig user_questions = 4;
+  .antigravity.localharness.FileEditToolConfig file_edit = 5;
+  .antigravity.localharness.ViewFileToolConfig view_file = 6;
+  .antigravity.localharness.WriteToFileToolConfig write_to_file = 7;
+  .antigravity.localharness.GrepSearchToolConfig grep_search = 8;
+  .antigravity.localharness.ListDirToolConfig list_dir = 9;
+  .antigravity.localharness.PermissionsConfig permissions = 10;
+  .antigravity.localharness.GenerateImageToolConfig generate_image = 11;
+  .antigravity.localharness.SearchWebToolConfig search_web = 12;
+  .antigravity.localharness.ReadUrlContentToolConfig read_url_content = 14;
+  .antigravity.localharness.ToolSearchConfig tool_search_config = 15;
+  extensions 1000 to 1999;
+  extensions 2000 to max;
+}
+message FindToolConfig {
+  bool enabled = 1;
+  extensions 1000 to 1999;
+  extensions 2000 to max;
+}
+message RunCommandToolConfig {
+  bool enabled = 1;
+  uint32 max_timeout_ms = 2;
+}
+message SubagentsConfig {
+  bool enabled = 1;
+  int32 max_nesting_depth = 2 [default = 1];
+  repeated string allowed_subagents = 3;
+}
+message UserQuestionsConfig {
+  bool enabled = 1;
+}
+message FileEditToolConfig {
+  bool enabled = 1;
+}
+message ViewFileToolConfig {
+  bool enabled = 1;
+}
+message WriteToFileToolConfig {
+  bool enabled = 1;
+}
+message GrepSearchToolConfig {
+  bool enabled = 1;
+  extensions 1000 to 1999;
+  extensions 2000 to max;
+}
+message ListDirToolConfig {
+  bool enabled = 1;
+}
+message GenerateImageToolConfig {
+  bool enabled = 1;
+}
+message SearchWebToolConfig {
+  bool enabled = 1;
+}
+message ReadUrlContentToolConfig {
+  bool enabled = 1;
+}
+message ToolSearchConfig {
+  bool enabled = 1;
+  extensions 1000 to max;
+}
+message PermissionsConfig {
+  bool enforce_workspace_validation = 1;
+}
+message OutputConfig {
+  int32 port = 1;
+  string api_key = 2;
+}
+message OutputEvent {
+  oneof event {
+    .antigravity.localharness.StepUpdate step_update = 10;
+    .antigravity.localharness.TrajectoryStateUpdate trajectory_state_update =
+        11;
+    .antigravity.localharness.ToolCall tool_call = 12;
+    .antigravity.localharness.InitializeConversationResponse
+        initialize_conversation_response = 13;
+    .antigravity.localharness.CallHookRequest call_hook_request = 14;
+    bool session_end_response = 15;
+    .antigravity.localharness.PolicyDecisionRequest policy_decision_request =
+        16;
+    .antigravity.localharness.UsageUpdate usage_update = 17;
+  }
+  int64 seq_num = 1;
+  int64 timestamp_micros = 2;
+}
+message InitializeConversationResponse {
+  string cascade_id = 1;
+  repeated .antigravity.localharness.StepUpdate history = 2;
+  .antigravity.localharness.UsageMetadata cumulative_usage = 3;
+  repeated .antigravity.localharness.TrajectoryUsageEntry trajectory_usage = 4;
+}
+message StepUpdate {
+  enum State {
+    STATE_UNSPECIFIED = 0;
+    STATE_ACTIVE = 1;
+    STATE_DONE = 2;
+    STATE_WAITING_FOR_USER = 3;
+    STATE_ERROR = 4;
+  }
+  enum Source {
+    SOURCE_UNSPECIFIED = 0;
+    SOURCE_SYSTEM = 1;
+    SOURCE_USER = 2;
+    SOURCE_MODEL = 3;
+  }
+  enum Target {
+    TARGET_UNSPECIFIED = 0;
+    TARGET_USER = 1;
+    TARGET_MODEL = 2;
+    TARGET_ENVIRONMENT = 3;
+  }
+  string cascade_id = 1;
+  string trajectory_id = 2;
+  string parent_trajectory_id = 40;
+  uint32 step_index = 3;
+  .antigravity.localharness.StepUpdate.State state = 4;
+  .antigravity.localharness.StepUpdate.Source source = 5;
+  .antigravity.localharness.StepUpdate.Target target = 6;
+  string error_message = 7;
+  string thinking = 8;
+  string text_delta = 9;
+  string thinking_delta = 10;
+  string text = 20;
+  .antigravity.localharness.ActionListDirectory list_directory = 21;
+  .antigravity.localharness.ActionFindFile find_file = 22;
+  .antigravity.localharness.ActionSearchDirectory search_directory = 23;
+  .antigravity.localharness.ActionViewFile view_file = 24;
+  .antigravity.localharness.ActionCreateFile create_file = 25;
+  .antigravity.localharness.ActionEditFile edit_file = 26;
+  .antigravity.localharness.ActionRunCommand run_command = 27;
+  .antigravity.localharness.ActionCompaction compaction = 28;
+  .antigravity.localharness.ActionInvokeSubagent invoke_subagent = 29;
+  .antigravity.localharness.ActionGenerateImage generate_image = 30;
+  .antigravity.localharness.ActionFinish finish = 31;
+  .antigravity.localharness.ActionError error = 32;
+  .antigravity.localharness.ActionMcpTool mcp_tool = 33;
+  .antigravity.localharness.ActionSearchWeb search_web = 34;
+  .antigravity.localharness.ActionReadUrlContent read_url_content = 35;
+  .antigravity.localharness.ActionCustomTool custom_tool = 36;
+  string request_text = 50;
+  .antigravity.localharness.ToolConfirmationRequest tool_confirmation_request =
+      51;
+  .antigravity.localharness.UserQuestionsRequest questions_request = 52;
+}
+message ActionGenerateImage {
+  string prompt = 1;
+  repeated string image_paths = 2;
+  string image_name = 3;
+  string aspect_ratio = 4;
+  string output_path = 5;
+}
+message ActionSearchWeb {
+  string query = 1;
+  string domain = 2;
+  string summary = 3;
+}
+message ActionReadUrlContent {
+  string url = 1;
+  string title = 2;
+  string summary = 3;
+  string content_path = 4;
+}
+message ActionFinish {
+  string output_string = 1;
+}
+message ActionError {
+  string error_message = 1;
+  uint32 http_code = 2;
+}
+message ActionListDirectory {
+  message Result {
+    oneof info {
+      bool is_directory = 2;
+      uint64 file_size = 3;
+    }
+    string name = 1;
+  }
+  string directory_path = 1;
+  repeated .antigravity.localharness.ActionListDirectory.Result results = 2;
+}
+message ActionFindFile {
+  string directory_path = 1;
+  string query = 2;
+  string output = 3;
+}
+message ActionSearchDirectory {
+  string directory_path = 1;
+  string query = 2;
+  int32 num_results = 3;
+}
+message ActionViewFile {
+  string file_path = 1;
+  uint32 start_line = 2;
+  uint32 end_line = 3;
+}
+message ActionCreateFile {
+  string file_path = 1;
+  string contents = 2;
+}
+message ActionEditFile {
+  message DiffLine {
+    enum LineAction {
+      LINE_ACTION_UNSPECIFIED = 0;
+      LINE_ACTION_INSERT = 1;
+      LINE_ACTION_DELETE = 2;
+      LINE_ACTION_NONE = 3;
+    }
+    string text = 1;
+    .antigravity.localharness.ActionEditFile.DiffLine.LineAction action = 2;
+  }
+  message DiffBlock {
+    int32 start_line = 1;
+    int32 end_line = 2;
+    repeated .antigravity.localharness.ActionEditFile.DiffLine lines = 3;
+  }
+  string file_path = 1;
+  repeated .antigravity.localharness.ActionEditFile.DiffBlock diff_block = 2;
+}
+message ActionRunCommand {
+  string command_line = 1;
+  string working_dir = 2;
+  int32 exit_code = 4;
+  string combined_output = 5;
+}
+message ActionCompaction {}
+message ActionInvokeSubagent {}
+message ToolConfirmationRequest {}
+message UserQuestionsRequest {
+  repeated .antigravity.localharness.UserQuestion questions = 1;
+}
+message UserQuestion {
+  oneof question_type {
+    .antigravity.localharness.MultipleChoice multiple_choice = 1;
+  }
+}
+message MultipleChoice {
+  string question = 1;
+  repeated string choices = 2;
+  bool is_multi_select = 3;
+}
+message InputEvent {
+  oneof event {
+    .antigravity.localharness.UserInput user_input = 7;
+    .antigravity.localharness.ToolConfirmation tool_confirmation = 2;
+    .antigravity.localharness.ToolResponse tool_response = 3;
+    .antigravity.localharness.UserQuestionsResponse question_response = 4;
+    bool halt_request = 5;
+    string automated_trigger = 6;
+    .antigravity.localharness.CallHookResponse call_hook_response = 8;
+    bool session_end_request = 9;
+    .antigravity.localharness.PolicyDecisionResponse policy_decision_response =
+        10;
+  }
+}
+message UserInput {
+  message Media {
+    string mime_type = 1;
+    string description = 2;
+    bytes data = 3;
+  }
+  message SlashCommand {
+    string name = 1;
+  }
+  message Part {
+    oneof part {
+      string text = 1;
+      .antigravity.localharness.UserInput.Media media = 2;
+      .antigravity.localharness.UserInput.SlashCommand slash_command = 3;
+    }
+  }
+  repeated .antigravity.localharness.UserInput.Part parts = 1;
+}
+message ToolConfirmation {
+  string trajectory_id = 1;
+  uint32 step_index = 2;
+  bool accepted = 3;
+}
+message TrajectoryStateUpdate {
+  enum State {
+    STATE_UNSPECIFIED = 0;
+    STATE_RUNNING = 1;
+    STATE_FULLY_IDLE = 2;
+    STATE_CANCELLED = 3;
+    STATE_WAITING_FOR_TASKS = 4;
+  }
+  enum StopReason {
+    STOP_REASON_UNSPECIFIED = 0;
+    STOP_REASON_MAX_MODEL_CALLS_EXCEEDED = 1;
+    STOP_REASON_MAX_TOOL_CALLS_EXCEEDED = 2;
+    STOP_REASON_MAX_INPUT_TOKENS_EXCEEDED = 3;
+    STOP_REASON_MAX_OUTPUT_TOKENS_EXCEEDED = 4;
+    STOP_REASON_MAX_TOTAL_TOKENS_EXCEEDED = 5;
+    STOP_REASON_QUOTA_EXHAUSTED = 6;
+  }
+  string trajectory_id = 2;
+  string parent_trajectory_id = 6;
+  int32 depth = 7;
+  .antigravity.localharness.TrajectoryStateUpdate.State state = 3;
+  string error = 4;
+  .antigravity.localharness.TrajectoryStateUpdate.StopReason stop_reason = 5;
+}
+message TrajectoryUsageEntry {
+  string trajectory_id = 1;
+  .antigravity.localharness.UsageMetadata usage = 2;
+}
+message UsageUpdate {
+  repeated .antigravity.localharness.TrajectoryUsageEntry agents = 1;
+  .antigravity.localharness.UsageMetadata total = 2;
+}
+message ToolCall {
+  string id = 1;
+  string name = 2;
+  string arguments_json = 3;
+  .genai.Struct arguments = 4;
+  extensions 1000 to 1999;
+  extensions 2000 to max;
+}
+message ToolResponse {
+  string id = 1;
+  string response_json = 2;
+  repeated .antigravity.localharness.Media supplemental_media = 3;
+  .genai.Struct response = 4;
+  string error_message = 5;
+  extensions 1000 to 1999;
+  extensions 2000 to max;
+}
+message UserQuestionsResponse {
+  message QuestionsResponse {
+    repeated .antigravity.localharness.UserQuestionAnswer answers = 1;
+  }
+  oneof result {
+    bool cancelled = 3;
+    .antigravity.localharness.UserQuestionsResponse.QuestionsResponse response =
+        4;
+  }
+  string trajectory_id = 1;
+  uint32 step_index = 2;
+}
+message UserQuestionAnswer {
+  oneof answer {
+    bool unanswered = 1;
+    .antigravity.localharness.MultipleChoiceAnswer multiple_choice_answer = 2;
+  }
+}
+message MultipleChoiceAnswer {
+  repeated int32 selected_choice_indices = 1;
+  string freeform_response = 2;
+}
+message Media {
+  string mime_type = 1;
+  string description = 2;
+  bytes data = 3;
+}
+message ModalityTokenCount {
+  .antigravity.localharness.Modality modality = 1;
+  uint64 token_count = 2;
+}
+message UsageMetadata {
+  uint64 prompt_token_count = 1;
+  uint64 cached_content_token_count = 5;
+  uint64 candidates_token_count = 2;
+  uint64 thoughts_token_count = 4;
+  uint64 total_token_count = 3;
+  string service_tier = 6;
+  repeated .antigravity.localharness.ModalityTokenCount prompt_tokens_details =
+      7;
+  repeated .antigravity.localharness.ModalityTokenCount cache_tokens_details =
+      8;
+  repeated .antigravity.localharness.ModalityTokenCount
+      candidates_tokens_details = 9;
+  repeated .antigravity.localharness.ModalityTokenCount
+      tool_use_prompt_tokens_details = 10;
+}
+message McpServerConfig {
+  enum AuthProviderType {
+    AUTH_PROVIDER_TYPE_UNSPECIFIED = 0;
+    AUTH_PROVIDER_TYPE_GOOGLE_CREDENTIALS = 1;
+  }
+  oneof transport {
+    .antigravity.localharness.McpStdioTransport stdio = 2;
+    .antigravity.localharness.McpHttpTransport http = 3;
+  }
+  string name = 1;
+  repeated string enabled_tools = 4;
+  repeated string disabled_tools = 5;
+  .antigravity.localharness.McpServerConfig.AuthProviderType
+      auth_provider_type = 6;
+  int32 timeout_seconds = 7;
+}
+message McpStdioTransport {
+  string command = 1;
+  repeated string args = 2;
+  map<string, string> env = 3;
+}
+message McpHttpTransport {
+  string url = 1;
+  map<string, string> headers = 2;
+}
+message ActionMcpTool {
+  string server_name = 1;
+  string tool_name = 2;
+  string arguments_json = 3;
+}
+message ActionCustomTool {
+  .antigravity.localharness.ToolCall tool_call = 1;
+  .antigravity.localharness.ToolResponse tool_response = 2;
+}
+message CallHookRequest {
+  oneof args {
+    .antigravity.localharness.PreTurnArgs pre_turn_args = 3;
+    .antigravity.localharness.PostTurnArgs post_turn_args = 4;
+    .antigravity.localharness.PreToolArgs pre_tool_args = 5;
+    .antigravity.localharness.PostToolArgs post_tool_args = 6;
+    .antigravity.localharness.OnToolErrorArgs on_tool_error_args = 8;
+  }
+  string request_id = 1;
+  string name = 2;
+  .antigravity.localharness.LifecycleHook type = 7;
+}
+message CallHookResponse {
+  oneof result {
+    .antigravity.localharness.PreTurnResult pre_turn_result = 2;
+    .antigravity.localharness.PreToolResult pre_tool_result = 3;
+    .antigravity.localharness.EmptyResult empty_result = 4;
+    string error_message = 5;
+    .antigravity.localharness.OnToolErrorResult on_tool_error_result = 6;
+  }
+  string request_id = 1;
+}
+message PreToolArgs {
+  string tool_name = 1;
+  string arguments_json = 2;
+  string server_name = 3;
+  string call_id = 4;
+}
+message PostToolArgs {
+  string tool_name = 1;
+  string result = 2;
+  string error = 3;
+  string server_name = 5;
+  string call_id = 6;
+}
+message OnToolErrorArgs {
+  string tool_name = 1;
+  string error_message = 2;
+  string server_name = 4;
+  string call_id = 5;
+}
+message PreTurnArgs {
+  .antigravity.localharness.UserInput user_input = 1;
+}
+message PostTurnArgs {
+  string response_text = 1;
+}
+message EmptyResult {}
+message OnToolErrorResult {
+  string custom_error_message = 1;
+}
+message PreToolResult {
+  enum Decision {
+    DECISION_UNSPECIFIED = 0;
+    ALLOW = 1;
+    DENY = 2;
+  }
+  .antigravity.localharness.PreToolResult.Decision decision = 1;
+  string reason = 2;
+  string modified_arguments_json = 3;
+}
+message PreTurnResult {
+  enum Decision {
+    DECISION_UNSPECIFIED = 0;
+    ALLOW = 1;
+    DENY = 2;
+  }
+  .antigravity.localharness.PreTurnResult.Decision decision = 1;
+  string reason = 2;
+}
+message SubagentSkillsConfig {
+  message InheritConfig {
+    repeated string extra_skills_paths = 1;
+  }
+  message NoneConfig {}
+  message OverrideConfig {
+    repeated string skills_paths = 1;
+  }
+  oneof mode {
+    .antigravity.localharness.SubagentSkillsConfig.InheritConfig
+        inherit_config = 1;
+    .antigravity.localharness.SubagentSkillsConfig.NoneConfig none_config = 2;
+    .antigravity.localharness.SubagentSkillsConfig.OverrideConfig
+        override_config = 3;
+  }
+}
+message CustomAgent {
+  string name = 1;
+  string description = 2;
+  .antigravity.localharness.SystemInstructions system_instructions = 3;
+  .antigravity.localharness.HarnessSideTools harness_side_tools = 4;
+  repeated .antigravity.localharness.Tool tools = 5;
+  .antigravity.localharness.SubagentSkillsConfig skills_config = 6;
+  .antigravity.localharness.AgentBehavior agent_behavior = 7;
+}
+message ToolOutputTruncation {
+  message TruncateStrategy {
+    int32 max_tokens = 1;
+  }
+  message ErrorStrategy {
+    int32 max_tokens = 1;
+    string error_message = 2;
+  }
+  oneof strategy {
+    .antigravity.localharness.ToolOutputTruncation.TruncateStrategy truncate =
+        1;
+    .antigravity.localharness.ToolOutputTruncation.ErrorStrategy error = 2;
+  }
+}
+message PolicyConfig {
+  repeated .antigravity.localharness.PolicyRule rules = 1;
+}
+message PolicyRule {
+  string tool = 1;
+  string server_name = 2;
+  string name = 3;
+  .antigravity.localharness.PolicyDecision decision = 4;
+  string deny_reason = 5;
+  bool is_dynamic = 6;
+  string rule_id = 7;
+}
+message PolicyDecisionRequest {
+  string request_id = 1;
+  string rule_id = 2;
+  .antigravity.localharness.PreToolArgs tool_args = 3;
+}
+message PolicyDecisionResponse {
+  string request_id = 1;
+  .antigravity.localharness.PolicyEvaluationOutcome outcome = 2;
+  string deny_reason = 3;
+}
+message BudgetConfig {
+  int32 max_model_calls = 1;
+  int32 max_tool_calls = 2;
+  int64 max_input_tokens = 3;
+  int64 max_output_tokens = 4;
+  int64 max_total_tokens = 5;
+}

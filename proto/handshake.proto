@@ -1,0 +1,24 @@
+syntax = "proto3";
+
+package antigravity.localharness;
+
+message ClientInfo {
+  string language = 1;
+  string version = 2;
+  string language_version = 3;
+  string os = 4;
+  string os_version = 5;
+}
+
+message InputConfig {
+  string storage_directory = 1;
+  uint32 port = 2;
+  string bind_address = 3;
+  ClientInfo client_info = 4;
+  map<string, string> env = 5;
+}
+
+message OutputConfig {
+  uint32 port = 1;
+  string api_key = 2;
+}
