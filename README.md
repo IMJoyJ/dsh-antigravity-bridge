@@ -129,8 +129,7 @@ $plugins:
 
 ```
 dsh-antigravity-bridge/
-├── bin/
-│   └── localharness.exe          # 备选 localharness 二进制
+├── bin/                          # 备选 localharness 放置目录（README.md）
 ├── docs/                         # 深度协议与逆向参考文档
 │   ├── README.md                 # 文档入口
 │   ├── implementation.md         # 架构与实现演进记录
