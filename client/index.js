@@ -6,7 +6,7 @@
 // hands it a `require` resolving only against the frozen seed table plus the
 // graph edges declared in `package.json`'s `dsh.client.inject`.
 window.__ModuleLoader__.load({
-  id: "dsh-antigravity-bridge",
+  id: "@dsh-external/dsh-antigravity-bridge",
   factory: (require) => {
     var module = { exports: {} };
     var exports = module.exports;
