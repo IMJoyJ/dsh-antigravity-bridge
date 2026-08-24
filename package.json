@@ -1,6 +1,6 @@
 {
   "name": "@dsh-external/dsh-antigravity-bridge",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "description": "Native TypeScript Antigravity (Gemini Agent) Bridge for DeepSeek Harness",
   "type": "module",
   "main": "./lib/index.mjs",
@@ -34,6 +34,7 @@
   "homepage": "https://github.com/IMJoyJ/dsh-antigravity-bridge",
   "dependencies": {
     "@bufbuild/protobuf": "^2.14.0",
+    "@deepseek-ai/dsh-settings": "0.1.1-rc.1",
     "@deepseek-ai/schemastery": "^3.18.1-rc.4",
     "protobufjs": "^7.4.0",
     "ws": "^8.18.0"

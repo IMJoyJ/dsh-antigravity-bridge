@@ -279,6 +279,12 @@ interface StartCascadeOptions {
   /** Folder URI (file:///...) to bind the cascade to directly, without a
    *  registered project. Backed by StartCascade's top-level workspaceUris. */
   workspaceUri?: string;
+  /** true (default): trajectory source JETBOX so the cascade shows in the IDE
+   *  sidebar (agy ≥ 2.9.1 routes CASCADE_CLIENT to externalSummaries; the hub
+   *  REJECTS UNSPECIFIED/omitted source on StartCascade — JETBOX is the only
+   *  accepted source the frontend classifies as local); false: keep
+   *  CASCADE_CLIENT (external, hidden from sidebar). */
+  sidebarVisible?: boolean;
 }
 declare class HubClient {
   private info;
@@ -333,6 +339,10 @@ interface AntigravityConfig {
   watchMaxMs?: number;
   /** Inline character budget for tool-result report bodies; longer reports are persisted and referenced by path. */
   inlineCharBudget?: number;
+  /** true (default): bridge-created cascades appear in the IDE sidebar (agy ≥ 2.9.1 requires trajectory source UNSPECIFIED). */
+  sidebarVisible?: boolean;
+  /** Grace window (ms) for YOLO auto-approval before an awaiting-approval notice is pushed (default 3000). */
+  approvalGraceMs?: number;
 }
 declare const Config: Schema<AntigravityConfig>;
 declare module '@deepseek-ai/cordis' {
@@ -390,6 +400,8 @@ declare class AntigravityService extends Service {
   private settlementWaiters;
   private disposed;
   constructor(ctx: Context, config: AntigravityConfig);
+  /** Hot-swap live config (settings namespace onChange). All fields are read at use-time. */
+  updateConfig(config: AntigravityConfig): void;
   /** Proactively push a settlement/approval notice to DSH session (steering / followup) with idempotency. */
   notifySettlementToDsh(run: HubRun, callerAgent?: any): void;
   /** Push a resumption notice when user approvals in IDE are granted. */

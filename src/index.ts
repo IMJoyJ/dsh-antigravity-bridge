@@ -20,6 +20,7 @@ import {
 } from './models.js';
 import { HubClient } from './hub/client.js';
 import { readCascadeTranscript, PendingToolApproval } from './hub/transcript.js';
+import { settingsNamespace, installSettingsSection } from '@deepseek-ai/dsh-settings';
 
 export interface AntigravityConfig {
   backend?: 'hub' | 'localharness';
@@ -34,6 +35,10 @@ export interface AntigravityConfig {
   watchMaxMs?: number;
   /** Inline character budget for tool-result report bodies; longer reports are persisted and referenced by path. */
   inlineCharBudget?: number;
+  /** true (default): bridge-created cascades appear in the IDE sidebar (agy ≥ 2.9.1 requires trajectory source UNSPECIFIED). */
+  sidebarVisible?: boolean;
+  /** Grace window (ms) for YOLO auto-approval before an awaiting-approval notice is pushed (default 3000). */
+  approvalGraceMs?: number;
 }
 
 export const Config: Schema<AntigravityConfig> = Schema.object({
@@ -50,6 +55,8 @@ export const Config: Schema<AntigravityConfig> = Schema.object({
   pollTimeoutMs: Schema.number().default(300_000).description('Settlement-wait timeout in ms (sync delegate replies and check_run wait=true)'),
   watchMaxMs: Schema.number().default(43_200_000).description('Background lifecycle watcher absolute cap in ms (default 12h); settlement watching never expires before this'),
   inlineCharBudget: Schema.number().default(4_000).description('Inline character budget for report bodies; longer reports are persisted to a file and referenced by path (default 4000)'),
+  sidebarVisible: Schema.boolean().default(true).description('Show bridge-created cascades in the Antigravity IDE sidebar (agy >= 2.9.1 hides source=CASCADE_CLIENT sessions; uses JETBOX which the hub accepts and the frontend treats as local); false keeps them external/search-only'),
+  approvalGraceMs: Schema.number().default(3_000).description('Grace window in ms for IDE YOLO auto-approval before pushing an awaiting-approval notice (default 3000)'),
 });
 
 declare module '@deepseek-ai/cordis' {
@@ -209,6 +216,11 @@ export class AntigravityService extends Service {
       }
       this.settlementWaiters.clear();
     });
+  }
+
+  /** Hot-swap live config (settings namespace onChange). All fields are read at use-time. */
+  updateConfig(config: AntigravityConfig): void {
+    this.config = config;
   }
 
   /** Proactively push a settlement/approval notice to DSH session (steering / followup) with idempotency. */
@@ -656,8 +668,12 @@ export class AntigravityService extends Service {
       status = 'error';
     } else if (snap?.pendingApproval) {
       status = 'awaiting-approval';
-    } else if (snap?.isFinished || existingRun?.status === 'done') {
+    } else if (snap?.isFinished && snap.plannerContents.length > 0) {
+      // Strict done: a bare isFinished (e.g. setup CHECKPOINT with zero planner
+      // output) must not classify as done — that poisoned the registry before.
       status = 'done';
+    } else if (!snap && existingRun?.status === 'done') {
+      status = 'done'; // transcript unreadable: keep the last known terminal state
     } else if (snap?.engaged) {
       status = 'running';
     }
@@ -738,6 +754,38 @@ export class AntigravityService extends Service {
         // 2. Pending tool approval in IDE
         if (snap?.pendingApproval) {
           const isNewApproval = run.status !== 'awaiting-approval' || !run.approvalNotified;
+
+          if (isNewApproval) {
+            // YOLO grace window: the IDE auto-approves within a second or two.
+            // Re-poll briefly before spamming the caller with an approval notice;
+            // if the prompt clears on its own, treat it as never having blocked.
+            const graceMs = this.config.approvalGraceMs ?? 3_000;
+            const graceDeadline = Date.now() + graceMs;
+            let cleared = false;
+            while (Date.now() < graceDeadline && !this.disposed) {
+              await new Promise((r) => setTimeout(r, 500));
+              const reSnap = await readCascadeTranscript(brainDir, cascadeId, baseline);
+              if (reSnap?.error) {
+                run.status = 'error';
+                run.error = reSnap.error;
+                this.runs.set(cascadeId, run);
+                await this.landReport(run);
+                this.notifySettlementToDsh(run);
+                this.settleWaiters(cascadeId, { status: 'error', content: AntigravityService.fullReportText(run), error: reSnap.error, lastActiveAt: run.lastActiveAt });
+                return;
+              }
+              if (!reSnap?.pendingApproval) {
+                cleared = true;
+                break;
+              }
+            }
+            if (cleared) {
+              run.lastActiveAt = (await readCascadeTranscript(brainDir, cascadeId, baseline))?.lastActiveAt ?? run.lastActiveAt;
+              this.runs.set(cascadeId, run);
+              continue; // auto-approved: resume the normal loop as running
+            }
+          }
+
           run.status = 'awaiting-approval';
           run.pendingTool = snap.pendingApproval;
           this.runs.set(cascadeId, run);
@@ -745,7 +793,7 @@ export class AntigravityService extends Service {
           if (isNewApproval) {
             run.approvalNotified = true;
             run.resumedNotified = false;
-            // Proactively notify caller of approval requirement immediately
+            // Proactively notify caller of approval requirement (after grace)
             this.notifySettlementToDsh(run);
             this.settleWaiters(cascadeId, { status: 'awaiting-approval', content: run.content ?? '', pendingTool: snap.pendingApproval, lastActiveAt: run.lastActiveAt });
           }
@@ -905,7 +953,13 @@ export class AntigravityService extends Service {
         throw new Error(`Model "${model || this.config.defaultModel}" not found on hub; call antigravity_list_models for valid ids.`);
       }
       const cascadeId = crypto.randomUUID();
-      await client.startCascade({ cascadeId, requestedModel: resolved, projectId: proj, workspaceUri });
+      await client.startCascade({
+        cascadeId,
+        requestedModel: resolved,
+        projectId: proj,
+        workspaceUri,
+        sidebarVisible: this.config.sidebarVisible !== false,
+      });
       conversationId = cascadeId;
       baselineStepIndex = -1;
     }
@@ -956,7 +1010,18 @@ export class AntigravityService extends Service {
     while (Date.now() < probeDeadline) {
       await new Promise((r) => setTimeout(r, 250));
       const snap = await readCascadeTranscript(brainDir, conversationId, baselineStepIndex);
-      if (snap && (snap.isFinished || snap.error || snap.pendingApproval)) {
+      // A CHECKPOINT right after USER_INPUT sets isFinished with zero planner
+      // output — that is turn setup, not settlement. Done requires real content.
+      const terminalDone = !!(snap?.isFinished && snap.plannerContents.length > 0);
+      // YOLO grace inside the probe too: a pending approval that clears within
+      // ~1.5s is auto-approved by the IDE and should not settle as a request.
+      let pendingConfirmed = !!snap?.pendingApproval;
+      if (pendingConfirmed) {
+        await new Promise((r) => setTimeout(r, 1500));
+        const reSnap = await readCascadeTranscript(brainDir, conversationId, baselineStepIndex);
+        if (!reSnap?.pendingApproval) continue; // auto-approved; keep probing
+      }
+      if (snap && (terminalDone || snap.error || pendingConfirmed)) {
         const status = snap.error ? 'error' : snap.pendingApproval ? 'awaiting-approval' : 'done';
         const run = this.runs.get(conversationId) ?? {
           cascadeId: conversationId,
@@ -1343,6 +1408,22 @@ export default class AntigravityBridgePlugin {
 
   constructor(ctx: Context, config: AntigravityConfig) {
     ctx.plugin(AntigravityService, config);
+
+    // Hot-reloadable settings namespace (Web Settings UI); config fields are
+    // read at use-time, so updating the service reference is sufficient.
+    try {
+      let current = () => config;
+      installSettingsSection(ctx, settingsNamespace('antigravity-bridge'), Config, config, {
+        setSource: (source: () => AntigravityConfig) => {
+          current = source;
+        },
+        onChange: () => {
+          (ctx.get('antigravity') as AntigravityService | undefined)?.updateConfig(current());
+        },
+      });
+    } catch {
+      // dsh-settings unavailable — run on static composition config only.
+    }
 
     if ((ctx as any).systemPrompt?.register) {
       (ctx as any).systemPrompt.register({

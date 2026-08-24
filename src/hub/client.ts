@@ -11,6 +11,12 @@ export interface StartCascadeOptions {
   /** Folder URI (file:///...) to bind the cascade to directly, without a
    *  registered project. Backed by StartCascade's top-level workspaceUris. */
   workspaceUri?: string;
+  /** true (default): trajectory source JETBOX so the cascade shows in the IDE
+   *  sidebar (agy ≥ 2.9.1 routes CASCADE_CLIENT to externalSummaries; the hub
+   *  REJECTS UNSPECIFIED/omitted source on StartCascade — JETBOX is the only
+   *  accepted source the frontend classifies as local); false: keep
+   *  CASCADE_CLIENT (external, hidden from sidebar). */
+  sidebarVisible?: boolean;
 }
 
 export class HubClient {
@@ -42,7 +48,13 @@ export class HubClient {
   async startCascade(opts: StartCascadeOptions): Promise<unknown> {
     const body: Record<string, unknown> = {
       cascadeId: opts.cascadeId,
-      source: 'CORTEX_TRAJECTORY_SOURCE_CASCADE_CLIENT',
+      // agy ≥ 2.9.1 sidebar classifies by trajectory source: only UNSPECIFIED/JETBOX
+      // land in the local sidebar; CASCADE_CLIENT is routed to externalSummaries
+      // (search-only). The hub REJECTS UNSPECIFIED/omitted source on StartCascade,
+      // so JETBOX is the only accepted value the frontend treats as local.
+      source: opts.sidebarVisible === false
+        ? 'CORTEX_TRAJECTORY_SOURCE_CASCADE_CLIENT'
+        : 'CORTEX_TRAJECTORY_SOURCE_JETBOX',
       trajectoryType: 'CORTEX_TRAJECTORY_TYPE_CASCADE',
       requestedModel: opts.requestedModel,
       customAgentSpec: {
