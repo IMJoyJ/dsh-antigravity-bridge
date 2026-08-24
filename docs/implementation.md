@@ -1,6 +1,6 @@
 # bridge 实现与架构文档
 
-> 状态：**全功能成熟版本**（2026-08-21：包含 8 大工具矩阵 + 后台委托 + DSH 主动通知系统 + IDE 程序化审批 + 12h 长效生命周期守卫 + 消息注入队列与交付确认 + WaitForConversationFullyIdle 空闲完成检测）。
+> 状态：**全功能成熟版本**（2026-08-24 v0.2.0：8 大工具矩阵 + 后台委托 + DSH 主动通知系统 + IDE 程序化审批 + 12h 长效生命周期守卫 + 消息注入队列与交付确认；v0.2.0 起等待路径改为结算事件驱动，移除 WaitForConversationFullyIdle 假空闲依赖，新增报告落盘与内联预算）。
 > 设计背景见 [integration-paths.md](integration-paths.md)，协议细节见 [hub-protocol.md](hub-protocol.md) 与 [api-surface.md](api-surface.md)。
 
 ## 架构
@@ -105,11 +105,31 @@ src/
   - `pollTimeoutMs` 仅对同步阻塞等待生效；
   - 引入**空闲退避（idle backoff）**：在无新 step 产出时逐步延长检测间隔（最多 5s），大幅降低 CPU 与磁盘 I/O 占用。
 
-### 5. 服务端空闲检测 (WaitForConversationFullyIdle)
+### 5. 结算等待与完成判定（v0.2.0 重构：事件驱动）
 
-- **两阶段检测**：
-  - **阶段 1 (engagement guard)**：轮询 `readCascadeTranscript`，确保收到 USER_INPUT 后的首个 MODEL 步，防止执行器未接单时空闲检测立即返回；
-  - **阶段 2 (server-side waitForIdle)**：调用 `WaitForConversationFullyIdle`（带 `inactivityTimeoutSeconds` 与 `stabilizationDurationSeconds`），彻底解决 thinking 模型（如 `claude-opus-4-6-thinking`）中间停顿导致的过早收口。
+- **历史教训**：旧版同步等待（`waitCascadeDetailed`）把 `WaitForConversationFullyIdle`
+  的 `timed_out=false` 当作"已完成/可收口"信号，并在 transcript 出现任一 planner 文本时
+  即判 `done`。实测 hub 在执行器长静默、子 agent 干活、planner 思考停顿期间会报**假空闲**，
+  造成 `wait=true` 数秒即返回、中间叙述被当终稿两类事故（隔壁会话日志实证：wait=240 最快
+  0s 返回；多条 "I am waiting for..." 被推送为 ✅ 完成）。
+- **现行机制**：
+  - 每个活动 cascade 仅保留**一个轮询单点**——生命周期 watcher，纯 transcript 驱动；
+    终态谓词收紧为 `snap.isFinished && plannerContents.length > 0`（最终 PLANNER_RESPONSE
+    无 tool_calls 或 CHECKPOINT），中间叙述永不计为完成；
+  - `WaitForConversationFullyIdle` 已从等待路径与 watcher 中完全移除（详见
+    [api-surface.md](api-surface.md) 的实测语义警示）；
+  - 同步等待（delegate 阻塞 / check_run wait>0 / send_message wait / 队列 flush）改为
+    **结算事件驱动**：调用方驻留在 watcher 的状态迁移上（done/error/awaiting-approval
+    即刻唤醒），超时到期如实返回当前快照，不伪造状态。
+
+### 6. 报告落盘与内联预算（v0.2.0）
+
+- 超过 `inlineCharBudget`（默认 4000 字符）的报告正文先持久化：优先 DSH `ctx.spillStore`
+  seam（会话私有 artifact + retrievalHint），未挂载时写入 `<appDataDir>/dsh-reports/<cascadeId>/turn-N-<时间戳>.md`（`wx` + 0600）；
+- 工具结果只保留内联预览 + 全文路径（`contentTruncated` / `totalChars` / `reportPath` 字段），
+  完成与超时结算通知同样携带全文路径；
+- run 记录按 turn 累积各轮终稿（`priorContents`），baseline 重置后历史内容仍可通过落盘文件取回；
+- 通知幂等键改为 `status:turn<N>`（旧键含内容切片，跨轮易碰撞）。
 
 ## 联调验证记录
 
@@ -126,8 +146,9 @@ $plugins:
     backend: "hub"                          # 后端类型: "hub" (推荐) 或 "localharness"
     defaultModel: "gemini-3.7-flash-tiered" # 默认模型显示 ID
     projectId: "<默认 project uuid>"         # delegate 新建 cascade 的默认归属
-    pollTimeoutMs: 300000                   # 同步轮询超时时间 (ms, 默认 300s)
+    pollTimeoutMs: 300000                   # 结算等待超时 (ms, 默认 300s)
     watchMaxMs: 43200000                    # 后台生命周期监视器绝对上限 (ms, 默认 12h)
+    inlineCharBudget: 4000                  # 报告内联字符预算，超出落盘并引用路径 (默认 4000)
     # appDataDir: "C:/Users/User/.gemini/antigravity" # 自定义数据目录
     # hubAddress / hubCsrfToken             # 可选手工覆盖，跳过进程发现
     # binaryPath / protoDir                 # localharness 后端才需要
@@ -136,5 +157,5 @@ $plugins:
 ## 已知边界
 
 - **发现平台**：目前自动发现针对 Windows（`Get-CimInstance`/`Get-NetTCPConnection`）；如需 macOS/Linux 需扩展 discovery.ts 对应 ps/lsof 实现（或直接配置 `hubAddress` + `hubCsrfToken`）。
-- **流式方法**：`callServerStream` 暂未启用，当前通过高频/长轮询 transcript + waitForIdle 获取完整轨迹。
+- **流式方法**：`callServerStream` 暂未启用，当前通过 watcher 的 transcript 轮询获取完整轨迹。
 - **并发能力**：Hub 实例支持多个并发 Cascade，各自维护独立的 UUID 与后台生命周期。

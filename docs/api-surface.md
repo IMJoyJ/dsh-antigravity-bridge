@@ -244,11 +244,25 @@ SearchConversationsRequest  ->  SearchConversationsResponse
 WaitForConversationFullyIdleRequest  ->  WaitForConversationFullyIdleResponse
 ```
 
-**请求**
+**请求**（字段号来自二进制描述符逆向；`fromJson` 同时接受 camelCase）
 
 | 字段号 | 字段名 | 类型 | 说明 |
 |--------|--------|------|------|
 | 1 | `conversation_id` | `string` | 会话 ID |
+| 2 | `inactivity_timeout_seconds` | `int32` | 等待窗口上限（秒）；超窗返回 `timed_out=true` |
+| 3 | `stabilization_duration_seconds` | `int32` | 判定"稳定空闲"所需的连续无活动时长（秒） |
+| 4 | `return_on_executor_error` | `bool` | 执行器出错时是否提前返回 |
+
+> ⚠️ **实测语义警示（2026-08-24）**：hub 的"活动"判定基于模型级事件流。执行器长静默步骤、
+> 子 agent 干活、planner 思考停顿期间，即使级联仍在运行，该 RPC 也可能在 stabilization
+> 窗口后立即返回 `timed_out=false`（假空闲）。**不能把它当作完成信号**——终态判定必须以
+> transcript 的 `isFinished`/`ERROR_MESSAGE` 为准。本插件已停止将该 RPC 用于等待与完成判定。
+
+**响应**
+
+| 字段号 | 字段名 | 类型 | 说明 |
+|--------|--------|------|------|
+| 1 | `timed_out` | `bool` | true = 等待窗口内未达到空闲 |
 
 ### CancelCascadeInvocation / ForceStopCascadeTree
 

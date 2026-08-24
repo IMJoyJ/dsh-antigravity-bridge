@@ -131,10 +131,12 @@ export function parseTranscript(lines: string[], baselineStepIndex = -1): Parsed
       const errObj = step.error_message as
         | { error?: { short_error?: string; user_error_message?: string } }
         | undefined;
+      // Keep a raw snippet in the fallback: an opaque "unknown agent error" hides
+      // diagnostic fields this parser has not mapped yet.
       result.error =
         errObj?.error?.short_error ??
         errObj?.error?.user_error_message ??
-        'unknown agent error';
+        `unknown agent error (raw: ${JSON.stringify(step).slice(0, 300)})`;
       return result;
     }
 

@@ -19,10 +19,7 @@ import {
   DEFAULT_MODEL_ID,
 } from './models.js';
 import { HubClient } from './hub/client.js';
-import { pollTranscript, readCascadeTranscript, TranscriptSnapshot, PendingToolApproval } from './hub/transcript.js';
-
-/** Server-side idle stabilization window for WaitForConversationFullyIdle. */
-const IDLE_STABILIZATION_SECONDS = 10;
+import { readCascadeTranscript, PendingToolApproval } from './hub/transcript.js';
 
 export interface AntigravityConfig {
   backend?: 'hub' | 'localharness';
@@ -35,6 +32,8 @@ export interface AntigravityConfig {
   hubCsrfToken?: string;
   pollTimeoutMs?: number;
   watchMaxMs?: number;
+  /** Inline character budget for tool-result report bodies; longer reports are persisted and referenced by path. */
+  inlineCharBudget?: number;
 }
 
 export const Config: Schema<AntigravityConfig> = Schema.object({
@@ -48,8 +47,9 @@ export const Config: Schema<AntigravityConfig> = Schema.object({
   projectId: Schema.string().description('Default Antigravity project id for new conversations'),
   hubAddress: Schema.string().description('Override hub address (e.g. 127.0.0.1:7778); skips discovery when both overrides are set'),
   hubCsrfToken: Schema.string().description('Override hub CSRF token'),
-  pollTimeoutMs: Schema.number().default(300_000).description('Transcript poll timeout in ms'),
+  pollTimeoutMs: Schema.number().default(300_000).description('Settlement-wait timeout in ms (sync delegate replies and check_run wait=true)'),
   watchMaxMs: Schema.number().default(43_200_000).description('Background lifecycle watcher absolute cap in ms (default 12h); settlement watching never expires before this'),
+  inlineCharBudget: Schema.number().default(4_000).description('Inline character budget for report bodies; longer reports are persisted to a file and referenced by path (default 4000)'),
 });
 
 declare module '@deepseek-ai/cordis' {
@@ -76,6 +76,14 @@ export interface HubRun {
   approvalNotified?: boolean;
   resumedNotified?: boolean;
   lastNotifiedTransition?: string;
+  /** 1-based user-turn counter; bumped on every new delegation or injected message into this cascade. */
+  turnSeq?: number;
+  /** Final planner text of completed prior turns; keeps history reachable after baseline resets. */
+  priorContents?: string[];
+  /** Locator (spill ref or file path) of the persisted full report for the latest settled turn. */
+  reportPath?: string;
+  /** Character length of the full accumulated report that reportPath covers. */
+  reportChars?: number;
 }
 
 export interface CascadeDetailedResult {
@@ -95,6 +103,9 @@ export interface SettlementNoticePayload {
 export function buildSettlementNotice(run: HubRun): SettlementNoticePayload {
   const elapsedSec = Math.max(1, Math.round((Date.now() - run.startedAt) / 1000));
   const content = (run.content || '').trim();
+  const reportLine = run.reportPath
+    ? `\n- **Full report** (${run.reportChars ?? content.length} chars): ${run.reportPath}`
+    : '';
 
   // Fast refusal and abnormal early termination detection
   const isRefusal = /无法协助|违反|safety policy|cannot assist|unable to assist|policy violation|作为AI|抱歉，我无法|I cannot fulfill|against our safety guidelines/i.test(content);
@@ -108,16 +119,20 @@ export function buildSettlementNotice(run: HubRun): SettlementNoticePayload {
     emoji = '🚨';
     label = 'Awaiting User Approval in IDE';
     const pt = run.pendingTool;
-    const argsStr = pt?.args ? JSON.stringify(pt.args, null, 2) : '{}';
+    // The notice is model-visible context: cap oversized tool args and keep the
+    // complete value reachable through check_run instead.
+    const argsJson = pt?.args ? JSON.stringify(pt.args, null, 2) : '{}';
+    const argsCap = 1500;
+    const argsStr = argsJson.length > argsCap ? `${argsJson.slice(0, argsCap)}\n…(args truncated; full value via antigravity_check_run)` : argsJson;
     detail = `Tool: **${pt?.name || 'unknown'}**\nAction: ${pt?.action || pt?.summary || 'N/A'}\nArgs:\n\`\`\`json\n${argsStr}\n\`\`\`\n\n> ⚠️ Antigravity IDE 正在等待用户点击授权弹窗，请前往 IDE 操作。`;
   } else if (run.status === 'error') {
     emoji = '❌';
     label = 'Execution Error';
-    detail = `Error: ${run.error || 'Unknown error'}`;
+    detail = `Error: ${run.error || 'Unknown error'}${reportLine}`;
   } else if (run.status === 'timeout') {
     emoji = '⏱️';
     label = 'Execution Timed Out';
-    detail = `⏱️ **Cascade 超过轮询时限未完成（超时）**\n\n- 最后活跃时间: ${run.lastActiveAt || '无'}\n- 当前输出片段:\n> ${content.slice(0, 400) || '(暂无输出)'}`;
+    detail = `⏱️ **Cascade 超过轮询时限未完成（超时）**\n\n- 最后活跃时间: ${run.lastActiveAt || '无'}${reportLine}\n- 当前输出片段:\n> ${content.slice(0, 400) || '(暂无输出)'}`;
   } else if (isEarlyDeath || isRefusal) {
     emoji = '⚠️';
     label = 'Early Termination / Model Refusal';
@@ -125,7 +140,7 @@ export function buildSettlementNotice(run: HubRun): SettlementNoticePayload {
   } else {
     emoji = '✅';
     label = 'Completed Successfully';
-    detail = `耗时: ${elapsedSec}s\n\n摘要:\n${content.slice(0, 400)}${content.length > 400 ? '...' : ''}`;
+    detail = `耗时: ${elapsedSec}s${reportLine}\n\n摘要:\n${content.slice(0, 400)}${content.length > 400 ? `...(共 ${content.length} 字符，全文见上方路径)` : ''}`;
   }
 
   const summary = `${emoji} [Antigravity] ${run.cascadeId.slice(0, 8)} ${label}`;
@@ -143,6 +158,12 @@ interface QueuedMessage {
   reject: (error: unknown) => void;
 }
 
+/** One check_run-style caller blocked on the cascade watcher's next state transition. */
+interface SettlementWaiter {
+  done: boolean;
+  finish: (result: CascadeDetailedResult) => void;
+}
+
 export class AntigravityService extends Service {
   private engine: AntigravityEngine;
   private config: AntigravityConfig;
@@ -150,6 +171,8 @@ export class AntigravityService extends Service {
   private runs = new Map<string, HubRun>();
   private watchers = new Map<string, Promise<void>>();
   private messageQueues = new Map<string, QueuedMessage[]>();
+  /** Callers parked inside waitForSettlement, keyed by cascade id; resolved by the watcher's transitions. */
+  private settlementWaiters = new Map<string, SettlementWaiter[]>();
   private disposed = false;
 
   constructor(ctx: Context, config: AntigravityConfig) {
@@ -162,6 +185,11 @@ export class AntigravityService extends Service {
     });
     ctx.effect(() => () => {
       this.disposed = true;
+      // Release parked waiters so no tool call outlives the service.
+      for (const waiters of this.settlementWaiters.values()) {
+        for (const waiter of waiters) waiter.finish({ status: 'error', content: '', error: 'antigravity bridge service disposed' });
+      }
+      this.settlementWaiters.clear();
     });
   }
 
@@ -169,7 +197,8 @@ export class AntigravityService extends Service {
   notifySettlementToDsh(run: HubRun, callerAgent?: any): void {
     if (this.disposed) return;
     try {
-      const transitionKey = `${run.status}:${run.startedAt}:${run.pendingTool ? run.pendingTool.name : (run.content?.slice(0, 32) || run.error || '')}`;
+      const turn = run.turnSeq ?? 1;
+      const transitionKey = `${run.status}:turn${turn}:${run.pendingTool ? run.pendingTool.name : ''}`;
       if (run.lastNotifiedTransition === transitionKey) {
         return; // Idempotent: already notified this transition
       }
@@ -235,7 +264,7 @@ export class AntigravityService extends Service {
   notifyResumedToDsh(run: HubRun, callerAgent?: any): void {
     if (this.disposed) return;
     try {
-      const transitionKey = `resumed:${run.startedAt}`;
+      const transitionKey = `resumed:turn${run.turnSeq ?? 1}`;
       if (run.lastNotifiedTransition === transitionKey) {
         return;
       }
@@ -414,7 +443,9 @@ export class AntigravityService extends Service {
     return slim;
   }
 
-  /** Ensure an active background watcher exists and monitors this cascade's lifecycle until final settlement. */
+  /** Ensure an active background watcher exists and monitors this cascade's lifecycle until final settlement.
+   *  Entry points (delegate/send/queue flush) must rearm the run themselves via {@link rearmRun}; this method
+   *  only creates a missing run record and starts the single poller. */
   ensureActiveWatcher(cascadeId: string, callerAgent?: any, baselineStepIndex?: number): void {
     if (this.disposed) return;
 
@@ -426,21 +457,13 @@ export class AntigravityService extends Service {
         startedAt: Date.now(),
         baselineStepIndex: baselineStepIndex ?? -1,
         callerAgent,
+        turnSeq: 1,
+        priorContents: [],
       };
       this.runs.set(cascadeId, run);
     } else {
       if (callerAgent) run.callerAgent = callerAgent;
       if (baselineStepIndex !== undefined) run.baselineStepIndex = baselineStepIndex;
-      if (run.status === 'done' || run.status === 'error' || run.status === 'timeout') {
-        // Re-activated cascade
-        run.status = 'running';
-        run.startedAt = Date.now();
-        run.approvalNotified = false;
-        run.resumedNotified = false;
-        run.lastNotifiedTransition = undefined;
-        run.error = undefined;
-        run.content = undefined;
-      }
     }
 
     if (this.watchers.has(cascadeId)) {
@@ -451,14 +474,213 @@ export class AntigravityService extends Service {
     this.watchers.set(cascadeId, watcher);
   }
 
-  /** Unified active cascade loop: continuously tracks running/approval/done transitions and notifies DSH. */
+  /** Archive the previous turn's final text, bump the turn counter, and re-arm the run for a new delegation. */
+  private static rearmRun(run: HubRun, baselineStepIndex: number, callerAgent?: any): HubRun {
+    const prev = (run.content ?? '').trim();
+    if (prev) run.priorContents = [...(run.priorContents ?? []), prev];
+    run.turnSeq = (run.turnSeq ?? 1) + 1;
+    run.status = 'running';
+    run.startedAt = Date.now();
+    run.baselineStepIndex = baselineStepIndex;
+    run.content = undefined;
+    run.error = undefined;
+    run.pendingTool = undefined;
+    run.approvalNotified = false;
+    run.resumedNotified = false;
+    run.lastNotifiedTransition = undefined;
+    run.reportPath = undefined;
+    run.reportChars = undefined;
+    if (callerAgent) run.callerAgent = callerAgent;
+    return run;
+  }
+
+  /** Whole-cascade accumulated report text: every settled prior turn plus the current one. */
+  private static fullReportText(run: HubRun): string {
+    return [...(run.priorContents ?? []), run.content ?? ''].map((part) => part.trim()).filter(Boolean).join('\n\n');
+  }
+
+  /**
+   * Persist an oversized report so nothing is unreachable from the session. The harness
+   * spill seam (`ctx.spillStore`) is preferred when mounted; otherwise a private
+   * owner-only file lands under `<appDataDir>/dsh-reports/<cascadeId>/`. Small reports
+   * stay inline-only and skip persistence entirely.
+   */
+  private async landReport(run: HubRun): Promise<void> {
+    const full = AntigravityService.fullReportText(run);
+    const budget = Math.max(1, this.config.inlineCharBudget ?? 4_000);
+    if (!full || full.length <= budget) {
+      run.reportPath = undefined;
+      run.reportChars = undefined;
+      return;
+    }
+    run.reportChars = full.length;
+    run.reportPath = (await this.persistText(run.cascadeId, full, run.turnSeq ?? 1, run.callerAgent)) ?? undefined;
+  }
+
+  /** Best-effort full-text persistence: spill seam first, private file fallback. Returns a model-facing locator. */
+  private async persistText(cascadeId: string, text: string, turnSeq: number, callerAgent?: any): Promise<string | undefined> {
+    // 1) Harness spill seam (optional capability): session-scoped private artifact with retrieval hint.
+    try {
+      const spillStore = (this.ctx as any).get?.('spillStore');
+      const sessionId = callerAgent?.session?.header?.id;
+      if (spillStore?.saveText && sessionId) {
+        const ref = await spillStore.saveText({
+          owner: { sessionId },
+          source: { toolName: 'antigravity_delegate', callId: `antigravity-${cascadeId.slice(0, 8)}`, label: 'result' },
+          suggestedName: `antigravity-${cascadeId.slice(0, 8)}-turn${turnSeq}.md`,
+          content: text,
+        });
+        if (ref?.locator) return String(ref.locator);
+      }
+    } catch {
+      // fall through to the local-file fallback
+    }
+    // 2) Private file next to the bridge's own data (exclusive owner-only create).
+    try {
+      const appDataDir = this.config.appDataDir || getDefaultAppDataDir();
+      const dir = `${appDataDir}/dsh-reports/${cascadeId}`;
+      await fsp.mkdir(dir, { recursive: true });
+      const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+      const file = `${dir}/turn-${turnSeq}-${stamp}.md`;
+      const handle = await fsp.open(file, 'wx', 0o600);
+      try {
+        await handle.writeFile(text, 'utf8');
+      } finally {
+        await handle.close();
+      }
+      return file;
+    } catch {
+      return undefined; // best-effort: the inline preview still carries the summary
+    }
+  }
+
+  /**
+   * Bound a report body to the configured inline budget. Oversized bodies are persisted
+   * first and returned as head preview + locator line, mirroring DSH's spill policy shape.
+   */
+  private async shapeResult(
+    cascadeId: string,
+    rawContent: string | undefined,
+    run?: HubRun,
+  ): Promise<{ content: string; truncated: boolean; totalChars: number; reportPath?: string }> {
+    const trimmed = (rawContent ?? '').trim();
+    if (!trimmed) return { content: '', truncated: false, totalChars: 0 };
+    const budget = Math.max(1, this.config.inlineCharBudget ?? 4_000);
+    if (trimmed.length <= budget) return { content: trimmed, truncated: false, totalChars: trimmed.length };
+
+    const alreadyLanded = run?.reportPath && run.reportChars === trimmed.length ? run.reportPath : undefined;
+    const locator = alreadyLanded ?? (await this.persistText(cascadeId, trimmed, run?.turnSeq ?? 1, run?.callerAgent));
+    if (locator && run && !alreadyLanded) {
+      run.reportPath = locator;
+      run.reportChars = trimmed.length;
+    }
+    const preview = `${trimmed.slice(0, budget)}\n…[truncated, ${trimmed.length - budget} more chars]`;
+    const note = locator ? `\nFull report (${trimmed.length} chars): ${locator}` : '\n(full-text persist failed; read the transcript directly)';
+    return { content: `${preview}${note}`, truncated: true, totalChars: trimmed.length, reportPath: locator };
+  }
+
+  /**
+   * Event-driven settlement wait: resolves on the cascade watcher's next state transition
+   * (done / error / awaiting-approval), or returns the honest instant snapshot at the
+   * deadline. There is deliberately NO self-managed polling loop here — hub idle probes
+   * report false idleness during long silent executor steps, which made wait=true return
+   * after seconds. The per-cascade watcher is the single poller.
+   */
+  private async waitForSettlement(conversationId: string, timeoutMs: number, baselineStepIndex: number): Promise<CascadeDetailedResult> {
+    const appDataDir = this.config.appDataDir || getDefaultAppDataDir();
+    const brainDir = `${appDataDir}/brain`;
+    const immediate = await this.classifySnapshot(brainDir, conversationId, baselineStepIndex);
+    if (immediate.status !== 'running') return immediate;
+
+    return new Promise<CascadeDetailedResult>((resolve) => {
+      const entry: SettlementWaiter = {
+        done: false,
+        finish: (result) => {
+          if (entry.done) return;
+          entry.done = true;
+          clearTimeout(timer);
+          const list = this.settlementWaiters.get(conversationId);
+          if (list) {
+            const at = list.indexOf(entry);
+            if (at >= 0) list.splice(at, 1);
+            if (list.length === 0) this.settlementWaiters.delete(conversationId);
+          }
+          resolve(result);
+        },
+      };
+      const timer = setTimeout(() => {
+        void this.classifySnapshot(brainDir, conversationId, baselineStepIndex).then((snap) => entry.finish(snap));
+      }, timeoutMs);
+      const waiters = this.settlementWaiters.get(conversationId) ?? [];
+      waiters.push(entry);
+      this.settlementWaiters.set(conversationId, waiters);
+    });
+  }
+
+  /** Release every parked settlement waiter for this cascade (watcher transition point). */
+  private settleWaiters(conversationId: string, result: CascadeDetailedResult): void {
+    const waiters = this.settlementWaiters.get(conversationId);
+    if (!waiters?.length) return;
+    this.settlementWaiters.delete(conversationId);
+    for (const waiter of waiters) waiter.finish(result);
+  }
+
+  /**
+   * One-shot transcript classification of a cascade; refreshes the run record and returns
+   * the same detailed result shape the wait path resolves with. Shared by check_run's
+   * instant path and waitForSettlement's deadline path.
+   */
+  private async classifySnapshot(brainDir: string, conversationId: string, baselineStepIndex: number): Promise<CascadeDetailedResult> {
+    const snap = await readCascadeTranscript(brainDir, conversationId, baselineStepIndex);
+    const existingRun = this.runs.get(conversationId);
+    let status: HubRun['status'] = existingRun?.status ?? 'running';
+    if (snap?.error) {
+      status = 'error';
+    } else if (snap?.pendingApproval) {
+      status = 'awaiting-approval';
+    } else if (snap?.isFinished || existingRun?.status === 'done') {
+      status = 'done';
+    } else if (snap?.engaged) {
+      status = 'running';
+    }
+
+    const updatedRun: HubRun = {
+      cascadeId: conversationId,
+      status,
+      startedAt: existingRun?.startedAt ?? Date.now(),
+      baselineStepIndex,
+      callerAgent: existingRun?.callerAgent,
+      turnSeq: existingRun?.turnSeq ?? 1,
+      priorContents: existingRun?.priorContents ?? [],
+      lastActiveAt: snap?.lastActiveAt ?? existingRun?.lastActiveAt,
+      content: snap?.plannerContents.join('\n\n') ?? existingRun?.content,
+      error: snap?.error ?? existingRun?.error,
+      pendingTool: snap?.pendingApproval ?? existingRun?.pendingTool,
+      approvalNotified: existingRun?.approvalNotified,
+      resumedNotified: existingRun?.resumedNotified,
+      lastNotifiedTransition: existingRun?.lastNotifiedTransition,
+      reportPath: existingRun?.reportPath,
+      reportChars: existingRun?.reportChars,
+    };
+    this.runs.set(conversationId, updatedRun);
+
+    return {
+      status,
+      content: updatedRun.content ?? '',
+      lastActiveAt: updatedRun.lastActiveAt,
+      pendingTool: updatedRun.pendingTool,
+      error: updatedRun.error,
+    };
+  }
+
+  /** Unified active cascade loop — the SINGLE poller per cascade. Tracks running/approval/error/done
+   *  transitions off the local transcript, notifies DSH, releases parked settlement waiters, and lands
+   *  oversized reports on disk. WaitForConversationFullyIdle is deliberately NOT used here: the hub
+   *  reports false idleness during long silent executor steps, which caused both premature returns and
+   *  premature done classifications. */
   private async runCascadeWatcher(cascadeId: string): Promise<void> {
     const appDataDir = this.config.appDataDir || getDefaultAppDataDir();
     const brainDir = `${appDataDir}/brain`;
-    // Lifecycle watcher: keep watching until terminal settlement (done/error).
-    // pollTimeoutMs applies ONLY to synchronous wait paths — previously this watcher
-    // died at 300s, fabricated a spurious 'timeout' notice, and left the cascade
-    // unwatched, so the genuine settlement was never delivered to DSH.
     const watchMs = this.config.watchMaxMs ?? 43_200_000;
     const deadline = Date.now() + watchMs;
     let lastStepSeen = -2;
@@ -468,9 +690,11 @@ export class AntigravityService extends Service {
       while (!this.disposed && Date.now() < deadline) {
         const run = this.runs.get(cascadeId) ?? {
           cascadeId,
-          status: 'running',
+          status: 'running' as const,
           startedAt: Date.now(),
           baselineStepIndex: -1,
+          turnSeq: 1,
+          priorContents: [] as string[],
         };
         const baseline = run.baselineStepIndex ?? -1;
         const snap = await readCascadeTranscript(brainDir, cascadeId, baseline);
@@ -487,7 +711,9 @@ export class AntigravityService extends Service {
           run.status = 'error';
           run.error = snap.error;
           this.runs.set(cascadeId, run);
+          await this.landReport(run);
           this.notifySettlementToDsh(run);
+          this.settleWaiters(cascadeId, { status: 'error', content: AntigravityService.fullReportText(run), error: snap.error, lastActiveAt: run.lastActiveAt });
           break;
         }
 
@@ -503,6 +729,7 @@ export class AntigravityService extends Service {
             run.resumedNotified = false;
             // Proactively notify caller of approval requirement immediately
             this.notifySettlementToDsh(run);
+            this.settleWaiters(cascadeId, { status: 'awaiting-approval', content: run.content ?? '', pendingTool: snap.pendingApproval, lastActiveAt: run.lastActiveAt });
           }
 
           // IMPORTANT: Do NOT stop the watcher! Cascade is alive but blocked waiting for user approval.
@@ -522,52 +749,16 @@ export class AntigravityService extends Service {
           this.runs.set(cascadeId, run);
         }
 
-        // 4. Finished naturally (transcript has done step or isFinished after baseline)
+        // 4. Finished naturally. Strict predicate: only a definitive finished step
+        //    (final PLANNER_RESPONSE without tool calls, or CHECKPOINT) settles the
+        //    turn — intermediate planner narration must never count as done.
         if (snap?.isFinished && snap.plannerContents.length > 0) {
           run.status = 'done';
           this.runs.set(cascadeId, run);
+          await this.landReport(run);
           this.notifySettlementToDsh(run);
+          this.settleWaiters(cascadeId, { status: 'done', content: AntigravityService.fullReportText(run), lastActiveAt: run.lastActiveAt });
           break;
-        }
-
-        // 5. Hub waitForIdle probe
-        try {
-          const client = await this.getHubClient();
-          const remainingSeconds = Math.max(1, Math.min(3, Math.ceil((deadline - Date.now()) / 1000)));
-          const resp = await client.waitForIdle(cascadeId, remainingSeconds, IDLE_STABILIZATION_SECONDS);
-
-          const freshSnap = await readCascadeTranscript(brainDir, cascadeId, baseline);
-          if (freshSnap?.pendingApproval) {
-            const isNewApproval = run.status !== 'awaiting-approval' || !run.approvalNotified;
-            run.status = 'awaiting-approval';
-            run.pendingTool = freshSnap.pendingApproval;
-            this.runs.set(cascadeId, run);
-            if (isNewApproval) {
-              run.approvalNotified = true;
-              run.resumedNotified = false;
-              this.notifySettlementToDsh(run);
-            }
-            await new Promise((r) => setTimeout(r, 1000));
-            continue;
-          }
-          if (freshSnap?.error) {
-            run.status = 'error';
-            run.error = freshSnap.error;
-            this.runs.set(cascadeId, run);
-            this.notifySettlementToDsh(run);
-            break;
-          }
-          if (!resp?.timedOut) {
-            if (freshSnap?.isFinished || (freshSnap && freshSnap.plannerContents.length > 0)) {
-              run.status = 'done';
-              run.content = freshSnap.plannerContents.join('\n\n');
-              this.runs.set(cascadeId, run);
-              this.notifySettlementToDsh(run);
-              break;
-            }
-          }
-        } catch {
-          await new Promise((r) => setTimeout(r, 1000));
         }
 
         // Idle backoff: poll less aggressively while the cascade makes no progress.
@@ -589,15 +780,19 @@ export class AntigravityService extends Service {
           run.status = 'timeout';
           run.error = `Cascade execution timed out after ${Math.round(watchMs / 1000)}s (lifecycle watcher cap)`;
           this.runs.set(cascadeId, run);
+          await this.landReport(run);
           this.notifySettlementToDsh(run);
+          this.settleWaiters(cascadeId, { status: 'timeout', content: AntigravityService.fullReportText(run), error: run.error, lastActiveAt: run.lastActiveAt });
         }
       }
     } catch (err) {
-      const run = this.runs.get(cascadeId) ?? { cascadeId, status: 'running', startedAt: Date.now() };
+      const run = this.runs.get(cascadeId) ?? { cascadeId, status: 'running' as const, startedAt: Date.now(), turnSeq: 1, priorContents: [] };
       run.status = 'error';
       run.error = err instanceof Error ? err.message : String(err);
       this.runs.set(cascadeId, run);
+      await this.landReport(run);
       this.notifySettlementToDsh(run);
+      this.settleWaiters(cascadeId, { status: 'error', content: AntigravityService.fullReportText(run), error: run.error });
     } finally {
       this.watchers.delete(cascadeId);
       await this.flushMessageQueue(cascadeId);
@@ -621,15 +816,16 @@ export class AntigravityService extends Service {
 
       const client = await this.getHubClient();
       await client.sendMessage(cascadeId, next.content);
-      const run = this.runs.get(cascadeId) ?? { cascadeId, status: 'running', startedAt: Date.now() };
-      run.status = 'running';
-      run.startedAt = Date.now();
-      run.baselineStepIndex = baselineStepIndex;
-      run.content = undefined;
-      run.lastNotifiedTransition = undefined;
-      run.approvalNotified = false;
-      run.resumedNotified = false;
-      if (next.callerAgent) run.callerAgent = next.callerAgent;
+      const run = this.runs.get(cascadeId) ?? {
+        cascadeId,
+        status: 'running' as const,
+        startedAt: Date.now(),
+        baselineStepIndex,
+        turnSeq: 1,
+        priorContents: [] as string[],
+        callerAgent: next.callerAgent,
+      };
+      AntigravityService.rearmRun(run, baselineStepIndex, next.callerAgent);
       this.runs.set(cascadeId, run);
 
       // Make sure unified watcher is running
@@ -640,11 +836,12 @@ export class AntigravityService extends Service {
           typeof next.wait === 'number' && next.wait > 0
             ? next.wait * 1000
             : (this.config.pollTimeoutMs ?? 300_000);
-        const res = await this.waitCascadeDetailed(cascadeId, timeoutMs, baselineStepIndex);
+        const res = await this.waitForSettlement(cascadeId, timeoutMs, baselineStepIndex);
         if (res.status === 'error') {
           next.reject(new Error(res.error || 'Antigravity execution failed'));
         } else {
-          next.resolve(res.content || '[Antigravity returned no planner output]');
+          const shaped = await this.shapeResult(cascadeId, res.content, this.runs.get(cascadeId));
+          next.resolve(shaped.content || '[Antigravity returned no planner output]');
         }
       } else {
         next.resolve(`Queued message sent to ${cascadeId}`);
@@ -695,29 +892,43 @@ export class AntigravityService extends Service {
 
     const startedAt = Date.now();
     await client.sendMessage(conversationId, task);
-    this.runs.set(conversationId, {
-      cascadeId: conversationId,
-      status: 'running',
-      startedAt,
-      baselineStepIndex,
-      callerAgent,
-    });
+
+    // New turn into this cascade: archive the prior turn's text and re-arm the run.
+    const existing = this.runs.get(conversationId);
+    if (existing) {
+      AntigravityService.rearmRun(existing, baselineStepIndex, callerAgent);
+      existing.startedAt = startedAt;
+      this.runs.set(conversationId, existing);
+    } else {
+      this.runs.set(conversationId, {
+        cascadeId: conversationId,
+        status: 'running',
+        startedAt,
+        baselineStepIndex,
+        callerAgent,
+        turnSeq: 1,
+        priorContents: [],
+      });
+    }
 
     // Ensure active watcher is monitoring across entire lifecycle
     this.ensureActiveWatcher(conversationId, callerAgent, baselineStepIndex);
 
     if (!background) {
-      const result = await this.waitCascadeDetailed(conversationId, this.config.pollTimeoutMs ?? 300_000, baselineStepIndex);
+      const result = await this.waitForSettlement(conversationId, this.config.pollTimeoutMs ?? 300_000, baselineStepIndex);
+      const run = this.runs.get(conversationId);
       if (result.status === 'awaiting-approval') {
         const tool = result.pendingTool;
-        const toolDesc = tool ? `${tool.name} (${tool.action || tool.summary || JSON.stringify(tool.args || {})})` : 'unknown';
-        return `[Awaiting Approval in Antigravity IDE]\nTool execution paused waiting for user confirmation: ${toolDesc}\n\nPartial output:\n${result.content}`;
+        const toolDesc = tool ? `${tool.name} (${tool.action || tool.summary || 'see antigravity_check_run for full args'})` : 'unknown';
+        const shapedPartial = await this.shapeResult(conversationId, result.content, run);
+        return `[Awaiting Approval in Antigravity IDE]\nTool execution paused waiting for user confirmation: ${toolDesc}\n\nPartial output:\n${shapedPartial.content}`;
       }
       if (result.status === 'error') {
         const partial = result.content ? `\n\nPartial output before error:\n${result.content}` : '';
         throw new Error(`${result.error || 'Antigravity execution failed'}${partial}`);
       }
-      return result.content || '[Antigravity returned no planner output]';
+      const shaped = await this.shapeResult(conversationId, result.content, run);
+      return shaped.content || '[Antigravity returned no planner output]';
     }
 
     // Short probe (3 seconds) for background runs to detect immediate fast refusal, error, or early completion
@@ -727,18 +938,22 @@ export class AntigravityService extends Service {
       const snap = await readCascadeTranscript(brainDir, conversationId, baselineStepIndex);
       if (snap && (snap.isFinished || snap.error || snap.pendingApproval)) {
         const status = snap.error ? 'error' : snap.pendingApproval ? 'awaiting-approval' : 'done';
-        const run: HubRun = {
+        const run = this.runs.get(conversationId) ?? {
           cascadeId: conversationId,
-          status,
+          status: 'running' as const,
           startedAt,
           baselineStepIndex,
           callerAgent,
-          content: snap.plannerContents.join('\n\n'),
-          lastActiveAt: snap.lastActiveAt,
-          pendingTool: snap.pendingApproval,
-          error: snap.error,
+          turnSeq: 1,
+          priorContents: [] as string[],
         };
+        run.status = status;
+        run.content = snap.plannerContents.join('\n\n');
+        run.lastActiveAt = snap.lastActiveAt;
+        run.pendingTool = snap.pendingApproval;
+        run.error = snap.error;
         this.runs.set(conversationId, run);
+        await this.landReport(run);
 
         return JSON.stringify({
           cascadeId: conversationId,
@@ -748,6 +963,7 @@ export class AntigravityService extends Service {
           content: run.content || null,
           pendingTool: run.pendingTool || null,
           error: run.error || null,
+          reportPath: run.reportPath ?? null,
           note: run.status === 'awaiting-approval'
             ? 'Cascade immediately paused waiting for user approval in Antigravity IDE.'
             : 'Cascade settled during initial probe window.',
@@ -764,21 +980,16 @@ export class AntigravityService extends Service {
     }, null, 2);
   }
 
-  /** Inspect a background run; wait supports boolean or timeout in seconds. */
+  /** Inspect a background run; wait supports boolean or timeout in seconds. With wait>0 the
+   *  call parks on the cascade watcher's settlement events (no polling of its own) and, at
+   *  the deadline, returns the latest honestly-observed snapshot instead of a fabricated status. */
   async hubCheckRun(runId: string, wait: boolean | number = false, callerAgent?: any): Promise<unknown> {
     const appDataDir = this.config.appDataDir || getDefaultAppDataDir();
     const brainDir = `${appDataDir}/brain`;
     const existingRun = this.runs.get(runId);
     const startedAt = existingRun?.startedAt ?? Date.now();
     const baselineStepIndex = existingRun?.baselineStepIndex ?? -1;
-
-    // Auto-attach watcher if active but no watcher is currently running
-    if (!this.watchers.has(runId)) {
-      const snap = await readCascadeTranscript(brainDir, runId, baselineStepIndex);
-      if (snap && (snap.pendingApproval || (!snap.isFinished && snap.engaged))) {
-        this.ensureActiveWatcher(runId, callerAgent || existingRun?.callerAgent, baselineStepIndex);
-      }
-    }
+    if (callerAgent && existingRun) existingRun.callerAgent = callerAgent;
 
     const timeoutMs =
       typeof wait === 'number' && wait > 0
@@ -788,65 +999,50 @@ export class AntigravityService extends Service {
         : 0;
 
     if (timeoutMs > 0) {
-      const detailed = await this.waitCascadeDetailed(runId, timeoutMs, baselineStepIndex);
-      const updatedRun: HubRun = {
-        cascadeId: runId,
-        status: detailed.status,
-        startedAt,
-        baselineStepIndex,
-        callerAgent: callerAgent || existingRun?.callerAgent,
-        lastActiveAt: detailed.lastActiveAt,
-        content: detailed.content,
-        error: detailed.error,
-        pendingTool: detailed.pendingTool,
-      };
-      this.runs.set(runId, updatedRun);
+      // The watcher is the only poller; attach one when the cascade is genuinely live but
+      // unwatched (e.g. after a plugin reload). Already-finished cascades skip this — the
+      // fast path in waitForSettlement classifies them instantly.
+      if (!this.watchers.has(runId)) {
+        const probe = await readCascadeTranscript(brainDir, runId, baselineStepIndex);
+        if (probe && !probe.isFinished && !probe.pendingApproval && probe.engaged) {
+          this.ensureActiveWatcher(runId, callerAgent || existingRun?.callerAgent, baselineStepIndex);
+        }
+      }
+
+      const detailed = await this.waitForSettlement(runId, timeoutMs, baselineStepIndex);
+      const run = this.runs.get(runId);
+      const shaped = await this.shapeResult(runId, detailed.content || undefined, run);
 
       return AntigravityService.lossless({
         cascadeId: runId,
         status: detailed.status,
-        pendingTool: detailed.pendingTool,
-        lastActiveAt: detailed.lastActiveAt,
+        pendingTool: detailed.pendingTool ?? null,
+        lastActiveAt: detailed.lastActiveAt ?? null,
         elapsedMs: Date.now() - startedAt,
-        content: detailed.content || null,
+        content: shaped.content || null,
+        contentTruncated: shaped.truncated,
+        totalChars: shaped.totalChars || null,
+        reportPath: shaped.reportPath ?? null,
         error: detailed.error || null,
       });
     }
 
     // Instant snapshot check
-    const snap = await readCascadeTranscript(brainDir, runId, baselineStepIndex);
-    let status: HubRun['status'] = existingRun?.status ?? 'running';
-    if (snap?.error) {
-      status = 'error';
-    } else if (snap?.pendingApproval) {
-      status = 'awaiting-approval';
-    } else if (snap?.isFinished || existingRun?.status === 'done') {
-      status = 'done';
-    } else if (snap?.engaged) {
-      status = 'running';
-    }
-
-    const updatedRun: HubRun = {
-      cascadeId: runId,
-      status,
-      startedAt,
-      baselineStepIndex,
-      callerAgent: callerAgent || existingRun?.callerAgent,
-      lastActiveAt: snap?.lastActiveAt ?? existingRun?.lastActiveAt,
-      content: snap?.plannerContents.join('\n\n') ?? existingRun?.content,
-      error: snap?.error ?? existingRun?.error,
-      pendingTool: snap?.pendingApproval ?? existingRun?.pendingTool,
-    };
-    this.runs.set(runId, updatedRun);
+    const detailed = await this.classifySnapshot(brainDir, runId, baselineStepIndex);
+    const run = this.runs.get(runId);
+    const shaped = await this.shapeResult(runId, detailed.content || undefined, run);
 
     return AntigravityService.lossless({
       cascadeId: runId,
-      status,
-      pendingTool: updatedRun.pendingTool,
-      lastActiveAt: updatedRun.lastActiveAt,
+      status: detailed.status,
+      pendingTool: detailed.pendingTool ?? null,
+      lastActiveAt: detailed.lastActiveAt ?? null,
       elapsedMs: Date.now() - startedAt,
-      content: updatedRun.content || null,
-      error: updatedRun.error || null,
+      content: shaped.content || null,
+      contentTruncated: shaped.truncated,
+      totalChars: shaped.totalChars || null,
+      reportPath: shaped.reportPath ?? null,
+      error: detailed.error || null,
     });
   }
 
@@ -949,13 +1145,17 @@ export class AntigravityService extends Service {
       const baselineStepIndex = preSnap?.maxStepIndex ?? -1;
 
       await client.sendMessage(conversationId, content);
-      this.runs.set(conversationId, {
+      const runningRun = this.runs.get(conversationId) ?? {
         cascadeId: conversationId,
-        status: 'running',
+        status: 'running' as const,
         startedAt: Date.now(),
         baselineStepIndex,
+        turnSeq: 1,
+        priorContents: [] as string[],
         callerAgent,
-      });
+      };
+      AntigravityService.rearmRun(runningRun, baselineStepIndex, callerAgent);
+      this.runs.set(conversationId, runningRun);
 
       // Ensure active watcher tracks the newly resumed run
       this.ensureActiveWatcher(conversationId, callerAgent, baselineStepIndex);
@@ -980,11 +1180,12 @@ export class AntigravityService extends Service {
         typeof wait === 'number' && wait > 0
           ? wait * 1000
           : (this.config.pollTimeoutMs ?? 300_000);
-      const result = await this.waitCascadeDetailed(conversationId, timeoutMs, baselineStepIndex);
+      const result = await this.waitForSettlement(conversationId, timeoutMs, baselineStepIndex);
       if (result.status === 'error') {
         throw new Error(result.error || 'Antigravity execution failed');
       }
-      return result.content || '[Antigravity returned no planner output]';
+      const shaped = await this.shapeResult(conversationId, result.content, this.runs.get(conversationId));
+      return shaped.content || '[Antigravity returned no planner output]';
     }
 
     const preSnap = await readCascadeTranscript(brainDir, conversationId, -1);
@@ -992,13 +1193,17 @@ export class AntigravityService extends Service {
 
     const client = await this.getHubClient();
     await client.sendMessage(conversationId, content);
-    this.runs.set(conversationId, {
+    const idleRun = this.runs.get(conversationId) ?? {
       cascadeId: conversationId,
-      status: 'running',
+      status: 'running' as const,
       startedAt: Date.now(),
       baselineStepIndex,
+      turnSeq: 1,
+      priorContents: [] as string[],
       callerAgent,
-    });
+    };
+    AntigravityService.rearmRun(idleRun, baselineStepIndex, callerAgent);
+    this.runs.set(conversationId, idleRun);
 
     // Ensure active watcher tracks the run
     this.ensureActiveWatcher(conversationId, callerAgent, baselineStepIndex);
@@ -1024,11 +1229,12 @@ export class AntigravityService extends Service {
       typeof wait === 'number' && wait > 0
         ? wait * 1000
         : (this.config.pollTimeoutMs ?? 300_000);
-    const result = await this.waitCascadeDetailed(conversationId, timeoutMs, baselineStepIndex);
+    const result = await this.waitForSettlement(conversationId, timeoutMs, baselineStepIndex);
     if (result.status === 'error') {
       throw new Error(result.error || 'Antigravity execution failed');
     }
-    return result.content || '[Antigravity returned no planner output]';
+    const shaped = await this.shapeResult(conversationId, result.content, this.runs.get(conversationId));
+    return shaped.content || '[Antigravity returned no planner output]';
   }
 
   /**
@@ -1100,127 +1306,6 @@ export class AntigravityService extends Service {
     });
   }
 
-  private async waitCascadeDetailed(
-    conversationId: string,
-    timeoutMs = this.config.pollTimeoutMs ?? 300_000,
-    baselineStepIndex = -1,
-  ): Promise<CascadeDetailedResult> {
-    const appDataDir = this.config.appDataDir || getDefaultAppDataDir();
-    const brainDir = `${appDataDir}/brain`;
-    const deadline = Date.now() + timeoutMs;
-
-    // Phase 1: engagement guard. Wait until executor produces steps or timeout
-    const engageDeadline = Math.min(deadline, Date.now() + 15_000);
-    while (Date.now() < engageDeadline) {
-      const snap = await readCascadeTranscript(brainDir, conversationId, baselineStepIndex);
-      if (snap?.error) {
-        return {
-          status: 'error',
-          content: snap.plannerContents.join('\n\n'),
-          lastActiveAt: snap.lastActiveAt,
-          error: snap.error,
-        };
-      }
-      if (snap?.pendingApproval) {
-        return {
-          status: 'awaiting-approval',
-          content: snap.plannerContents.join('\n\n'),
-          lastActiveAt: snap.lastActiveAt,
-          pendingTool: snap.pendingApproval,
-        };
-      }
-      if (snap?.engaged) break;
-      await new Promise((resolve) => setTimeout(resolve, 800));
-    }
-
-    // Phase 2: Hub waitForIdle + Transcript status checking
-    const client = await this.getHubClient();
-    let fallback = false;
-
-    while (Date.now() < deadline) {
-      try {
-        const remainingSeconds = Math.max(1, Math.ceil((deadline - Date.now()) / 1000));
-        const sliceSeconds = Math.min(30, remainingSeconds);
-        const resp = await client.waitForIdle(conversationId, sliceSeconds, IDLE_STABILIZATION_SECONDS);
-
-        const snap = await readCascadeTranscript(brainDir, conversationId, baselineStepIndex);
-        if (snap?.error) {
-          return {
-            status: 'error',
-            content: snap.plannerContents.join('\n\n'),
-            lastActiveAt: snap.lastActiveAt,
-            error: snap.error,
-          };
-        }
-        if (snap?.pendingApproval) {
-          return {
-            status: 'awaiting-approval',
-            content: snap.plannerContents.join('\n\n'),
-            lastActiveAt: snap.lastActiveAt,
-            pendingTool: snap.pendingApproval,
-          };
-        }
-
-        if (!resp?.timedOut) {
-          if (snap?.isFinished || (snap && snap.plannerContents.length > 0)) {
-            return {
-              status: 'done',
-              content: snap.plannerContents.join('\n\n'),
-              lastActiveAt: snap.lastActiveAt,
-            };
-          }
-          break;
-        }
-      } catch {
-        fallback = true;
-        break;
-      }
-    }
-
-    if (fallback) {
-      const remainingMs = Math.max(1000, deadline - Date.now());
-      const pollRes = await pollTranscript(brainDir, conversationId, remainingMs, 1500, 4000, baselineStepIndex);
-      return {
-        status: pollRes.status ?? (pollRes.done ? 'done' : 'running'),
-        content: pollRes.content,
-        lastActiveAt: pollRes.lastActiveAt,
-        pendingTool: pollRes.pendingTool,
-        error: pollRes.error,
-      };
-    }
-
-    const finalSnap = await readCascadeTranscript(brainDir, conversationId, baselineStepIndex);
-    if (finalSnap?.error) {
-      return {
-        status: 'error',
-        content: finalSnap.plannerContents.join('\n\n'),
-        lastActiveAt: finalSnap.lastActiveAt,
-        error: finalSnap.error,
-      };
-    }
-    if (finalSnap?.pendingApproval) {
-      return {
-        status: 'awaiting-approval',
-        content: finalSnap.plannerContents.join('\n\n'),
-        lastActiveAt: finalSnap.lastActiveAt,
-        pendingTool: finalSnap.pendingApproval,
-      };
-    }
-    if (finalSnap?.isFinished) {
-      return {
-        status: 'done',
-        content: finalSnap.plannerContents.join('\n\n'),
-        lastActiveAt: finalSnap.lastActiveAt,
-      };
-    }
-
-    return {
-      status: finalSnap?.engaged ? 'running' : 'timeout',
-      content: finalSnap?.plannerContents.join('\n\n') ?? '',
-      lastActiveAt: finalSnap?.lastActiveAt,
-    };
-  }
-
   async hubCreateProject(name: string, folderUri: string): Promise<unknown> {
     const client = await this.getHubClient();
     return client.createProject(name, folderUri);
@@ -1248,7 +1333,8 @@ Google Antigravity (AGY) is Google's multi-agent coding harness running locally 
 - 'gemini-3.7-flash-tiered' (default): Gemini quota group (very generous limit), 1M context, fast multimodal; use for general and parallel coding subtasks.
 - 'claude-opus-4-6-thinking': non-Gemini quota group (strict limit); deep reasoning for tough challenges.
 - 'antigravity_list_models' shows the live model catalog with remaining quota fractions.
-- 'antigravity_delegate' runs a task: with conversation_id it continues that conversation; without, it creates a new cascade (needs project_id or config default). Default blocks until the reply stabilizes; background=true returns a run id immediately so you can keep working, then poll with 'antigravity_check_run' (wait=true blocks until done).
+- 'antigravity_delegate' runs a task: with conversation_id it continues that conversation; without, it creates a new cascade (needs project_id or config default). Default blocks until the reply stabilizes; background=true returns a run id immediately so you can keep working, then check with 'antigravity_check_run' (wait=true parks on lifecycle events until done/error/awaiting-approval, or returns the latest snapshot at the timeout).
+- Large Antigravity reports are persisted to disk: tool results cap inline content and carry reportPath — read that file for the full text.
 - Mid-run steering: 'antigravity_send_message' with wait=false injects guidance into a running conversation.
 - 'antigravity_create_project' creates a project (returns projectId).
 - 'antigravity_list_conversations' and 'antigravity_get_conversation_tree' browse local session history.
@@ -1354,12 +1440,13 @@ Google Antigravity (AGY) is Google's multi-agent coding harness running locally 
       tools.register({
         name: 'antigravity_check_run',
         description: 'Check a background antigravity_delegate run (cascade UUID): returns status (running, awaiting-approval, done, error, timeout), elapsed time, last active timestamp, and pending tool approvals. '
-          + 'Set wait=true to block until done or timeout (default 300s), or specify seconds (e.g. wait=30).',
+          + 'Set wait=true to block until a lifecycle transition (done/error/awaiting-approval) or timeout — at the deadline it returns the latest observed snapshot instead of fabricating a status. Pass a number for custom seconds (e.g. wait=30). '
+          + 'Oversized reports are persisted to disk: content is capped inline and reportPath points at the full text.',
         parameters: {
           type: 'object',
           properties: {
             run_id: { type: 'string', description: 'Cascade UUID returned by a background delegate or external conversation' },
-            wait: { description: 'Block until done or timeout. Pass true for default timeout (300s), or a number for custom seconds (e.g. 30).' },
+            wait: { description: 'Block until done/error/awaiting-approval or timeout. Pass true for default timeout (300s), or a number for custom seconds (e.g. 30).' },
           },
           required: ['run_id'],
         },

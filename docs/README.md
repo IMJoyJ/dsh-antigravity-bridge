@@ -2,7 +2,7 @@
 
 本目录记录对 Google Antigravity 本地协议的可行性探索与逆向成果，以及插件的演进方向与完整实现规范。
 
-> **当前状态：全功能成熟版本**（8 大工具矩阵 + 后台委托 + DSH 主动结算/恢复通知 + IDE 程序化审批 + 12h 长效生命周期监视器 + 消息注入队列与交付探测 + 服务端 WaitForConversationFullyIdle 空闲检测）。
+> **当前状态：全功能成熟版本**（8 大工具矩阵 + 后台委托 + DSH 主动结算/恢复通知 + IDE 程序化审批 + 12h 长效生命周期监视器 + 消息注入队列与交付探测；v0.2.0 起等待路径为**结算事件驱动**，`WaitForConversationFullyIdle` 因实测假空闲已移出等待与完成判定，新增报告落盘与内联预算）。
 > 默认 `backend: "hub"`。实现与联调记录见 [implementation.md](implementation.md)。
 
 ## 背景问题
@@ -34,7 +34,7 @@
 1. `antigravity_delegate(task, model?, project_id?, conversation_id?, background?)`：
    - `background: false`：阻塞等待回复；
    - `background: true`：立即返回 `{cascadeId, status:'running'}`，后台守护并在完成/挂起时向 DSH 主动推送通知。
-2. `antigravity_check_run(run_id, wait?)`：查询后台运行状态快照；`wait: true` 或数字秒数阻塞等待 transcript 完成。
+2. `antigravity_check_run(run_id, wait?)`：查询后台运行状态快照；`wait: true` 或数字秒数驻留在 watcher 结算事件上等待终态迁移，超时如实返回最新快照。超预算报告落盘并以 `reportPath` 引用全文。
 3. `antigravity_send_message(conversation_id, content, wait?, mode?)`：
    - `mode: 'step-end'`（默认，等待当前步骤结束注入）、`'turn-end'`（安全排队至轮次结束）、`'interrupt'`（立即中断）；
    - `confirmMessageDelivered` 自动探测 transcript.jsonl 并带失败重试。

@@ -33,11 +33,15 @@ Native TypeScript Google Antigravity (Gemini Agent) Bridge for DeepSeek Harness 
   - `background: true`：启动会话后立即返回 `{cascadeId, status: 'running', ...}`，并在后台启动生命周期监视器。
 
 ### 2. `antigravity_check_run`
-查询后台任务状态或阻塞等待完成。
+查询后台任务状态，或事件驱动地阻塞等待终态迁移。
 - **参数**：
   - `run_id` (string, 必需)：Cascade UUID。
-  - `wait` (boolean | number, 可选)：是否阻塞等待。`true` 默认等待 300s，传入数字代表自定义超时秒数（如 `wait: 30`）。
-- **返回**：包含 `cascadeId`, `status` (`running` | `awaiting-approval` | `done` | `error` | `timeout`), `pendingTool`, `lastActiveAt`, `elapsedMs`, `content`, `error` 等字段的结构化对象。
+  - `wait` (boolean | number, 可选)：是否阻塞等待。`true` 默认最长 300s，传入数字代表自定义超时秒数（如 `wait: 30`）。等待期间驻留在生命周期 watcher 的**结算事件**上（done/error/awaiting-approval 即刻唤醒），自身不做轮询；超时到期则如实返回当前最新快照（不伪造状态）。
+- **返回**：包含 `cascadeId`, `status` (`running` | `awaiting-approval` | `done` | `error` | `timeout`), `pendingTool`, `lastActiveAt`, `elapsedMs`, `content`, `contentTruncated`, `totalChars`, `reportPath`, `error` 等字段的结构化对象。
+
+> 📁 **报告落盘（v0.2.0）**：超过 `inlineCharBudget`（默认 4000 字符）的报告正文先持久化——优先走 DSH
+> `spillStore` seam，未挂载时写入 `<appDataDir>/dsh-reports/<cascadeId>/turn-N-<时间戳>.md`（权限
+> 0600）——工具结果只保留内联预览 + 全文路径；完成/超时结算通知同样携带全文路径与总字符数。
 
 ### 3. `antigravity_send_message`
 向进行中的 Antigravity 会话发送追加指导或转向消息。

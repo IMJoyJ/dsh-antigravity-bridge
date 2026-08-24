@@ -324,6 +324,8 @@ interface AntigravityConfig {
   hubCsrfToken?: string;
   pollTimeoutMs?: number;
   watchMaxMs?: number;
+  /** Inline character budget for tool-result report bodies; longer reports are persisted and referenced by path. */
+  inlineCharBudget?: number;
 }
 declare const Config: Schema<AntigravityConfig>;
 declare module '@deepseek-ai/cordis' {
@@ -348,6 +350,14 @@ interface HubRun {
   approvalNotified?: boolean;
   resumedNotified?: boolean;
   lastNotifiedTransition?: string;
+  /** 1-based user-turn counter; bumped on every new delegation or injected message into this cascade. */
+  turnSeq?: number;
+  /** Final planner text of completed prior turns; keeps history reachable after baseline resets. */
+  priorContents?: string[];
+  /** Locator (spill ref or file path) of the persisted full report for the latest settled turn. */
+  reportPath?: string;
+  /** Character length of the full accumulated report that reportPath covers. */
+  reportChars?: number;
 }
 interface CascadeDetailedResult {
   status: 'done' | 'awaiting-approval' | 'running' | 'timeout' | 'error';
@@ -369,6 +379,8 @@ declare class AntigravityService extends Service {
   private runs;
   private watchers;
   private messageQueues;
+  /** Callers parked inside waitForSettlement, keyed by cascade id; resolved by the watcher's transitions. */
+  private settlementWaiters;
   private disposed;
   constructor(ctx: Context, config: AntigravityConfig);
   /** Proactively push a settlement/approval notice to DSH session (steering / followup) with idempotency. */
@@ -391,14 +403,56 @@ declare class AntigravityService extends Service {
   private getHubClient;
   /** Hub GetAvailableModels, slimmed to the fields a model caller needs. */
   hubListModels(): Promise<unknown>;
-  /** Ensure an active background watcher exists and monitors this cascade's lifecycle until final settlement. */
+  /** Ensure an active background watcher exists and monitors this cascade's lifecycle until final settlement.
+   *  Entry points (delegate/send/queue flush) must rearm the run themselves via {@link rearmRun}; this method
+   *  only creates a missing run record and starts the single poller. */
   ensureActiveWatcher(cascadeId: string, callerAgent?: any, baselineStepIndex?: number): void;
-  /** Unified active cascade loop: continuously tracks running/approval/done transitions and notifies DSH. */
+  /** Archive the previous turn's final text, bump the turn counter, and re-arm the run for a new delegation. */
+  private static rearmRun;
+  /** Whole-cascade accumulated report text: every settled prior turn plus the current one. */
+  private static fullReportText;
+  /**
+   * Persist an oversized report so nothing is unreachable from the session. The harness
+   * spill seam (`ctx.spillStore`) is preferred when mounted; otherwise a private
+   * owner-only file lands under `<appDataDir>/dsh-reports/<cascadeId>/`. Small reports
+   * stay inline-only and skip persistence entirely.
+   */
+  private landReport;
+  /** Best-effort full-text persistence: spill seam first, private file fallback. Returns a model-facing locator. */
+  private persistText;
+  /**
+   * Bound a report body to the configured inline budget. Oversized bodies are persisted
+   * first and returned as head preview + locator line, mirroring DSH's spill policy shape.
+   */
+  private shapeResult;
+  /**
+   * Event-driven settlement wait: resolves on the cascade watcher's next state transition
+   * (done / error / awaiting-approval), or returns the honest instant snapshot at the
+   * deadline. There is deliberately NO self-managed polling loop here — hub idle probes
+   * report false idleness during long silent executor steps, which made wait=true return
+   * after seconds. The per-cascade watcher is the single poller.
+   */
+  private waitForSettlement;
+  /** Release every parked settlement waiter for this cascade (watcher transition point). */
+  private settleWaiters;
+  /**
+   * One-shot transcript classification of a cascade; refreshes the run record and returns
+   * the same detailed result shape the wait path resolves with. Shared by check_run's
+   * instant path and waitForSettlement's deadline path.
+   */
+  private classifySnapshot;
+  /** Unified active cascade loop — the SINGLE poller per cascade. Tracks running/approval/error/done
+   *  transitions off the local transcript, notifies DSH, releases parked settlement waiters, and lands
+   *  oversized reports on disk. WaitForConversationFullyIdle is deliberately NOT used here: the hub
+   *  reports false idleness during long silent executor steps, which caused both premature returns and
+   *  premature done classifications. */
   private runCascadeWatcher;
   /** Flush any messages that were queued while the cascade was actively generating or running. */
   private flushMessageQueue;
   hubDelegate(task: string, model?: string, projectId?: string, conversationId?: string, background?: boolean, callerAgent?: any): Promise<string>;
-  /** Inspect a background run; wait supports boolean or timeout in seconds. */
+  /** Inspect a background run; wait supports boolean or timeout in seconds. With wait>0 the
+   *  call parks on the cascade watcher's settlement events (no polling of its own) and, at
+   *  the deadline, returns the latest honestly-observed snapshot instead of a fabricated status. */
   hubCheckRun(runId: string, wait?: boolean | number, callerAgent?: any): Promise<unknown>;
   /** Best-effort confirmation that a sent user message materialized in the cascade transcript. */
   private confirmMessageDelivered;
@@ -410,7 +464,6 @@ declare class AntigravityService extends Service {
    * HandleCascadeUserInteraction. confirm=false rejects.
    */
   hubRespondApproval(cascadeId: string, confirm: boolean, scope?: string): Promise<unknown>;
-  private waitCascadeDetailed;
   hubCreateProject(name: string, folderUri: string): Promise<unknown>;
 }
 declare class AntigravityBridgePlugin {
