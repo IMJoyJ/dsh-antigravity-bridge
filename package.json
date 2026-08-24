@@ -10,8 +10,18 @@
       "types": "./lib/index.d.ts",
       "import": "./lib/index.mjs"
     },
+    "./client": "./client/index.js",
     "./cordis.patch.yml": "./cordis.patch.yml",
     "./package.json": "./package.json"
+  },
+  "dsh": {
+    "client": {
+      "platform": "web",
+      "inject": [
+        "@deepseek-ai/dsh-client-runtime",
+        "@deepseek-ai/dsh-client-ui-settings"
+      ]
+    }
   },
   "scripts": {
     "build": "tsdown",
