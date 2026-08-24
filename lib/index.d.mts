@@ -274,7 +274,11 @@ declare function clearHubCache(): void;
 interface StartCascadeOptions {
   cascadeId: string;
   requestedModel: string;
-  projectId: string;
+  /** Registered project UUID. Mutually exclusive with workspaceUri. */
+  projectId?: string;
+  /** Folder URI (file:///...) to bind the cascade to directly, without a
+   *  registered project. Backed by StartCascade's top-level workspaceUris. */
+  workspaceUri?: string;
 }
 declare class HubClient {
   private info;
@@ -296,7 +300,10 @@ declare class HubClient {
     timedOut?: boolean;
   }>;
   getConversationMetadata(conversationId: string): Promise<unknown>;
-  /** Creates a project and returns the caller-generated id (hub responds with {}). */
+  /** Creates a project and returns the caller-generated id (hub responds with {}).
+   *  The hub accepts CreateProject with grpc status 0 but may never persist the
+   *  project (ReadProject then reports notFoundOnDisk). Verify persistence and
+   *  throw an honest error so callers can fall back to folder-bound starts. */
   createProject(name: string, folderUri: string): Promise<{
     projectId: string;
   }>;

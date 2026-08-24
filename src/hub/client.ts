@@ -6,7 +6,11 @@ import type { HubInfo } from './discovery.js';
 export interface StartCascadeOptions {
   cascadeId: string;
   requestedModel: string;
-  projectId: string;
+  /** Registered project UUID. Mutually exclusive with workspaceUri. */
+  projectId?: string;
+  /** Folder URI (file:///...) to bind the cascade to directly, without a
+   *  registered project. Backed by StartCascade's top-level workspaceUris. */
+  workspaceUri?: string;
 }
 
 export class HubClient {
@@ -36,7 +40,7 @@ export class HubClient {
   }
 
   async startCascade(opts: StartCascadeOptions): Promise<unknown> {
-    return this.call('StartCascade', {
+    const body: Record<string, unknown> = {
       cascadeId: opts.cascadeId,
       source: 'CORTEX_TRAJECTORY_SOURCE_CASCADE_CLIENT',
       trajectoryType: 'CORTEX_TRAJECTORY_TYPE_CASCADE',
@@ -47,11 +51,30 @@ export class HubClient {
           plannerConfig: { planModel: opts.requestedModel },
         },
       },
-      projectEnvConfig: {
+    };
+    if (opts.workspaceUri) {
+      // Folder-bound start: no registered project needed. Verified live:
+      // the hub creates the cascade (brain dir appears ~1s) with the given
+      // folder as its workspace root.
+      body.workspaceUris = [opts.workspaceUri];
+    }
+    if (opts.projectId) {
+      body.projectEnvConfig = {
         projectId: opts.projectId,
         defaultProjectEnvironment: {},
-      },
-    });
+      };
+    }
+    const resp = await this.call('StartCascade', body);
+    // The hub silently no-ops (grpc status 0, empty message) when the given
+    // projectId is not registered. A real start echoes the cascadeId.
+    if (!resp || typeof resp !== 'object' || !('cascadeId' in resp)) {
+      throw new Error(
+        'StartCascade was silently rejected by the hub (empty response): the projectId is not registered. '
+        + 'Pass an absolute folder path or file:/// URI as project_id instead — the bridge will bind the cascade '
+        + 'directly to that workspace via workspaceUris.',
+      );
+    }
+    return resp;
   }
 
   async sendMessage(cascadeId: string, text: string): Promise<unknown> {
@@ -80,7 +103,10 @@ export class HubClient {
     return this.call('GetConversationMetadata', { conversationId });
   }
 
-  /** Creates a project and returns the caller-generated id (hub responds with {}). */
+  /** Creates a project and returns the caller-generated id (hub responds with {}).
+   *  The hub accepts CreateProject with grpc status 0 but may never persist the
+   *  project (ReadProject then reports notFoundOnDisk). Verify persistence and
+   *  throw an honest error so callers can fall back to folder-bound starts. */
   async createProject(name: string, folderUri: string): Promise<{ projectId: string }> {
     const projectId = crypto.randomUUID();
     await this.call('CreateProject', {
@@ -92,7 +118,18 @@ export class HubClient {
         },
       },
     });
-    return { projectId };
+    for (let attempt = 0; attempt < 3; attempt++) {
+      await new Promise((r) => setTimeout(r, 500 * (attempt + 1)));
+      const resp = (await this.readProject(projectId)) as { notFoundOnDisk?: boolean; project?: unknown };
+      if (resp && typeof resp === 'object' && resp.project) {
+        return { projectId };
+      }
+    }
+    throw new Error(
+      `CreateProject was accepted by the hub but the project "${name}" (${projectId}) was not persisted `
+      + '(ReadProject: notFoundOnDisk). Instead of a project UUID, pass the folder path or file:/// URI '
+      + 'directly as project_id to antigravity_delegate — the cascade will be bound to that workspace.',
+    );
   }
 
   async readProject(id: string): Promise<unknown> {

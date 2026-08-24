@@ -1,6 +1,6 @@
 {
   "name": "@dsh-external/dsh-antigravity-bridge",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Native TypeScript Antigravity (Gemini Agent) Bridge for DeepSeek Harness",
   "type": "module",
   "main": "./lib/index.mjs",

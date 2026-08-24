@@ -62,6 +62,24 @@ export interface RunOneShotOptions extends AgentInitConfig {
   attachments?: string[];
 }
 
+/**
+ * Interprets a delegate `project_id` argument as a local folder reference.
+ * Returns a file:/// URI when the value is a file:/// URI, a Windows absolute
+ * path (C:\... or C:/...), or a POSIX absolute path; undefined otherwise
+ * (i.e. it is presumably a registered project UUID).
+ * Rationale: the hub silently drops StartCascade for unregistered projectIds
+ * (grpc status 0, empty response), so folder-bound starts via top-level
+ * workspaceUris are the reliable path for ad-hoc workspaces.
+ */
+function asFolderUri(value?: string): string | undefined {
+  if (!value) return undefined;
+  const v = value.trim();
+  if (/^file:\/\//i.test(v)) return v;
+  if (/^[A-Za-z]:[\\/]/.test(v)) return 'file:///' + v.replace(/\\/g, '/');
+  if (v.startsWith('/')) return 'file://' + v;
+  return undefined;
+}
+
 /** Live state of one background hub delegation, keyed by cascade id. */
 export interface HubRun {
   cascadeId: string;
@@ -864,7 +882,8 @@ export class AntigravityService extends Service {
     callerAgent?: any,
   ): Promise<string> {
     const client = await this.getHubClient();
-    const proj = projectId || this.config.projectId || '';
+    const workspaceUri = asFolderUri(projectId);
+    const proj = workspaceUri ? undefined : (projectId || this.config.projectId || '');
     const appDataDir = this.config.appDataDir || getDefaultAppDataDir();
     const brainDir = `${appDataDir}/brain`;
 
@@ -875,9 +894,10 @@ export class AntigravityService extends Service {
     }
 
     if (!conversationId) {
-      if (!proj) {
+      if (!proj && !workspaceUri) {
         throw new Error(
-          'No project_id available: pass project_id, set config.projectId, or create one with antigravity_create_project.',
+          'No project_id available: pass project_id (a registered project UUID, an absolute folder path, or a file:/// URI), '
+          + 'set config.projectId, or create one with antigravity_create_project.',
         );
       }
       const resolved = await client.resolveModel(model || this.config.defaultModel || DEFAULT_MODEL_ID);
@@ -885,7 +905,7 @@ export class AntigravityService extends Service {
         throw new Error(`Model "${model || this.config.defaultModel}" not found on hub; call antigravity_list_models for valid ids.`);
       }
       const cascadeId = crypto.randomUUID();
-      await client.startCascade({ cascadeId, requestedModel: resolved, projectId: proj });
+      await client.startCascade({ cascadeId, requestedModel: resolved, projectId: proj, workspaceUri });
       conversationId = cascadeId;
       baselineStepIndex = -1;
     }
@@ -1401,6 +1421,8 @@ Google Antigravity (AGY) is Google's multi-agent coding harness running locally 
         name: 'antigravity_delegate',
         description: 'Delegate a task to Google Antigravity via the local hub (burns agy OAuth quota, sessions visible in the IDE). '
           + 'With conversation_id: continues that conversation. Without: creates a new cascade in project_id (or configured default project). '
+          + 'project_id accepts a registered project UUID, an absolute folder path (D:\\path\\to\\dir), or a file:/// URI — folder references '
+          + 'bind the cascade directly to that workspace, no project registration needed. '
           + 'Default: waits for the reply by polling the local transcript (timeout 300s). '
           + 'With background=true: returns a run id immediately; poll it with antigravity_check_run.',
         parameters: {
@@ -1408,7 +1430,7 @@ Google Antigravity (AGY) is Google's multi-agent coding harness running locally 
           properties: {
             task: { type: 'string', description: 'The clear, detailed instruction for the Antigravity agent' },
             model: { type: 'string', description: 'Model display id from antigravity_list_models (default: gemini-3.7-flash-tiered)' },
-            project_id: { type: 'string', description: 'Target project UUID for new cascades' },
+            project_id: { type: 'string', description: 'Target project for new cascades: registered project UUID, absolute folder path, or file:/// URI' },
             conversation_id: { type: 'string', description: 'Existing conversation/cascade UUID to continue' },
             background: { type: 'boolean', description: 'Return a run id immediately instead of waiting for the reply (default false)' },
           },
@@ -1523,7 +1545,10 @@ Google Antigravity (AGY) is Google's multi-agent coding harness running locally 
 
       tools.register({
         name: 'antigravity_create_project',
-        description: 'Create a new Antigravity project rooted at a local folder. Returns the generated projectId for use with antigravity_delegate.',
+        description: 'Create a new Antigravity project rooted at a local folder and verify the hub persisted it. '
+          + 'Returns the generated projectId for use with antigravity_delegate. '
+          + 'NOTE: current hub builds accept CreateProject but often never persist the project; this tool then throws, '
+          + 'in which case simply pass folder_uri itself as project_id to antigravity_delegate (folder-bound start).',
         parameters: {
           type: 'object',
           properties: {
