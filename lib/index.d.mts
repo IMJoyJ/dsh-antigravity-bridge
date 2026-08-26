@@ -270,14 +270,21 @@ declare function discoverHub(config?: {
 }): Promise<HubInfo>;
 declare function clearHubCache(): void;
 //#endregion
+//#region src/hub/projects.d.ts
+interface ResolvedProject {
+  projectId: string;
+  workspaceUri: string;
+  projectName: string;
+  created: boolean;
+}
+//#endregion
 //#region src/hub/client.d.ts
 interface StartCascadeOptions {
   cascadeId: string;
   requestedModel: string;
-  /** Registered project UUID. Mutually exclusive with workspaceUri. */
+  /** Registered project UUID. */
   projectId?: string;
-  /** Folder URI (file:///...) to bind the cascade to directly, without a
-   *  registered project. Backed by StartCascade's top-level workspaceUris. */
+  /** Folder URI (file:///...) to bind the cascade to directly. */
   workspaceUri?: string;
   /** true (default): trajectory source JETBOX so the cascade shows in the IDE
    *  sidebar (agy ≥ 2.9.1 routes CASCADE_CLIENT to externalSummaries; the hub
@@ -289,7 +296,11 @@ interface StartCascadeOptions {
 declare class HubClient {
   private info;
   private registry;
+  private projectResolver;
   constructor(info: HubInfo);
+  /** Resolves a folder path or project UUID to a registered project UUID and workspace URI,
+   *  automatically creating a new project on the hub if no existing project matches. */
+  resolveOrCreateProject(folderOrId?: string): Promise<ResolvedProject>;
   static create(config?: {
     address?: string;
     csrfToken?: string;
@@ -322,6 +333,11 @@ declare class HubClient {
   getCascadeTrajectory(cascadeId: string): Promise<unknown>;
   /** Answer a pending cascade user interaction (the IDE approval dialog's RPC). */
   handleCascadeUserInteraction(cascadeId: string, interaction: Record<string, unknown>): Promise<unknown>;
+  /**
+   * Accurately checks whether the cascade is genuinely blocked waiting for interactive user approval in the IDE.
+   * Distinguishes between auto-approved/running tools (which take seconds to execute) and actual modal prompts.
+   */
+  isCascadeAwaitingApproval(cascadeId: string): Promise<boolean>;
   call(method: string, json: Record<string, unknown>): Promise<unknown>;
 }
 //#endregion

@@ -69,24 +69,6 @@ export interface RunOneShotOptions extends AgentInitConfig {
   attachments?: string[];
 }
 
-/**
- * Interprets a delegate `project_id` argument as a local folder reference.
- * Returns a file:/// URI when the value is a file:/// URI, a Windows absolute
- * path (C:\... or C:/...), or a POSIX absolute path; undefined otherwise
- * (i.e. it is presumably a registered project UUID).
- * Rationale: the hub silently drops StartCascade for unregistered projectIds
- * (grpc status 0, empty response), so folder-bound starts via top-level
- * workspaceUris are the reliable path for ad-hoc workspaces.
- */
-function asFolderUri(value?: string): string | undefined {
-  if (!value) return undefined;
-  const v = value.trim();
-  if (/^file:\/\//i.test(v)) return v;
-  if (/^[A-Za-z]:[\\/]/.test(v)) return 'file:///' + v.replace(/\\/g, '/');
-  if (v.startsWith('/')) return 'file://' + v;
-  return undefined;
-}
-
 /** Live state of one background hub delegation, keyed by cascade id. */
 export interface HubRun {
   cascadeId: string;
@@ -667,7 +649,9 @@ export class AntigravityService extends Service {
     if (snap?.error) {
       status = 'error';
     } else if (snap?.pendingApproval) {
-      status = 'awaiting-approval';
+      const client = await this.getHubClient();
+      const isReal = await client.isCascadeAwaitingApproval(conversationId);
+      status = isReal ? 'awaiting-approval' : 'running';
     } else if (snap?.isFinished && snap.plannerContents.length > 0) {
       // Strict done: a bare isFinished (e.g. setup CHECKPOINT with zero planner
       // output) must not classify as done — that poisoned the registry before.
@@ -751,19 +735,35 @@ export class AntigravityService extends Service {
           break;
         }
 
-        // 2. Pending tool approval in IDE
+        // 2. Pending tool approval in IDE vs Tool execution in progress
         if (snap?.pendingApproval) {
+          const client = await this.getHubClient();
+          const isRealWaiting = await client.isCascadeAwaitingApproval(cascadeId);
+
+          if (!isRealWaiting) {
+            // Auto-approved / YOLO or tool is actively executing in the background.
+            // Do NOT mark as awaiting-approval; stay purely running with zero notification noise.
+            run.status = 'running';
+            run.pendingTool = undefined;
+            this.runs.set(cascadeId, run);
+            await new Promise((r) => setTimeout(r, 1000));
+            continue;
+          }
+
           const isNewApproval = run.status !== 'awaiting-approval' || !run.approvalNotified;
 
           if (isNewApproval) {
-            // YOLO grace window: the IDE auto-approves within a second or two.
-            // Re-poll briefly before spamming the caller with an approval notice;
-            // if the prompt clears on its own, treat it as never having blocked.
+            // Grace window in case IDE auto-approves within 1-2 seconds
             const graceMs = this.config.approvalGraceMs ?? 3_000;
             const graceDeadline = Date.now() + graceMs;
             let cleared = false;
             while (Date.now() < graceDeadline && !this.disposed) {
               await new Promise((r) => setTimeout(r, 500));
+              const stillWaiting = await client.isCascadeAwaitingApproval(cascadeId);
+              if (!stillWaiting) {
+                cleared = true;
+                break;
+              }
               const reSnap = await readCascadeTranscript(brainDir, cascadeId, baseline);
               if (reSnap?.error) {
                 run.status = 'error';
@@ -774,15 +774,12 @@ export class AntigravityService extends Service {
                 this.settleWaiters(cascadeId, { status: 'error', content: AntigravityService.fullReportText(run), error: reSnap.error, lastActiveAt: run.lastActiveAt });
                 return;
               }
-              if (!reSnap?.pendingApproval) {
-                cleared = true;
-                break;
-              }
             }
             if (cleared) {
-              run.lastActiveAt = (await readCascadeTranscript(brainDir, cascadeId, baseline))?.lastActiveAt ?? run.lastActiveAt;
+              run.status = 'running';
+              run.pendingTool = undefined;
               this.runs.set(cascadeId, run);
-              continue; // auto-approved: resume the normal loop as running
+              continue; // auto-approved during grace: resume quietly without notifying
             }
           }
 
@@ -798,20 +795,21 @@ export class AntigravityService extends Service {
             this.settleWaiters(cascadeId, { status: 'awaiting-approval', content: run.content ?? '', pendingTool: snap.pendingApproval, lastActiveAt: run.lastActiveAt });
           }
 
-          // IMPORTANT: Do NOT stop the watcher! Cascade is alive but blocked waiting for user approval.
+          // Cascade is alive but blocked waiting for user approval in IDE
           await new Promise((r) => setTimeout(r, 1000));
           continue;
         }
 
-        // 3. Resumed from awaiting-approval back to running (User approved/rejected in IDE)
+        // 3. Resumed from awaiting-approval back to running (User approved in IDE)
         if (run.status === 'awaiting-approval' && !snap?.pendingApproval) {
           run.status = 'running';
           run.pendingTool = undefined;
-          run.approvalNotified = false;
-          if (!run.resumedNotified) {
+          // ONLY notify resumption if an approval notice was actually sent out before!
+          if (run.approvalNotified && !run.resumedNotified) {
             run.resumedNotified = true;
             this.notifyResumedToDsh(run);
           }
+          run.approvalNotified = false;
           this.runs.set(cascadeId, run);
         }
 
@@ -930,8 +928,6 @@ export class AntigravityService extends Service {
     callerAgent?: any,
   ): Promise<string> {
     const client = await this.getHubClient();
-    const workspaceUri = asFolderUri(projectId);
-    const proj = workspaceUri ? undefined : (projectId || this.config.projectId || '');
     const appDataDir = this.config.appDataDir || getDefaultAppDataDir();
     const brainDir = `${appDataDir}/brain`;
 
@@ -942,22 +938,18 @@ export class AntigravityService extends Service {
     }
 
     if (!conversationId) {
-      if (!proj && !workspaceUri) {
-        throw new Error(
-          'No project_id available: pass project_id (a registered project UUID, an absolute folder path, or a file:/// URI), '
-          + 'set config.projectId, or create one with antigravity_create_project.',
-        );
-      }
-      const resolved = await client.resolveModel(model || this.config.defaultModel || DEFAULT_MODEL_ID);
-      if (!resolved) {
+      const targetInput = projectId || this.config.projectId || process.cwd();
+      const resolvedProj = await client.resolveOrCreateProject(targetInput);
+      const resolvedModel = await client.resolveModel(model || this.config.defaultModel || DEFAULT_MODEL_ID);
+      if (!resolvedModel) {
         throw new Error(`Model "${model || this.config.defaultModel}" not found on hub; call antigravity_list_models for valid ids.`);
       }
       const cascadeId = crypto.randomUUID();
       await client.startCascade({
         cascadeId,
-        requestedModel: resolved,
-        projectId: proj,
-        workspaceUri,
+        requestedModel: resolvedModel,
+        projectId: resolvedProj.projectId,
+        workspaceUri: resolvedProj.workspaceUri,
         sidebarVisible: this.config.sidebarVisible !== false,
       });
       conversationId = cascadeId;
@@ -1013,16 +1005,19 @@ export class AntigravityService extends Service {
       // A CHECKPOINT right after USER_INPUT sets isFinished with zero planner
       // output — that is turn setup, not settlement. Done requires real content.
       const terminalDone = !!(snap?.isFinished && snap.plannerContents.length > 0);
-      // YOLO grace inside the probe too: a pending approval that clears within
-      // ~1.5s is auto-approved by the IDE and should not settle as a request.
-      let pendingConfirmed = !!snap?.pendingApproval;
-      if (pendingConfirmed) {
-        await new Promise((r) => setTimeout(r, 1500));
-        const reSnap = await readCascadeTranscript(brainDir, conversationId, baselineStepIndex);
-        if (!reSnap?.pendingApproval) continue; // auto-approved; keep probing
+      let pendingConfirmed = false;
+      if (snap?.pendingApproval) {
+        const isReal = await client.isCascadeAwaitingApproval(conversationId);
+        if (isReal) {
+          await new Promise((r) => setTimeout(r, 1500));
+          const stillReal = await client.isCascadeAwaitingApproval(conversationId);
+          if (stillReal) {
+            pendingConfirmed = true;
+          }
+        }
       }
       if (snap && (terminalDone || snap.error || pendingConfirmed)) {
-        const status = snap.error ? 'error' : snap.pendingApproval ? 'awaiting-approval' : 'done';
+        const status = snap.error ? 'error' : pendingConfirmed ? 'awaiting-approval' : 'done';
         const run = this.runs.get(conversationId) ?? {
           cascadeId: conversationId,
           status: 'running' as const,

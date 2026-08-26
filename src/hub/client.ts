@@ -2,14 +2,15 @@ import { getHubRegistry } from './registry.js';
 import { grpcWebCall } from './transport.js';
 import { discoverHub, clearHubCache } from './discovery.js';
 import type { HubInfo } from './discovery.js';
+import { ProjectResolver } from './projects.js';
+import type { ResolvedProject } from './projects.js';
 
 export interface StartCascadeOptions {
   cascadeId: string;
   requestedModel: string;
-  /** Registered project UUID. Mutually exclusive with workspaceUri. */
+  /** Registered project UUID. */
   projectId?: string;
-  /** Folder URI (file:///...) to bind the cascade to directly, without a
-   *  registered project. Backed by StartCascade's top-level workspaceUris. */
+  /** Folder URI (file:///...) to bind the cascade to directly. */
   workspaceUri?: string;
   /** true (default): trajectory source JETBOX so the cascade shows in the IDE
    *  sidebar (agy ≥ 2.9.1 routes CASCADE_CLIENT to externalSummaries; the hub
@@ -22,9 +23,16 @@ export interface StartCascadeOptions {
 export class HubClient {
   private info: HubInfo;
   private registry = getHubRegistry();
+  private projectResolver = new ProjectResolver(this);
 
   constructor(info: HubInfo) {
     this.info = info;
+  }
+
+  /** Resolves a folder path or project UUID to a registered project UUID and workspace URI,
+   *  automatically creating a new project on the hub if no existing project matches. */
+  async resolveOrCreateProject(folderOrId?: string): Promise<ResolvedProject> {
+    return this.projectResolver.resolveOrCreateProject(folderOrId, this.info);
   }
 
   static async create(config?: { address?: string; csrfToken?: string }): Promise<HubClient> {
@@ -64,17 +72,13 @@ export class HubClient {
         },
       },
     };
-    if (opts.workspaceUri) {
-      // Folder-bound start: no registered project needed. Verified live:
-      // the hub creates the cascade (brain dir appears ~1s) with the given
-      // folder as its workspace root.
-      body.workspaceUris = [opts.workspaceUri];
-    }
     if (opts.projectId) {
       body.projectEnvConfig = {
         projectId: opts.projectId,
         defaultProjectEnvironment: {},
       };
+    } else if (opts.workspaceUri) {
+      body.workspaceUris = [opts.workspaceUri];
     }
     const resp = await this.call('StartCascade', body);
     // The hub silently no-ops (grpc status 0, empty message) when the given
@@ -172,6 +176,61 @@ export class HubClient {
   /** Answer a pending cascade user interaction (the IDE approval dialog's RPC). */
   async handleCascadeUserInteraction(cascadeId: string, interaction: Record<string, unknown>): Promise<unknown> {
     return this.call('HandleCascadeUserInteraction', { cascadeId, interaction });
+  }
+
+  /**
+   * Accurately checks whether the cascade is genuinely blocked waiting for interactive user approval in the IDE.
+   * Distinguishes between auto-approved/running tools (which take seconds to execute) and actual modal prompts.
+   */
+  async isCascadeAwaitingApproval(cascadeId: string): Promise<boolean> {
+    try {
+      const resp = (await this.getCascadeTrajectory(cascadeId)) as {
+        trajectory?: {
+          steps?: Array<{
+            status?: string | number;
+            type?: string;
+            metadata?: {
+              startedAt?: string;
+              preToolHookResults?: Array<{ decision?: string; allowTool?: boolean }>;
+              requestedInteraction?: unknown;
+            };
+            requestedInteraction?: unknown;
+            codeAction?: { filePermissionRequest?: unknown };
+          }>;
+        };
+      };
+
+      const steps = resp?.trajectory?.steps;
+      if (!steps || steps.length === 0) return false;
+
+      const lastStep = steps[steps.length - 1];
+      const status = lastStep.status;
+      const meta = lastStep.metadata || {};
+      const preHooks = meta.preToolHookResults || [];
+      const isAllowed = preHooks.some((h) => h.decision === 'allow' || h.allowTool === true);
+      const hasStarted = !!meta.startedAt;
+      const isRunning = status === 'CORTEX_STEP_STATUS_RUNNING' || status === 2;
+      const isWaiting = status === 'CORTEX_STEP_STATUS_WAITING' || status === 9;
+      const hasRequestedInteraction = !!(
+        meta.requestedInteraction ||
+        lastStep.requestedInteraction ||
+        lastStep.codeAction?.filePermissionRequest
+      );
+
+      // If the tool has been allowed or is actively running, it is NOT awaiting approval.
+      if (isRunning && (isAllowed || hasStarted)) {
+        return false;
+      }
+
+      // If it is explicitly waiting or has an active unapproved requestedInteraction:
+      if (isWaiting || (hasRequestedInteraction && !isAllowed)) {
+        return true;
+      }
+
+      return false;
+    } catch {
+      return false;
+    }
   }
 
 
