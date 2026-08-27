@@ -19,7 +19,7 @@ import {
   DEFAULT_MODEL_ID,
 } from './models.js';
 import { HubClient } from './hub/client.js';
-import { readCascadeTranscript, PendingToolApproval } from './hub/transcript.js';
+import { readCascadeTranscript, loadTranscriptFile, PendingToolApproval } from './hub/transcript.js';
 import { settingsNamespace, installSettingsSection } from '@deepseek-ai/dsh-settings';
 
 export interface AntigravityConfig {
@@ -1132,15 +1132,10 @@ export class AntigravityService extends Service {
     // (CJK included), unlike quotes/backslashes/whitespace which get JSON-escaped.
     const probe = (content.match(/[\p{L}\p{N}]{8,}/u)?.[0] ?? '').slice(0, 24);
     if (!probe) return true; // nothing distinctive to probe; skip confirmation
-    const file = `${brainDir}/${cascadeId}/.system_generated/logs/transcript.jsonl`;
     const deadline = Date.now() + timeoutMs;
     while (Date.now() < deadline) {
-      try {
-        const text = await fsp.readFile(file, 'utf8');
-        if (text.includes(probe)) return true;
-      } catch {
-        // transcript not readable yet
-      }
+      const loaded = await loadTranscriptFile(brainDir, cascadeId);
+      if (loaded && loaded.text.includes(probe)) return true;
       await new Promise((r) => setTimeout(r, 500));
     }
     return false;

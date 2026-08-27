@@ -250,10 +250,21 @@ interface ParsedTranscript {
   error?: string;
 }
 declare function parseTranscript(lines: string[], baselineStepIndex?: number): ParsedTranscript;
+interface LoadedTranscript {
+  path: string;
+  text: string;
+  mtimeMs: number;
+}
+/**
+ * Loads the cascade transcript from disk, preferring the full fidelity transcript
+ * (`transcript_full.jsonl`) over the compact/truncated view (`transcript.jsonl`).
+ * Evaluated dynamically per read so callers cleanly handle files appearing at different times.
+ */
+declare function loadTranscriptFile(brainDir: string, cascadeId: string): Promise<LoadedTranscript | undefined>;
 /** One-shot read+parse of a cascade transcript; undefined when the file does not exist yet. */
 declare function readCascadeTranscript(brainDir: string, cascadeId: string, baselineStepIndex?: number): Promise<TranscriptSnapshot | undefined>;
 /**
- * Polls a cascade's transcript.jsonl until the planner answered (file stable
+ * Polls a cascade's transcript until the planner answered (file stable
  * for `stableMs` or a CHECKPOINT follows the reply), an approval is needed,
  * an error step appears, or the timeout elapses.
  */
@@ -508,5 +519,5 @@ declare class AntigravityBridgePlugin {
   constructor(ctx: Context, config: AntigravityConfig);
 }
 //#endregion
-export { ANTIGRAVITY_MODELS, AgentInitConfig, AgentStep, AntigravityAgent, AntigravityConfig, AntigravityEngine, AntigravityModelInfo, AntigravityService, CascadeDetailedResult, Config, ConversationSummary, ConversationTreeNode, DEFAULT_MODEL_ID, EngineConfig, HarnessSessionInfo, HubClient, HubInfo, HubRun, ListConversationsOptions, MediaInput, PendingToolApproval, PollResult, PromptContent, PromptItem, ProtoMediaPart, RunOneShotOptions, SessionContinuationMode, SettlementNoticePayload, StartCascadeOptions, TokenUsage, TranscriptSnapshot, TranscriptStep, buildConversationGraph, buildSettlementNotice, clearHubCache, AntigravityBridgePlugin as default, discoverHub, fileToMedia, getConversationTree, getDefaultAppDataDir, guessMimeType, listConversations, normalizeModelName, normalizePromptParts, parseTranscript, pollTranscript, readCascadeTranscript, renderAsciiTree };
+export { ANTIGRAVITY_MODELS, AgentInitConfig, AgentStep, AntigravityAgent, AntigravityConfig, AntigravityEngine, AntigravityModelInfo, AntigravityService, CascadeDetailedResult, Config, ConversationSummary, ConversationTreeNode, DEFAULT_MODEL_ID, EngineConfig, HarnessSessionInfo, HubClient, HubInfo, HubRun, ListConversationsOptions, LoadedTranscript, MediaInput, PendingToolApproval, PollResult, PromptContent, PromptItem, ProtoMediaPart, RunOneShotOptions, SessionContinuationMode, SettlementNoticePayload, StartCascadeOptions, TokenUsage, TranscriptSnapshot, TranscriptStep, buildConversationGraph, buildSettlementNotice, clearHubCache, AntigravityBridgePlugin as default, discoverHub, fileToMedia, getConversationTree, getDefaultAppDataDir, guessMimeType, listConversations, loadTranscriptFile, normalizeModelName, normalizePromptParts, parseTranscript, pollTranscript, readCascadeTranscript, renderAsciiTree };
 //# sourceMappingURL=index.d.mts.map

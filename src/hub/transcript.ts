@@ -225,20 +225,51 @@ export function parseTranscript(lines: string[], baselineStepIndex = -1): Parsed
   return result;
 }
 
+export interface LoadedTranscript {
+  path: string;
+  text: string;
+  mtimeMs: number;
+}
+
+/**
+ * Loads the cascade transcript from disk, preferring the full fidelity transcript
+ * (`transcript_full.jsonl`) over the compact/truncated view (`transcript.jsonl`).
+ * Evaluated dynamically per read so callers cleanly handle files appearing at different times.
+ */
+export async function loadTranscriptFile(
+  brainDir: string,
+  cascadeId: string,
+): Promise<LoadedTranscript | undefined> {
+  const logDir = join(brainDir, cascadeId, '.system_generated', 'logs');
+  const fullPath = join(logDir, 'transcript_full.jsonl');
+  const compactPath = join(logDir, 'transcript.jsonl');
+
+  try {
+    const s = await stat(fullPath);
+    const text = await readFile(fullPath, 'utf8');
+    return { path: fullPath, text, mtimeMs: s.mtimeMs };
+  } catch {
+    try {
+      const s = await stat(compactPath);
+      const text = await readFile(compactPath, 'utf8');
+      return { path: compactPath, text, mtimeMs: s.mtimeMs };
+    } catch {
+      return undefined;
+    }
+  }
+}
+
 /** One-shot read+parse of a cascade transcript; undefined when the file does not exist yet. */
 export async function readCascadeTranscript(
   brainDir: string,
   cascadeId: string,
   baselineStepIndex = -1,
 ): Promise<TranscriptSnapshot | undefined> {
-  const logPath = join(brainDir, cascadeId, '.system_generated', 'logs', 'transcript.jsonl');
-  let text: string;
-  try {
-    text = await readFile(logPath, 'utf8');
-  } catch {
+  const loaded = await loadTranscriptFile(brainDir, cascadeId);
+  if (!loaded) {
     return undefined; // transcript not materialized yet
   }
-  const lines = text.split('\n').filter((l) => l.trim());
+  const lines = loaded.text.split('\n').filter((l) => l.trim());
   const parsed = parseTranscript(lines, baselineStepIndex);
   return {
     maxStepIndex: parsed.maxStepIndex,
@@ -252,7 +283,7 @@ export async function readCascadeTranscript(
 }
 
 /**
- * Polls a cascade's transcript.jsonl until the planner answered (file stable
+ * Polls a cascade's transcript until the planner answered (file stable
  * for `stableMs` or a CHECKPOINT follows the reply), an approval is needed,
  * an error step appears, or the timeout elapses.
  */
@@ -264,7 +295,6 @@ export async function pollTranscript(
   stableMs = 4000,
   baselineStepIndex = -1,
 ): Promise<PollResult> {
-  const logPath = join(brainDir, cascadeId, '.system_generated', 'logs', 'transcript.jsonl');
   const deadline = Date.now() + timeoutMs;
   let lastChange = Date.now();
   let lastFingerprint = '';
@@ -272,17 +302,14 @@ export async function pollTranscript(
 
   while (Date.now() < deadline) {
     let lines: string[] | undefined;
-    try {
-      const s = await stat(logPath);
-      const text = await readFile(logPath, 'utf8');
-      lines = text.split('\n').filter((l) => l.trim());
-      const fingerprint = `${s.mtimeMs}:${lines.length}`;
+    const loaded = await loadTranscriptFile(brainDir, cascadeId);
+    if (loaded) {
+      lines = loaded.text.split('\n').filter((l) => l.trim());
+      const fingerprint = `${loaded.path}:${loaded.mtimeMs}:${lines.length}`;
       if (fingerprint !== lastFingerprint) {
         lastFingerprint = fingerprint;
         lastChange = Date.now();
       }
-    } catch {
-      // transcript not materialized yet
     }
 
     if (lines) {
