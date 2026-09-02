@@ -186,7 +186,7 @@ interface AntigravityModelInfo {
   description: string;
 }
 declare const ANTIGRAVITY_MODELS: AntigravityModelInfo[];
-declare const DEFAULT_MODEL_ID = "gemini-3.7-flash";
+declare const DEFAULT_MODEL_ID = "gemini-3.8-flash";
 /**
  * Normalizes input model name or alias to canonical Antigravity model ID.
  */
@@ -304,11 +304,34 @@ interface StartCascadeOptions {
    *  CASCADE_CLIENT (external, hidden from sidebar). */
   sidebarVisible?: boolean;
 }
+interface HubCallOptions {
+  /** Passed through to grpcWebCall: 'reject' makes a frame-less 200 body throw
+   *  HubTransportError (data-returning methods), 'allow' decodes it as an
+   *  empty message (methods whose empty response is legitimate). */
+  emptyResponse?: 'allow' | 'reject';
+}
+/**
+ * Decides whether an error from a hub call means the cached hub endpoint is
+ * stale and one rediscovery + retry could still succeed. Covers:
+ * - {@link HubTransportError} (HTTP-level failure or rejected frame-less body);
+ * - Node fetch network failures, whose ECONNREFUSED and friends live in
+ *   `err.cause` — the outer message is just "fetch failed" — including
+ *   AggregateError causes with multiple inner errors;
+ * - the pre-existing message conventions "401" / "Unauthenticated".
+ */
+declare function isStaleHubError(err: unknown): boolean;
 declare class HubClient {
   private info;
+  /** Config from {@link HubClient.create}; the self-heal retry re-discovers
+   *  with it so config-pinned setups stay pinned (and just get one transparent
+   *  retry) while dynamic setups get real rediscovery. */
+  private readonly createConfig?;
   private registry;
   private projectResolver;
-  constructor(info: HubInfo);
+  constructor(info: HubInfo, createConfig?: {
+    address?: string;
+    csrfToken?: string;
+  });
   /** Resolves a folder path or project UUID to a registered project UUID and workspace URI,
    *  automatically creating a new project on the hub if no existing project matches. */
   resolveOrCreateProject(folderOrId?: string): Promise<ResolvedProject>;
@@ -317,7 +340,7 @@ declare class HubClient {
     csrfToken?: string;
   }): Promise<HubClient>;
   getAvailableModels(): Promise<unknown>;
-  /** Maps a display id (e.g. "gemini-3.7-flash-tiered") to the hub's
+  /** Maps a display id (e.g. "gemini-3.8-flash-high") to the hub's
    *  MODEL_* enum name. Response shape: { response: { models: { id: {...} } } }. */
   resolveModel(displayId: string): Promise<string | undefined>;
   startCascade(opts: StartCascadeOptions): Promise<unknown>;
@@ -349,10 +372,82 @@ declare class HubClient {
    * Distinguishes between auto-approved/running tools (which take seconds to execute) and actual modal prompts.
    */
   isCascadeAwaitingApproval(cascadeId: string): Promise<boolean>;
-  call(method: string, json: Record<string, unknown>): Promise<unknown>;
+  call(method: string, json: Record<string, unknown>, options?: HubCallOptions): Promise<unknown>;
+  private rawCall;
 }
 //#endregion
+//#region src/hub/classifier.d.ts
+/**
+ * Error signature classifier for transient vs terminal cascade errors in Google Antigravity.
+ *
+ * Transient retryable errors:
+ * 1. Empty model output ('model_output_empty')
+ * 2. Interrupted stream ('stream_interrupted')
+ * 3. Expired OAuth access token ('auth_token_expired') - HTTP 401 with invalid_token / UNAUTHENTICATED
+ *
+ * Terminal non-retryable errors:
+ * - DELIVERY FAILED / hub-side dead state
+ * - 403 / PERMISSION_DENIED (permission issues)
+ * - Persistent OAuth failure ("OAuth 凭据已失效，请重新登录 Antigravity", invalid_grant, revoked refresh token)
+ */
+type TransientErrorSignature = 'model_output_empty' | 'stream_interrupted' | 'auth_token_expired';
+interface ErrorClassification {
+  /** Whether this error is a transient error eligible for auto-resume. */
+  retryable: boolean;
+  /** Transient error signature identifier if retryable. */
+  signature?: TransientErrorSignature;
+  /** Explanatory reason if terminal / non-retryable. */
+  reason?: string;
+  /** Normalized raw error message text. */
+  rawError: string;
+}
+/** Default exponential backoff delay schedule for auto-resume: 2s, 5s, 10s. */
+declare const BACKOFF_SCHEDULE_MS: readonly [2000, 5000, 10000];
+/**
+ * Checks if the error string matches an expired/invalid OAuth access token (HTTP 401 invalid_token / UNAUTHENTICATED).
+ */
+declare function isAuthTokenExpiredError(rawError: string): boolean;
+/**
+ * Get backoff delay in ms for a given 0-based retry index.
+ * For auth_token_expired, returns 1000ms (1s) to allow hub-side token refresh.
+ * For other transient errors: 0 -> 2000ms, 1 -> 5000ms, 2+ -> 10000ms.
+ */
+declare function getAutoResumeBackoffMs(retryIndex: number, signature?: TransientErrorSignature): number;
+/**
+ * Get maximum allowed retries for a given error signature.
+ * auth_token_expired is capped at 2 retries; standard transient errors use config (default 3).
+ */
+declare function getMaxRetriesForSignature(signature?: TransientErrorSignature, configMaxRetries?: number): number;
+/**
+ * Format terminal error for expired/invalid OAuth credentials.
+ */
+declare function formatAuthExpiredTerminalError(details?: string): string;
+/**
+ * Format error message when auto-resume retries are exhausted.
+ */
+declare function formatExhaustedRetryError(retries: number, originalError: string, signature?: TransientErrorSignature): string;
+/**
+ * Extracts the error string from various error containers (Error object, step, snapshot, string, HTTP response object).
+ */
+declare function extractErrorMessage(input: unknown): string;
+/**
+ * Classifies an error input into transient retryable vs terminal.
+ */
+declare function classifyError(error: unknown): ErrorClassification;
+/**
+ * Fast boolean check if an error is a transient retryable cascade error.
+ */
+declare function isTransientRetryableError(error: unknown): boolean;
+//#endregion
 //#region src/index.d.ts
+interface AutoResumeConfig {
+  /** Automatically resume cascade on transient errors (default true). */
+  enabled?: boolean;
+  /** Maximum consecutive auto-resume retries per cascade (default 3). */
+  maxRetries?: number;
+  /** Instruction sent to the cascade when resuming (default "继续。按原计划继续执行当前任务，不要停止。"). */
+  message?: string;
+}
 interface AntigravityConfig {
   backend?: 'hub' | 'localharness';
   binaryPath?: string;
@@ -370,6 +465,8 @@ interface AntigravityConfig {
   sidebarVisible?: boolean;
   /** Grace window (ms) for YOLO auto-approval before an awaiting-approval notice is pushed (default 3000). */
   approvalGraceMs?: number;
+  /** Transient error auto-resume configuration. */
+  autoResume?: AutoResumeConfig;
 }
 declare const Config: Schema<AntigravityConfig>;
 declare module '@deepseek-ai/cordis' {
@@ -402,6 +499,8 @@ interface HubRun {
   reportPath?: string;
   /** Character length of the full accumulated report that reportPath covers. */
   reportChars?: number;
+  /** Consecutive auto-resume retry count for transient errors in the current turn/streak. */
+  autoResumeRetries?: number;
 }
 interface CascadeDetailedResult {
   status: 'done' | 'awaiting-approval' | 'running' | 'timeout' | 'error';
@@ -487,6 +586,12 @@ declare class AntigravityService extends Service {
    * instant path and waitForSettlement's deadline path.
    */
   private classifySnapshot;
+  /**
+   * Evaluates a cascade error: if transient and retry budget remains, archives current content,
+   * waits backoff, bumps the baseline, sends the resume message to the hub, and returns { resumed: true }.
+   * Otherwise marks terminal error, lands report, notifies DSH, settles waiters, and returns { resumed: false }.
+   */
+  private handleCascadeError;
   /** Unified active cascade loop — the SINGLE poller per cascade. Tracks running/approval/error/done
    *  transitions off the local transcript, notifies DSH, releases parked settlement waiters, and lands
    *  oversized reports on disk. WaitForConversationFullyIdle is deliberately NOT used here: the hub
@@ -519,5 +624,5 @@ declare class AntigravityBridgePlugin {
   constructor(ctx: Context, config: AntigravityConfig);
 }
 //#endregion
-export { ANTIGRAVITY_MODELS, AgentInitConfig, AgentStep, AntigravityAgent, AntigravityConfig, AntigravityEngine, AntigravityModelInfo, AntigravityService, CascadeDetailedResult, Config, ConversationSummary, ConversationTreeNode, DEFAULT_MODEL_ID, EngineConfig, HarnessSessionInfo, HubClient, HubInfo, HubRun, ListConversationsOptions, LoadedTranscript, MediaInput, PendingToolApproval, PollResult, PromptContent, PromptItem, ProtoMediaPart, RunOneShotOptions, SessionContinuationMode, SettlementNoticePayload, StartCascadeOptions, TokenUsage, TranscriptSnapshot, TranscriptStep, buildConversationGraph, buildSettlementNotice, clearHubCache, AntigravityBridgePlugin as default, discoverHub, fileToMedia, getConversationTree, getDefaultAppDataDir, guessMimeType, listConversations, loadTranscriptFile, normalizeModelName, normalizePromptParts, parseTranscript, pollTranscript, readCascadeTranscript, renderAsciiTree };
+export { ANTIGRAVITY_MODELS, AgentInitConfig, AgentStep, AntigravityAgent, AntigravityConfig, AntigravityEngine, AntigravityModelInfo, AntigravityService, AutoResumeConfig, BACKOFF_SCHEDULE_MS, CascadeDetailedResult, Config, ConversationSummary, ConversationTreeNode, DEFAULT_MODEL_ID, EngineConfig, ErrorClassification, HarnessSessionInfo, HubCallOptions, HubClient, HubInfo, HubRun, ListConversationsOptions, LoadedTranscript, MediaInput, PendingToolApproval, PollResult, PromptContent, PromptItem, ProtoMediaPart, RunOneShotOptions, SessionContinuationMode, SettlementNoticePayload, StartCascadeOptions, TokenUsage, TranscriptSnapshot, TranscriptStep, TransientErrorSignature, buildConversationGraph, buildSettlementNotice, classifyError, clearHubCache, AntigravityBridgePlugin as default, discoverHub, extractErrorMessage, fileToMedia, formatAuthExpiredTerminalError, formatExhaustedRetryError, getAutoResumeBackoffMs, getConversationTree, getDefaultAppDataDir, getMaxRetriesForSignature, guessMimeType, isAuthTokenExpiredError, isStaleHubError, isTransientRetryableError, listConversations, loadTranscriptFile, normalizeModelName, normalizePromptParts, parseTranscript, pollTranscript, readCascadeTranscript, renderAsciiTree };
 //# sourceMappingURL=index.d.mts.map

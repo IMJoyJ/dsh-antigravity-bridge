@@ -10,10 +10,10 @@ export interface AntigravityModelInfo {
 
 export const ANTIGRAVITY_MODELS: AntigravityModelInfo[] = [
   {
-    id: 'gemini-3.7-flash',
-    name: 'Gemini 3.7 Flash',
+    id: 'gemini-3.8-flash',
+    name: 'Gemini 3.8 Flash',
     group: 'gemini',
-    aliases: ['flash', '3.7-flash', 'gemini-flash', 'default'],
+    aliases: ['flash', '3.8-flash', 'gemini-flash', 'default'],
     recommended: true,
     contextWindow: '1M+ tokens',
     description: '【推荐默认】Gemini 配额组（充沛配额，适合高并发与大量子任务），速度极快，支持 1M+ 超长上下文与多模态分析，日常编码与工程分析首选。'
@@ -34,7 +34,7 @@ export const ANTIGRAVITY_MODELS: AntigravityModelInfo[] = [
     aliases: ['sonnet', 'sonnet-4.6', 'claude-sonnet'],
     recommended: false,
     contextWindow: '200k tokens',
-    description: '非 Gemini 配额组常规模型，综合能力与配额性价比均次于 Gemini 3.7 Flash。'
+    description: '非 Gemini 配额组常规模型，综合能力与配额性价比均次于 Gemini 3.8 Flash。'
   },
   {
     id: 'gemini-3.1-pro',
@@ -43,7 +43,7 @@ export const ANTIGRAVITY_MODELS: AntigravityModelInfo[] = [
     aliases: ['pro', '3.1-pro', 'gemini-pro'],
     recommended: false,
     contextWindow: '1M+ tokens',
-    description: '通用知识问答与综合常识模型；编码能力弱于 3.7 Flash，不推荐作为主力编程任务模型。'
+    description: '通用知识问答与综合常识模型；编码能力弱于 3.8 Flash，不推荐作为主力编程任务模型。'
   },
   {
     id: 'gpt-oss-120b',
@@ -56,7 +56,7 @@ export const ANTIGRAVITY_MODELS: AntigravityModelInfo[] = [
   }
 ];
 
-export const DEFAULT_MODEL_ID = 'gemini-3.7-flash';
+export const DEFAULT_MODEL_ID = 'gemini-3.8-flash';
 
 /**
  * Normalizes input model name or alias to canonical Antigravity model ID.

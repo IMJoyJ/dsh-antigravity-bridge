@@ -2,6 +2,6 @@
 $plugins:
   "@dsh-external/dsh-antigravity-bridge":
     backend: "hub"
-    defaultModel: "gemini-3.7-flash-tiered"
+    defaultModel: "gemini-3.8-flash-high"
     projectId: "a1b2c3d4-0000-4000-8000-d51ec0000001"
     pollTimeoutMs: 300000

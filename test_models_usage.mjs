@@ -14,7 +14,7 @@ async function main() {
   }
 
   console.log('\n--- 2. Testing normalizeModelName helper ---');
-  const testAliases = ['flash', '3.7-flash', 'opus', 'opus-4.6', 'pro', 'unknown-model'];
+  const testAliases = ['flash', '3.8-flash', 'opus', 'opus-4.6', 'pro', 'unknown-model'];
   for (const alias of testAliases) {
     console.log(`  "${alias}"  ==>  "${normalizeModelName(alias)}"`);
   }
@@ -35,7 +35,7 @@ async function main() {
 
   try {
     await agent.start({
-      model: 'gemini-3.7-flash'
+      model: 'gemini-3.8-flash'
     });
 
     console.log(`✓ Agent started with model: ${agent.model}`);

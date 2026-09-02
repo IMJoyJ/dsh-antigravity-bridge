@@ -144,7 +144,7 @@ src/
 $plugins:
   "@dsh-external/dsh-antigravity-bridge":
     backend: "hub"                          # 后端类型: "hub" (推荐) 或 "localharness"
-    defaultModel: "gemini-3.7-flash-tiered" # 默认模型显示 ID
+    defaultModel: "gemini-3.8-flash-high" # 默认模型显示 ID
     projectId: "<默认 project uuid>"         # delegate 新建 cascade 的默认归属
     pollTimeoutMs: 300000                   # 结算等待超时 (ms, 默认 300s)
     watchMaxMs: 43200000                    # 后台生命周期监视器绝对上限 (ms, 默认 12h)

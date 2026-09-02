@@ -6,7 +6,7 @@ import os from 'node:os';
 
 const brainDir = path.join(os.homedir(), '.gemini', 'antigravity', 'brain');
 const client = await HubClient.create();
-const model = await client.resolveModel('gemini-3.7-flash-tiered');
+const model = await client.resolveModel('gemini-3.8-flash-high');
 
 const id = crypto.randomUUID();
 const resp = await client.startCascade({

@@ -19,7 +19,7 @@ try {
   console.log('2. GetAvailableModels OK:', count, 'models');
 
   step = 'resolveModel';
-  const placeholder = await client.resolveModel('gemini-3.7-flash-tiered');
+  const placeholder = await client.resolveModel('gemini-3.8-flash-high');
   console.log('3. resolveModel OK:', placeholder);
   if (!placeholder) throw new Error('resolveModel returned undefined');
 

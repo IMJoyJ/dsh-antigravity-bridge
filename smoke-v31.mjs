@@ -9,7 +9,7 @@ const BRAIN = path.join(getDefaultAppDataDir(), 'brain');
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 const client = await HubClient.create();
-const model = await client.resolveModel('gemini-3.7-flash-tiered');
+const model = await client.resolveModel('gemini-3.8-flash-high');
 const id = crypto.randomUUID();
 await client.startCascade({ cascadeId: id, requestedModel: model, projectId: PROJECT_ID });
 await client.sendMessage(id, 'Write one haiku about compilers, then on a new line say exactly: V31DONE. Do not use any tools.');

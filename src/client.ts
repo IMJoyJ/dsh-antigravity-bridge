@@ -170,7 +170,7 @@ export class AntigravityAgent extends EventEmitter {
 
       // Check stop reason for quota exhaustion
       if (su.stopReason === 6 || su.stop_reason === 6 || su.stopReason === 'STOP_REASON_QUOTA_EXHAUSTED') {
-        const quotaErr = new Error(`[Antigravity Quota Limit] Model "${this.currentModel}" has exhausted its usage quota. Please wait for quota reset or switch to Gemini 3.7 Flash.`);
+        const quotaErr = new Error(`[Antigravity Quota Limit] Model "${this.currentModel}" has exhausted its usage quota. Please wait for quota reset or switch to Gemini 3.8 Flash.`);
         this.emit('error', quotaErr);
       }
 

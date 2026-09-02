@@ -24,7 +24,7 @@ Native TypeScript Google Antigravity (Gemini Agent) Bridge for DeepSeek Harness 
 向 Antigravity 委托任务。
 - **参数**：
   - `task` (string, 必需)：任务说明或提示词。
-  - `model` (string, 可选)：模型显示 ID（如 `gemini-3.7-flash-tiered`，默认从配置读取）。
+  - `model` (string, 可选)：模型显示 ID（如 `gemini-3.8-flash-high`，默认从配置读取）。
   - `project_id` (string, 可选)：目标项目 UUID（若未提供且无 `conversation_id` 则使用配置默认项目）。
   - `conversation_id` (string, 可选)：已有会话/Cascade UUID，提供时在此会话中追加并继续执行。
   - `background` (boolean, 可选)：是否后台异步执行（默认 `false`）。
@@ -116,7 +116,7 @@ Native TypeScript Google Antigravity (Gemini Agent) Bridge for DeepSeek Harness 
 $plugins:
   "@dsh-external/dsh-antigravity-bridge":
     backend: "hub"                          # 后端模式: "hub" (默认, 走本地 IDE) 或 "localharness" (走独立 SDK 二进制)
-    defaultModel: "gemini-3.7-flash-tiered" # 默认模型显示 ID
+    defaultModel: "gemini-3.8-flash-high" # 默认模型显示 ID
     projectId: "a1b2c3d4-0000-4000-8000-d51ec0000001" # 默认项目 UUID (新建 cascade 时使用)
     pollTimeoutMs: 300000                   # 同步轮询超时时间 (ms, 默认 300s)
     watchMaxMs: 43200000                    # 后台生命周期监视器绝对上限 (ms, 默认 12 小时)
