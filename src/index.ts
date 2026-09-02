@@ -20,7 +20,26 @@ import {
 } from './models.js';
 import { HubClient } from './hub/client.js';
 import { readCascadeTranscript, loadTranscriptFile, PendingToolApproval } from './hub/transcript.js';
-import { settingsNamespace, installSettingsSection } from '@deepseek-ai/dsh-settings';
+import {
+  classifyError,
+  isTransientRetryableError,
+  isAuthTokenExpiredError,
+  getAutoResumeBackoffMs,
+  getMaxRetriesForSignature,
+  formatExhaustedRetryError,
+  formatAuthExpiredTerminalError,
+  TransientErrorSignature,
+  ErrorClassification,
+} from './hub/classifier.js';
+
+export interface AutoResumeConfig {
+  /** Automatically resume cascade on transient errors (default true). */
+  enabled?: boolean;
+  /** Maximum consecutive auto-resume retries per cascade (default 3). */
+  maxRetries?: number;
+  /** Instruction sent to the cascade when resuming (default "继续。按原计划继续执行当前任务，不要停止。"). */
+  message?: string;
+}
 
 export interface AntigravityConfig {
   backend?: 'hub' | 'localharness';
@@ -39,6 +58,8 @@ export interface AntigravityConfig {
   sidebarVisible?: boolean;
   /** Grace window (ms) for YOLO auto-approval before an awaiting-approval notice is pushed (default 3000). */
   approvalGraceMs?: number;
+  /** Transient error auto-resume configuration. */
+  autoResume?: AutoResumeConfig;
 }
 
 export const Config: Schema<AntigravityConfig> = Schema.object({
@@ -57,6 +78,15 @@ export const Config: Schema<AntigravityConfig> = Schema.object({
   inlineCharBudget: Schema.number().default(4_000).description('Inline character budget for report bodies; longer reports are persisted to a file and referenced by path (default 4000)'),
   sidebarVisible: Schema.boolean().default(true).description('Show bridge-created cascades in the Antigravity IDE sidebar (agy >= 2.9.1 hides source=CASCADE_CLIENT sessions; uses JETBOX which the hub accepts and the frontend treats as local); false keeps them external/search-only'),
   approvalGraceMs: Schema.number().default(3_000).description('Grace window in ms for IDE YOLO auto-approval before pushing an awaiting-approval notice (default 3000)'),
+  autoResume: Schema.object({
+    enabled: Schema.boolean().default(true).description('Automatically resume cascade on transient errors (default true)'),
+    maxRetries: Schema.number().default(3).description('Maximum consecutive auto-resume retries per cascade (default 3)'),
+    message: Schema.string().default('继续。按原计划继续执行当前任务，不要停止。').description('Resume prompt message sent to the cascade'),
+  }).default({
+    enabled: true,
+    maxRetries: 3,
+    message: '继续。按原计划继续执行当前任务，不要停止。',
+  }).description('Transient error auto-resume configuration'),
 });
 
 declare module '@deepseek-ai/cordis' {
@@ -91,6 +121,8 @@ export interface HubRun {
   reportPath?: string;
   /** Character length of the full accumulated report that reportPath covers. */
   reportChars?: number;
+  /** Consecutive auto-resume retry count for transient errors in the current turn/streak. */
+  autoResumeRetries?: number;
 }
 
 export interface CascadeDetailedResult {
@@ -437,7 +469,15 @@ export class AntigravityService extends Service {
     const resp = (await client.getAvailableModels()) as {
       response?: { models?: Record<string, Record<string, unknown>> };
     };
-    const models = resp.response?.models ?? {};
+    const models = resp.response?.models;
+    if (!models) {
+      // Fail loud: after a hub restart a stale endpoint used to decode into an
+      // empty message here and surface as an empty model catalog.
+      throw new Error(
+        'GetAvailableModels returned an unexpected shape (missing response.models): '
+        + JSON.stringify(resp).slice(0, 300),
+      );
+    }
     const slim: Record<string, unknown> = {};
     for (const [id, m] of Object.entries(models)) {
       const quota = m.quotaInfo as Record<string, unknown> | undefined;
@@ -502,6 +542,7 @@ export class AntigravityService extends Service {
     run.lastNotifiedTransition = undefined;
     run.reportPath = undefined;
     run.reportChars = undefined;
+    run.autoResumeRetries = 0;
     if (callerAgent) run.callerAgent = callerAgent;
     return run;
   }
@@ -691,6 +732,99 @@ export class AntigravityService extends Service {
     };
   }
 
+  /**
+   * Evaluates a cascade error: if transient and retry budget remains, archives current content,
+   * waits backoff, bumps the baseline, sends the resume message to the hub, and returns { resumed: true }.
+   * Otherwise marks terminal error, lands report, notifies DSH, settles waiters, and returns { resumed: false }.
+   */
+  private async handleCascadeError(
+    cascadeId: string,
+    run: HubRun,
+    errorText: string,
+    maxStepIndex?: number,
+  ): Promise<{ resumed: boolean }> {
+    const autoResume = this.config.autoResume;
+    const enabled = autoResume?.enabled !== false;
+    const configMaxRetries = autoResume?.maxRetries ?? 3;
+    const message = autoResume?.message || '继续。按原计划继续执行当前任务，不要停止。';
+    const classification = classifyError(errorText);
+    const isTransient = classification.retryable;
+    const signature = classification.signature;
+    const maxRetries = getMaxRetriesForSignature(signature, configMaxRetries);
+    const currentRetries = run.autoResumeRetries ?? 0;
+
+    if (enabled && isTransient && currentRetries < maxRetries) {
+      const nextRetry = currentRetries + 1;
+      run.autoResumeRetries = nextRetry;
+      const backoffMs = getAutoResumeBackoffMs(currentRetries, signature);
+
+      // Archive content produced before the error so nothing is lost
+      const prev = (run.content ?? '').trim();
+      if (prev) {
+        run.priorContents = [...(run.priorContents ?? []), prev];
+        run.content = undefined;
+      }
+
+      // Bump baseline to skip previous error step in future reads
+      const newBaseline = maxStepIndex !== undefined && maxStepIndex >= 0 ? maxStepIndex : (run.baselineStepIndex ?? -1);
+      run.baselineStepIndex = newBaseline;
+      run.status = 'running';
+      run.error = undefined;
+      run.pendingTool = undefined;
+      this.runs.set(cascadeId, run);
+
+      // Wait backoff delay (1s for auth refresh, 2s/5s/10s for other transient)
+      await new Promise((r) => setTimeout(r, backoffMs));
+      if (this.disposed) return { resumed: false };
+
+      try {
+        const client = await this.getHubClient();
+        await client.sendMessage(cascadeId, message);
+        return { resumed: true };
+      } catch (sendErr) {
+        const errMsg = sendErr instanceof Error ? sendErr.message : String(sendErr);
+        const sendClassification = classifyError(errMsg);
+        if (sendClassification.signature === 'auth_token_expired' || /401|unauthenticated/i.test(errMsg)) {
+          run.status = 'error';
+          run.error = formatAuthExpiredTerminalError(`发送继续指令失败: ${errMsg}`);
+        } else {
+          run.status = 'error';
+          run.error = `已自动重试 ${nextRetry} 次但在发送继续指令时失败: ${errMsg} (原错误: ${errorText})`;
+        }
+        this.runs.set(cascadeId, run);
+        await this.landReport(run);
+        this.notifySettlementToDsh(run);
+        this.settleWaiters(cascadeId, {
+          status: 'error',
+          content: AntigravityService.fullReportText(run),
+          error: run.error,
+          lastActiveAt: run.lastActiveAt,
+        });
+        return { resumed: false };
+      }
+    }
+
+    // Terminal / exhausted / disabled
+    run.status = 'error';
+    if (enabled && isTransient && currentRetries >= maxRetries) {
+      run.error = formatExhaustedRetryError(maxRetries, errorText, signature);
+    } else if (classification.reason === 'terminal_auth_permanent_failure') {
+      run.error = formatAuthExpiredTerminalError(errorText);
+    } else {
+      run.error = errorText;
+    }
+    this.runs.set(cascadeId, run);
+    await this.landReport(run);
+    this.notifySettlementToDsh(run);
+    this.settleWaiters(cascadeId, {
+      status: 'error',
+      content: AntigravityService.fullReportText(run),
+      error: run.error,
+      lastActiveAt: run.lastActiveAt,
+    });
+    return { resumed: false };
+  }
+
   /** Unified active cascade loop — the SINGLE poller per cascade. Tracks running/approval/error/done
    *  transitions off the local transcript, notifies DSH, releases parked settlement waiters, and lands
    *  oversized reports on disk. WaitForConversationFullyIdle is deliberately NOT used here: the hub
@@ -726,12 +860,12 @@ export class AntigravityService extends Service {
 
         // 1. Error state
         if (snap?.error) {
-          run.status = 'error';
-          run.error = snap.error;
-          this.runs.set(cascadeId, run);
-          await this.landReport(run);
-          this.notifySettlementToDsh(run);
-          this.settleWaiters(cascadeId, { status: 'error', content: AntigravityService.fullReportText(run), error: snap.error, lastActiveAt: run.lastActiveAt });
+          const { resumed } = await this.handleCascadeError(cascadeId, run, snap.error, snap.maxStepIndex);
+          if (resumed) {
+            idleCycles = 0;
+            lastStepSeen = -2;
+            continue;
+          }
           break;
         }
 
@@ -766,12 +900,12 @@ export class AntigravityService extends Service {
               }
               const reSnap = await readCascadeTranscript(brainDir, cascadeId, baseline);
               if (reSnap?.error) {
-                run.status = 'error';
-                run.error = reSnap.error;
-                this.runs.set(cascadeId, run);
-                await this.landReport(run);
-                this.notifySettlementToDsh(run);
-                this.settleWaiters(cascadeId, { status: 'error', content: AntigravityService.fullReportText(run), error: reSnap.error, lastActiveAt: run.lastActiveAt });
+                const { resumed } = await this.handleCascadeError(cascadeId, run, reSnap.error, reSnap.maxStepIndex);
+                if (resumed) {
+                  idleCycles = 0;
+                  lastStepSeen = -2;
+                  break;
+                }
                 return;
               }
             }
@@ -851,12 +985,8 @@ export class AntigravityService extends Service {
       }
     } catch (err) {
       const run = this.runs.get(cascadeId) ?? { cascadeId, status: 'running' as const, startedAt: Date.now(), turnSeq: 1, priorContents: [] };
-      run.status = 'error';
-      run.error = err instanceof Error ? err.message : String(err);
-      this.runs.set(cascadeId, run);
-      await this.landReport(run);
-      this.notifySettlementToDsh(run);
-      this.settleWaiters(cascadeId, { status: 'error', content: AntigravityService.fullReportText(run), error: run.error });
+      const errText = err instanceof Error ? err.message : String(err);
+      await this.handleCascadeError(cascadeId, run, errText);
     } finally {
       this.watchers.delete(cascadeId);
       await this.flushMessageQueue(cascadeId);
@@ -1016,7 +1146,12 @@ export class AntigravityService extends Service {
           }
         }
       }
-      if (snap && (terminalDone || snap.error || pendingConfirmed)) {
+      const isAutoResumeCandidate =
+        !!snap?.error &&
+        this.config.autoResume?.enabled !== false &&
+        isTransientRetryableError(snap.error);
+
+      if (snap && (terminalDone || (snap.error && !isAutoResumeCandidate) || pendingConfirmed)) {
         const status = snap.error ? 'error' : pendingConfirmed ? 'awaiting-approval' : 'done';
         const run = this.runs.get(conversationId) ?? {
           cascadeId: conversationId,
@@ -1401,19 +1536,25 @@ export default class AntigravityBridgePlugin {
 
     // Hot-reloadable settings namespace (Web Settings UI); config fields are
     // read at use-time, so updating the service reference is sufficient.
-    try {
-      let current = () => config;
-      installSettingsSection(ctx, settingsNamespace('antigravity-bridge'), Config, config, {
-        setSource: (source: () => AntigravityConfig) => {
-          current = source;
-        },
-        onChange: () => {
-          (ctx.get('antigravity') as AntigravityService | undefined)?.updateConfig(current());
-        },
+    let current = () => config;
+    // dsh-settings is optional; inject waits for the service instead of racing
+    // the boot order — a direct ctx.get here can silently miss it and the
+    // settings card never registers.
+    ctx.inject(['settings'] as any, (settingsCtx) => {
+      const settings = (settingsCtx as unknown as { settings?: {
+        installSection?: (
+          owner: Context,
+          ns: string,
+          schema: unknown,
+          entry: AntigravityConfig,
+          hooks: { setSource: (source: () => AntigravityConfig) => void; onChange: () => void },
+        ) => void;
+      } }).settings;
+      settings?.installSection?.(ctx, 'antigravity-bridge', Config, config, {
+        setSource: (source) => { current = source; },
+        onChange: () => { (ctx.get('antigravity') as AntigravityService | undefined)?.updateConfig(current()); },
       });
-    } catch {
-      // dsh-settings unavailable — run on static composition config only.
-    }
+    });
 
     if ((ctx as any).systemPrompt?.register) {
       (ctx as any).systemPrompt.register({
@@ -1421,7 +1562,7 @@ export default class AntigravityBridgePlugin {
         order: 118,
         render: () => `## Google Antigravity Agent Tools
 Google Antigravity (AGY) is Google's multi-agent coding harness running locally on this machine. The default backend is "hub": sessions run INSIDE the local Antigravity IDE and burn the IDE's own OAuth quota (not Google Cloud billing).
-- 'gemini-3.7-flash-tiered' (default): Gemini quota group (very generous limit), 1M context, fast multimodal; use for general and parallel coding subtasks.
+- 'gemini-3.8-flash-high' (default): Gemini quota group (very generous limit), 1M context, fast multimodal; use for general and parallel coding subtasks.
 - 'claude-opus-4-6-thinking': non-Gemini quota group (strict limit); deep reasoning for tough challenges.
 - 'antigravity_list_models' shows the live model catalog with remaining quota fractions.
 - 'antigravity_delegate' runs a task: with conversation_id it continues that conversation; without, it creates a new cascade (needs project_id or config default). Default blocks until the reply stabilizes; background=true returns a run id immediately so you can keep working, then check with 'antigravity_check_run' (wait=true parks on lifecycle events until done/error/awaiting-approval, or returns the latest snapshot at the timeout).
@@ -1500,7 +1641,7 @@ Google Antigravity (AGY) is Google's multi-agent coding harness running locally 
           type: 'object',
           properties: {
             task: { type: 'string', description: 'The clear, detailed instruction for the Antigravity agent' },
-            model: { type: 'string', description: 'Model display id from antigravity_list_models (default: gemini-3.7-flash-tiered)' },
+            model: { type: 'string', description: 'Model display id from antigravity_list_models (default: gemini-3.8-flash-high)' },
             project_id: { type: 'string', description: 'Target project for new cascades: registered project UUID, absolute folder path, or file:/// URI' },
             conversation_id: { type: 'string', description: 'Existing conversation/cascade UUID to continue' },
             background: { type: 'boolean', description: 'Return a run id immediately instead of waiting for the reply (default false)' },
@@ -1697,3 +1838,4 @@ export * from './models.js';
 export * from './hub/client.js';
 export * from './hub/discovery.js';
 export * from './hub/transcript.js';
+export * from './hub/classifier.js';

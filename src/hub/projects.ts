@@ -100,6 +100,7 @@ export class ProjectResolver {
         body: frame as unknown as BodyInit,
       });
 
+      if (!res.ok) return;
       if (!res.body) return;
       const reader = res.body.getReader();
       const { value } = await reader.read();
@@ -121,7 +122,7 @@ export class ProjectResolver {
       const fetched = await Promise.all(
         projectIds.map(async (id) => {
           try {
-            const resp = (await this.client.call('ReadProject', { id })) as { project?: HubProject };
+            const resp = (await this.client.call('ReadProject', { id }, { emptyResponse: 'reject' })) as { project?: HubProject };
             if (resp?.project) return resp.project;
           } catch {
             // Project might be stale or not readable
@@ -169,7 +170,7 @@ export class ProjectResolver {
         };
       }
       try {
-        const resp = (await this.client.call('ReadProject', { id: raw })) as { project?: HubProject };
+        const resp = (await this.client.call('ReadProject', { id: raw }, { emptyResponse: 'reject' })) as { project?: HubProject };
         if (resp?.project) {
           this.cache.set(resp.project.id, resp.project);
           const primaryUri = resp.project.projectResources?.resources?.[0]?.folderUri

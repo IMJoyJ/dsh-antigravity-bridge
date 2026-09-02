@@ -1,5 +1,5 @@
 import { getHubRegistry } from './registry.js';
-import { grpcWebCall } from './transport.js';
+import { grpcWebCall, HubTransportError } from './transport.js';
 import { discoverHub, clearHubCache } from './discovery.js';
 import type { HubInfo } from './discovery.js';
 import { ProjectResolver } from './projects.js';
@@ -20,13 +20,54 @@ export interface StartCascadeOptions {
   sidebarVisible?: boolean;
 }
 
+export interface HubCallOptions {
+  /** Passed through to grpcWebCall: 'reject' makes a frame-less 200 body throw
+   *  HubTransportError (data-returning methods), 'allow' decodes it as an
+   *  empty message (methods whose empty response is legitimate). */
+  emptyResponse?: 'allow' | 'reject';
+}
+
+const STALE_HUB_ERROR_PATTERN =
+  /ECONNREFUSED|ECONNRESET|ETIMEDOUT|EPIPE|socket hang up|401|Unauthenticated/i;
+
+/**
+ * Decides whether an error from a hub call means the cached hub endpoint is
+ * stale and one rediscovery + retry could still succeed. Covers:
+ * - {@link HubTransportError} (HTTP-level failure or rejected frame-less body);
+ * - Node fetch network failures, whose ECONNREFUSED and friends live in
+ *   `err.cause` — the outer message is just "fetch failed" — including
+ *   AggregateError causes with multiple inner errors;
+ * - the pre-existing message conventions "401" / "Unauthenticated".
+ */
+export function isStaleHubError(err: unknown): boolean {
+  if (!(err instanceof Error)) return false;
+  if (err instanceof HubTransportError) return true;
+  const parts: unknown[] = [err.message];
+  const cause = (err as { cause?: unknown }).cause;
+  if (cause instanceof Error) {
+    parts.push(cause.message, (cause as NodeJS.ErrnoException).code);
+    const aggregate = (cause as { errors?: unknown[] }).errors;
+    if (Array.isArray(aggregate)) {
+      for (const inner of aggregate) {
+        if (inner instanceof Error) parts.push(inner.message, (inner as NodeJS.ErrnoException).code);
+      }
+    }
+  }
+  return parts.some((p) => typeof p === 'string' && STALE_HUB_ERROR_PATTERN.test(p));
+}
+
 export class HubClient {
   private info: HubInfo;
+  /** Config from {@link HubClient.create}; the self-heal retry re-discovers
+   *  with it so config-pinned setups stay pinned (and just get one transparent
+   *  retry) while dynamic setups get real rediscovery. */
+  private readonly createConfig?: { address?: string; csrfToken?: string };
   private registry = getHubRegistry();
   private projectResolver = new ProjectResolver(this);
 
-  constructor(info: HubInfo) {
+  constructor(info: HubInfo, createConfig?: { address?: string; csrfToken?: string }) {
     this.info = info;
+    this.createConfig = createConfig;
   }
 
   /** Resolves a folder path or project UUID to a registered project UUID and workspace URI,
@@ -37,14 +78,14 @@ export class HubClient {
 
   static async create(config?: { address?: string; csrfToken?: string }): Promise<HubClient> {
     const info = await discoverHub(config);
-    return new HubClient(info);
+    return new HubClient(info, config);
   }
 
   async getAvailableModels(): Promise<unknown> {
-    return this.call('GetAvailableModels', {});
+    return this.call('GetAvailableModels', {}, { emptyResponse: 'reject' });
   }
 
-  /** Maps a display id (e.g. "gemini-3.7-flash-tiered") to the hub's
+  /** Maps a display id (e.g. "gemini-3.8-flash-high") to the hub's
    *  MODEL_* enum name. Response shape: { response: { models: { id: {...} } } }. */
   async resolveModel(displayId: string): Promise<string | undefined> {
     const resp = (await this.getAvailableModels()) as {
@@ -116,7 +157,7 @@ export class HubClient {
   }
 
   async getConversationMetadata(conversationId: string): Promise<unknown> {
-    return this.call('GetConversationMetadata', { conversationId });
+    return this.call('GetConversationMetadata', { conversationId }, { emptyResponse: 'reject' });
   }
 
   /** Creates a project and returns the caller-generated id (hub responds with {}).
@@ -149,7 +190,7 @@ export class HubClient {
   }
 
   async readProject(id: string): Promise<unknown> {
-    return this.call('ReadProject', { id });
+    return this.call('ReadProject', { id }, { emptyResponse: 'reject' });
   }
 
   async deleteProject(id: string): Promise<unknown> {
@@ -157,7 +198,7 @@ export class HubClient {
   }
 
   async searchConversations(query: string, limit = 20): Promise<unknown> {
-    return this.call('SearchConversations', { query, limit });
+    return this.call('SearchConversations', { query, limit }, { emptyResponse: 'reject' });
   }
 
   /** Cancel an ongoing cascade invocation in a clean manner. */
@@ -170,7 +211,7 @@ export class HubClient {
 
   /** Fetch the full cascade trajectory (steps carry requestedInteraction when awaiting approval). */
   async getCascadeTrajectory(cascadeId: string): Promise<unknown> {
-    return this.call('GetCascadeTrajectory', { cascadeId });
+    return this.call('GetCascadeTrajectory', { cascadeId }, { emptyResponse: 'reject' });
   }
 
   /** Answer a pending cascade user interaction (the IDE approval dialog's RPC). */
@@ -234,34 +275,29 @@ export class HubClient {
   }
 
 
-  async call(method: string, json: Record<string, unknown>): Promise<unknown> {
+  async call(method: string, json: Record<string, unknown>, options: HubCallOptions = {}): Promise<unknown> {
     try {
-      return await grpcWebCall(
-        this.registry,
-        this.info.address,
-        this.info.csrfToken,
-        'exa.language_server_pb.LanguageServerService',
-        method,
-        json,
-      );
+      return await this.rawCall(method, json, options);
     } catch (err) {
-      if (
-        err instanceof Error &&
-        (err.message.includes('ECONNREFUSED') || err.message.includes('401') || err.message.includes('Unauthenticated'))
-      ) {
-        clearHubCache();
-        const fresh = await discoverHub({});
-        this.info = fresh;
-        return grpcWebCall(
-          this.registry,
-          this.info.address,
-          this.info.csrfToken,
-          'exa.language_server_pb.LanguageServerService',
-          method,
-          json,
-        );
-      }
-      throw err;
+      if (!isStaleHubError(err)) throw err;
+      // The cached endpoint is stale (hub restarted: new port and/or CSRF
+      // token). Rediscover once and retry the same call; if the retry fails
+      // too, the error propagates — no second rediscovery loop.
+      clearHubCache();
+      this.info = await discoverHub(this.createConfig);
+      return await this.rawCall(method, json, options);
     }
+  }
+
+  private rawCall(method: string, json: Record<string, unknown>, options: HubCallOptions): Promise<unknown> {
+    return grpcWebCall(
+      this.registry,
+      this.info.address,
+      this.info.csrfToken,
+      'exa.language_server_pb.LanguageServerService',
+      method,
+      json,
+      options,
+    );
   }
 }

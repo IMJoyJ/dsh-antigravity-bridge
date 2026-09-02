@@ -128,6 +128,26 @@ rpc error: code = Unauthenticated desc = missing CSRF token
 
 CSRF token 生命周期与 hub 进程绑定，IDE 重启后失效。
 
+### 3.1 过期 CSRF 的实际表现与桥接自愈（v0.2.4）
+
+缺失 token 与过期 token 的表现不同（均实测）：
+
+- **缺失**：gRPC 错误 `Unauthenticated desc = missing CSRF token`。
+- **过期（header 存在但值不对）**：hub 返回 **HTTP 200 + 0 字节空 body**，不含任何 gRPC-web
+  帧——gRPC 层面完全静默。直接解码会得到空消息，即"模型列表为空但不报错"的来源。
+
+桥接层（`src/hub/`）的自愈约定：
+
+- `transport.ts`：非 2xx 响应、以及数据类方法（`GetAvailableModels`、`GetConversationMetadata`、
+  `GetCascadeTrajectory`、`SearchConversations`、`ReadProject`）收到无帧 200 时抛
+  `HubTransportError`（kind `http` / `empty`）；容忍空响应的方法（`SendUserCascadeMessage`、
+  `WaitForConversationFullyIdle`、`StartCascade`、`CreateProject` 等）保持解码为空消息。
+- `client.ts`：`HubClient.call` 捕获 `HubTransportError` 及 `err.cause` 中带
+  `ECONNREFUSED` 等网络码的 `fetch failed`（Node fetch 的外层 message 只有 "fetch failed"），
+  清掉发现缓存后重新扫描 hub 并重试一次；第二次仍失败则原样抛出。
+- `discovery.ts`：扫描时遍历**所有** `subclient_type=hub` 的 language_server.exe 进程 ×
+  其全部 127.0.0.1 监听端口，逐个用 index 页 CSRF 校验，防止重启后残留旧进程干扰。
+
 ---
 
 ## 4. 传输一：原生 gRPC（h2c）
@@ -343,7 +363,7 @@ language_server.exe multicall schedule "0 1 * * *" `
 
 - `new-conversation` 返回的 `conversationId` 可用于 `get-conversation-metadata` 和后续 `send-message`。
 - `send-message` 的消息在 transcript 中表现为 `SYSTEM_MESSAGE`，而非 `USER_INPUT`。
-- 模型档位只有三档，无法指定 `gemini-3.7-flash` 等具体模型名。
+- 模型档位只有三档，无法指定 `gemini-3.8-flash` 等具体模型名。
 - 所有写操作（CreateProject、new-conversation）均会同步到 IDE 的本地状态，在 IDE UI 中可见。
 
 ---
