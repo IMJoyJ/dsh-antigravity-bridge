@@ -129,13 +129,27 @@ export function parseTranscript(lines: string[], baselineStepIndex = -1): Parsed
 
     if (step.type === 'ERROR_MESSAGE') {
       const errObj = step.error_message as
-        | { error?: { short_error?: string; user_error_message?: string } }
+        | {
+            error?: {
+              short_error?: string;
+              user_error_message?: string;
+              code?: number | string;
+              status?: string;
+              message?: string;
+            };
+          }
         | undefined;
+      const code = errObj?.error?.code;
+      const status = errObj?.error?.status;
+      const msg = errObj?.error?.message;
+      const httpSummary = code && status ? `HTTP ${code} ${status}: ${msg || ''}`.trim() : undefined;
+
       // Keep a raw snippet in the fallback: an opaque "unknown agent error" hides
       // diagnostic fields this parser has not mapped yet.
       result.error =
         errObj?.error?.short_error ??
         errObj?.error?.user_error_message ??
+        httpSummary ??
         `unknown agent error (raw: ${JSON.stringify(step).slice(0, 300)})`;
       return result;
     }

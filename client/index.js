@@ -15,7 +15,24 @@ window.__ModuleLoader__.load({
     const React = require("react");
     const { jsx, jsxs } = require("react/jsx-runtime");
     const { Button, Input, Pill } = require("@deepseek-ai/dsh-client-ui-primitives");
-    const { createSnapshotStore } = require("@deepseek-ai/dsh-client-runtime/client");
+
+    // Minimal zustand-compatible observable store, replacing the now-removed
+    // `@deepseek-ai/dsh-client-runtime/client` export (renamed to client-store in 0.1.2-alpha).
+    function createSnapshotStore(initial) {
+      let state = initial;
+      const listeners = new Set();
+      return {
+        getSnapshot() { return state; },
+        subscribe(listener) {
+          listeners.add(listener);
+          return () => listeners.delete(listener);
+        },
+        set(next) {
+          state = next;
+          for (const listener of listeners) listener();
+        }
+      };
+    }
 
     const NAMESPACE = "antigravity-bridge";
     const inject = ["slots", "locale", "settingsScope"];
