@@ -221,6 +221,13 @@ interface PollResult {
   lastActiveAt?: string;
   error?: string;
 }
+/**
+ * Classification of the LAST valid entry inside the current turn window.
+ * Drives the tail guard that distinguishes a genuinely finished turn from a
+ * model that merely paused mid-work (e.g. launched a background task and is
+ * waiting on it).
+ */
+type TranscriptTailKind = 'none' | 'assistant-text' | 'tool-call' | 'tool-result' | 'checkpoint' | 'other';
 interface TranscriptSnapshot {
   maxStepIndex: number;
   engaged: boolean;
@@ -229,6 +236,8 @@ interface TranscriptSnapshot {
   pendingApproval?: PendingToolApproval;
   isFinished?: boolean;
   error?: string;
+  /** Kind of the last valid entry in the turn window (settlement tail guard). */
+  tailKind: TranscriptTailKind;
 }
 interface ParsedTranscript {
   maxStepIndex: number;
@@ -246,10 +255,50 @@ interface ParsedTranscript {
   pendingApproval?: PendingToolApproval;
   /** Whether the trajectory reached a definitive finished state (e.g. final text reply or checkpoint). */
   isFinished: boolean;
+  /** Kind of the last valid entry in the turn window. */
+  tailKind: TranscriptTailKind;
   /** short_error from the first ERROR_MESSAGE step, if any. */
   error?: string;
 }
 declare function parseTranscript(lines: string[], baselineStepIndex?: number): ParsedTranscript;
+type AutoContinueReason = 'tool-tail' | 'no-assistant-text';
+type SettleGuardAction = 'settle' | 'settle-exhausted' | 'continue' | 'wait';
+interface SettleGuardInput {
+  snap: Pick<TranscriptSnapshot, 'isFinished' | 'plannerContents' | 'tailKind' | 'engaged' | 'pendingApproval' | 'error'>;
+  /** How long the transcript has produced no new steps (ms). */
+  tailQuietMs: number;
+  /** Auto-continue nudges already spent on the current turn. */
+  autoContinueCount: number;
+  /** Auto-continue nudge budget per turn. */
+  maxAutoContinue: number;
+  /** Required stillness before a clean final reply may settle (ms). */
+  settleStableMs: number;
+  /** Required stillness before a stalled turn may be nudged (ms). */
+  autoContinueQuietMs: number;
+}
+interface SettleGuardDecision {
+  action: SettleGuardAction;
+  reason?: AutoContinueReason;
+}
+/**
+ * Decides whether a "finished-looking" cascade snapshot may settle as done, or
+ * whether the transcript tail proves the model merely paused mid-work and the
+ * bridge should nudge it with a "Continue" message instead.
+ *
+ * Guard conditions (checked at every done-settlement exit):
+ * - (a) `tool-tail`: the LAST valid entry is a tool call or tool result with no
+ *   assistant text after it. `isFinished` is then stale state left behind by an
+ *   earlier final text or CHECKPOINT (executor DONE steps never reset it) — the
+ *   classic false summary "I am waiting for the background test run to
+ *   complete." that the transcript carries while the model is actually stalled.
+ * - (b) `no-assistant-text`: the whole turn ended without ANY assistant text
+ *   reply (e.g. the model launched a background task and yielded silently).
+ *
+ * Both conditions keep the run unsettled and trigger one capped auto-continue;
+ * once the budget (`maxAutoContinue`) is spent the caller settles anyway and
+ * flags `autoContinueExhausted` so callers can verify the outcome.
+ */
+declare function decideTailSettle(input: SettleGuardInput): SettleGuardDecision;
 interface LoadedTranscript {
   path: string;
   text: string;
@@ -390,7 +439,7 @@ declare class HubClient {
  * - 403 / PERMISSION_DENIED (permission issues)
  * - Persistent OAuth failure ("OAuth 凭据已失效，请重新登录 Antigravity", invalid_grant, revoked refresh token)
  */
-type TransientErrorSignature = 'model_output_empty' | 'stream_interrupted' | 'auth_token_expired';
+type TransientErrorSignature = 'model_output_empty' | 'stream_interrupted' | 'auth_token_expired' | 'network_error';
 interface ErrorClassification {
   /** Whether this error is a transient error eligible for auto-resume. */
   retryable: boolean;
@@ -427,6 +476,10 @@ declare function formatAuthExpiredTerminalError(details?: string): string;
  */
 declare function formatExhaustedRetryError(retries: number, originalError: string, signature?: TransientErrorSignature): string;
 /**
+ * Checks if the error string matches a network error, connection drop, fetch failure, or socket timeout.
+ */
+declare function isNetworkError(rawError: string): boolean;
+/**
  * Extracts the error string from various error containers (Error object, step, snapshot, string, HTTP response object).
  */
 declare function extractErrorMessage(input: unknown): string;
@@ -448,6 +501,14 @@ interface AutoResumeConfig {
   /** Instruction sent to the cascade when resuming (default "继续。按原计划继续执行当前任务，不要停止。"). */
   message?: string;
 }
+/** Default budget of tail-guard auto-"Continue" nudges per turn. */
+declare const DEFAULT_AUTO_CONTINUE_MAX = 5;
+/** Default message sent by the tail-guard auto-continue. */
+declare const DEFAULT_AUTO_CONTINUE_MESSAGE = "Continue";
+/** Stillness (ms) required before a stalled tail may be nudged with "Continue". */
+declare const AUTO_CONTINUE_QUIET_MS = 10000;
+/** Stillness (ms) required before a final-looking assistant reply may settle. */
+declare const SETTLE_STABLE_MS = 3000;
 interface AntigravityConfig {
   backend?: 'hub' | 'localharness';
   binaryPath?: string;
@@ -467,6 +528,16 @@ interface AntigravityConfig {
   approvalGraceMs?: number;
   /** Transient error auto-resume configuration. */
   autoResume?: AutoResumeConfig;
+  /** Inactivity timeout (ms) for a mid-turn running cascade before triggering stall recovery (default 120_000, 2m).
+   *  When no new steps or heartbeats arrive for this duration, the bridge treats it as a network error / stalled stream
+   *  and sends an auto-resume nudge up to autoResume.maxRetries. */
+  stallTimeoutMs?: number;
+  /** Max consecutive auto-"Continue" nudges per turn when the transcript tail shows the turn is not
+   *  really finished (tool tail / no assistant text); 0 disables nudging and settles after the quiet
+   *  window with autoContinueExhausted flagged (default 5). */
+  autoContinueMax?: number;
+  /** Message sent to the cascade for each tail-guard auto-continue (default "Continue"). */
+  autoContinueMessage?: string;
 }
 declare const Config: Schema<AntigravityConfig>;
 declare module '@deepseek-ai/cordis' {
@@ -501,6 +572,12 @@ interface HubRun {
   reportChars?: number;
   /** Consecutive auto-resume retry count for transient errors in the current turn/streak. */
   autoResumeRetries?: number;
+  /** Auto-"Continue" nudges already sent for the current turn's tail-guard stalls. */
+  autoContinueCount?: number;
+  /** True once the tail-guard nudge budget was exhausted (or delivery failed) and the run settled anyway. */
+  autoContinueExhausted?: boolean;
+  /** Reason the last tail-guard nudge was sent ('tool-tail' | 'no-assistant-text'). */
+  lastAutoContinueReason?: AutoContinueReason;
 }
 interface CascadeDetailedResult {
   status: 'done' | 'awaiting-approval' | 'running' | 'timeout' | 'error';
@@ -508,6 +585,10 @@ interface CascadeDetailedResult {
   lastActiveAt?: string;
   pendingTool?: PendingToolApproval;
   error?: string;
+  /** Auto-"Continue" nudges spent on the current turn. */
+  autoContinueCount?: number;
+  /** True when the tail guard burned the whole nudge budget and the run settled anyway. */
+  autoContinueExhausted?: boolean;
 }
 interface SettlementNoticePayload {
   summary: string;
@@ -592,6 +673,15 @@ declare class AntigravityService extends Service {
    * Otherwise marks terminal error, lands report, notifies DSH, settles waiters, and returns { resumed: false }.
    */
   private handleCascadeError;
+  /**
+   * Send one tail-guard auto-"Continue" nudge through the existing sendMessage
+   * channel and re-arm the run so the pre-nudge transcript is excluded from the
+   * next settlement decision (the watcher then judges the model's response TO
+   * the nudge, not the stale tail that triggered it). Returns false when the
+   * budget is spent or delivery fails — the caller settles with
+   * autoContinueExhausted in that case.
+   */
+  private sendAutoContinue;
   /** Unified active cascade loop — the SINGLE poller per cascade. Tracks running/approval/error/done
    *  transitions off the local transcript, notifies DSH, releases parked settlement waiters, and lands
    *  oversized reports on disk. WaitForConversationFullyIdle is deliberately NOT used here: the hub
@@ -624,5 +714,5 @@ declare class AntigravityBridgePlugin {
   constructor(ctx: Context, config: AntigravityConfig);
 }
 //#endregion
-export { ANTIGRAVITY_MODELS, AgentInitConfig, AgentStep, AntigravityAgent, AntigravityConfig, AntigravityEngine, AntigravityModelInfo, AntigravityService, AutoResumeConfig, BACKOFF_SCHEDULE_MS, CascadeDetailedResult, Config, ConversationSummary, ConversationTreeNode, DEFAULT_MODEL_ID, EngineConfig, ErrorClassification, HarnessSessionInfo, HubCallOptions, HubClient, HubInfo, HubRun, ListConversationsOptions, LoadedTranscript, MediaInput, PendingToolApproval, PollResult, PromptContent, PromptItem, ProtoMediaPart, RunOneShotOptions, SessionContinuationMode, SettlementNoticePayload, StartCascadeOptions, TokenUsage, TranscriptSnapshot, TranscriptStep, TransientErrorSignature, buildConversationGraph, buildSettlementNotice, classifyError, clearHubCache, AntigravityBridgePlugin as default, discoverHub, extractErrorMessage, fileToMedia, formatAuthExpiredTerminalError, formatExhaustedRetryError, getAutoResumeBackoffMs, getConversationTree, getDefaultAppDataDir, getMaxRetriesForSignature, guessMimeType, isAuthTokenExpiredError, isStaleHubError, isTransientRetryableError, listConversations, loadTranscriptFile, normalizeModelName, normalizePromptParts, parseTranscript, pollTranscript, readCascadeTranscript, renderAsciiTree };
+export { ANTIGRAVITY_MODELS, AUTO_CONTINUE_QUIET_MS, AgentInitConfig, AgentStep, AntigravityAgent, AntigravityConfig, AntigravityEngine, AntigravityModelInfo, AntigravityService, AutoContinueReason, AutoResumeConfig, BACKOFF_SCHEDULE_MS, CascadeDetailedResult, Config, ConversationSummary, ConversationTreeNode, DEFAULT_AUTO_CONTINUE_MAX, DEFAULT_AUTO_CONTINUE_MESSAGE, DEFAULT_MODEL_ID, EngineConfig, ErrorClassification, HarnessSessionInfo, HubCallOptions, HubClient, HubInfo, HubRun, ListConversationsOptions, LoadedTranscript, MediaInput, PendingToolApproval, PollResult, PromptContent, PromptItem, ProtoMediaPart, RunOneShotOptions, SETTLE_STABLE_MS, SessionContinuationMode, SettleGuardAction, SettleGuardDecision, SettleGuardInput, SettlementNoticePayload, StartCascadeOptions, TokenUsage, TranscriptSnapshot, TranscriptStep, TranscriptTailKind, TransientErrorSignature, buildConversationGraph, buildSettlementNotice, classifyError, clearHubCache, decideTailSettle, AntigravityBridgePlugin as default, discoverHub, extractErrorMessage, fileToMedia, formatAuthExpiredTerminalError, formatExhaustedRetryError, getAutoResumeBackoffMs, getConversationTree, getDefaultAppDataDir, getMaxRetriesForSignature, guessMimeType, isAuthTokenExpiredError, isNetworkError, isStaleHubError, isTransientRetryableError, listConversations, loadTranscriptFile, normalizeModelName, normalizePromptParts, parseTranscript, pollTranscript, readCascadeTranscript, renderAsciiTree };
 //# sourceMappingURL=index.d.mts.map

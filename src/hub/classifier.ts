@@ -15,7 +15,8 @@
 export type TransientErrorSignature =
   | 'model_output_empty'
   | 'stream_interrupted'
-  | 'auth_token_expired';
+  | 'auth_token_expired'
+  | 'network_error';
 
 export interface ErrorClassification {
   /** Whether this error is a transient error eligible for auto-resume. */
@@ -53,6 +54,10 @@ const TRANSIENT_PATTERNS: Array<{ signature: TransientErrorSignature; pattern: R
   {
     signature: 'stream_interrupted',
     pattern: /(?:stream was interrupted|continue the task you were working on)/i,
+  },
+  {
+    signature: 'network_error',
+    pattern: /(?:network\s*(?:error|timeout)|fetch failed|ECONNRESET|ECONNREFUSED|ETIMEDOUT|EPIPE|ENOTFOUND|socket hang up|connection (?:reset|closed|aborted)|stream (?:disconnected|closed|error)|event stream (?:closed|error|disconnected)|SSE (?:error|disconnect|closed)|UND_ERR_\w+)/i,
   },
 ];
 
@@ -144,7 +149,22 @@ export function formatExhaustedRetryError(
   if (signature === 'auth_token_expired') {
     return formatAuthExpiredTerminalError(`已自动重试 ${retries} 次仍失败: ${originalError}`);
   }
+  if (signature === 'network_error') {
+    return `网络异常 (network error)，已自动重试 ${retries} 次仍失败: ${originalError}`;
+  }
   return `已自动重试 ${retries} 次仍失败: ${originalError}`;
+}
+
+/**
+ * Checks if the error string matches a network error, connection drop, fetch failure, or socket timeout.
+ */
+export function isNetworkError(rawError: string): boolean {
+  for (const term of TERMINAL_PATTERNS) {
+    if (term.pattern.test(rawError)) {
+      return false;
+    }
+  }
+  return /(?:network\s*(?:error|timeout)|fetch failed|ECONNRESET|ECONNREFUSED|ETIMEDOUT|EPIPE|ENOTFOUND|socket hang up|connection (?:reset|closed|aborted)|stream (?:disconnected|closed|error)|event stream (?:closed|error|disconnected)|SSE (?:error|disconnect|closed)|UND_ERR_\w+)/i.test(rawError);
 }
 
 /**

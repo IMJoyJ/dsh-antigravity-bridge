@@ -196,6 +196,56 @@ describe('Error Signature Classifier', () => {
     });
   });
 
+  describe('Transient Network Error Signatures', () => {
+    const networkSamples = [
+      'Network error connecting to gemini: fetch failed',
+      'TypeError: fetch failed',
+      'Error: ECONNRESET',
+      'ECONNREFUSED 127.0.0.1:7778',
+      'Error: socket hang up',
+      'ETIMEDOUT',
+      'EPIPE: broken pipe',
+      'ENOTFOUND gemini.google.com',
+      'SSE disconnect: stream closed',
+      'event stream disconnected: connection reset by peer',
+      'Cascade stalled: no progress or heartbeat for 120s (network error or stream interrupted)',
+      'UND_ERR_CONNECT_TIMEOUT',
+    ];
+
+    it('should classify network errors, connection drops, and stalled streams as retryable network_error', () => {
+      for (const msg of networkSamples) {
+        const result = classifyError(msg);
+        expect(result.retryable).toBe(true);
+        expect(result.signature).toBe('network_error');
+        expect(isTransientRetryableError(msg)).toBe(true);
+      }
+    });
+
+    it('should handle JavaScript Error objects containing network error messages', () => {
+      const err1 = new TypeError('fetch failed');
+      const err2 = new Error('read ECONNRESET');
+      const err3 = new Error('socket hang up');
+
+      expect(classifyError(err1).signature).toBe('network_error');
+      expect(classifyError(err2).signature).toBe('network_error');
+      expect(classifyError(err3).signature).toBe('network_error');
+    });
+
+    it('should format retry exhausted error for network_error with clear escalation message', () => {
+      const formatted = formatExhaustedRetryError(3, 'fetch failed', 'network_error');
+      expect(formatted).toContain('网络异常 (network error)');
+      expect(formatted).toContain('已自动重试 3 次仍失败');
+      expect(formatted).toContain('fetch failed');
+    });
+
+    it('should use standard 3 retries and exponential backoff schedule for network_error', () => {
+      expect(getMaxRetriesForSignature('network_error')).toBe(3);
+      expect(getAutoResumeBackoffMs(0, 'network_error')).toBe(2000);
+      expect(getAutoResumeBackoffMs(1, 'network_error')).toBe(5000);
+      expect(getAutoResumeBackoffMs(2, 'network_error')).toBe(10000);
+    });
+  });
+
   describe('Terminal / Non-Retryable Signatures', () => {
     const terminalSamples = [
       'DELIVERY FAILED for ed414fea-72d4-4342-bb12-c28df96874e8: message not visible in transcript after send + resend. The conversation may be in a hub-side dead state; start a fresh cascade.',
@@ -205,7 +255,7 @@ describe('Error Signature Classifier', () => {
       'CreateProject was accepted by the hub but the project was not persisted',
       'Cascade execution timed out after 300s',
       'No pending requestedInteraction in trajectory',
-      'ECONNREFUSED 127.0.0.1:7778',
+      'unknown agent error (raw: {"code":400,"message":"Bad Request"})',
       'unknown agent error (raw: {"foo":"bar"})',
     ];
 

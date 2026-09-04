@@ -32,6 +32,20 @@ export interface PollResult {
   error?: string;
 }
 
+/**
+ * Classification of the LAST valid entry inside the current turn window.
+ * Drives the tail guard that distinguishes a genuinely finished turn from a
+ * model that merely paused mid-work (e.g. launched a background task and is
+ * waiting on it).
+ */
+export type TranscriptTailKind =
+  | 'none'           // no steps in the turn window yet
+  | 'assistant-text' // PLANNER_RESPONSE without tool calls (the model's text reply)
+  | 'tool-call'      // PLANNER_RESPONSE carrying tool_calls
+  | 'tool-result'    // executor step (tool execution / result materialized)
+  | 'checkpoint'     // CHECKPOINT
+  | 'other';         // USER_INPUT / SYSTEM_MESSAGE / ERROR_MESSAGE / unknown
+
 export interface TranscriptSnapshot {
   maxStepIndex: number;
   engaged: boolean;
@@ -40,6 +54,8 @@ export interface TranscriptSnapshot {
   pendingApproval?: PendingToolApproval;
   isFinished?: boolean;
   error?: string;
+  /** Kind of the last valid entry in the turn window (settlement tail guard). */
+  tailKind: TranscriptTailKind;
 }
 
 interface ParsedTranscript {
@@ -58,8 +74,21 @@ interface ParsedTranscript {
   pendingApproval?: PendingToolApproval;
   /** Whether the trajectory reached a definitive finished state (e.g. final text reply or checkpoint). */
   isFinished: boolean;
+  /** Kind of the last valid entry in the turn window. */
+  tailKind: TranscriptTailKind;
   /** short_error from the first ERROR_MESSAGE step, if any. */
   error?: string;
+}
+
+function classifyTranscriptStep(step: TranscriptStep): TranscriptTailKind {
+  if (step.type === 'PLANNER_RESPONSE') {
+    return Array.isArray(step.tool_calls) && step.tool_calls.length > 0 ? 'tool-call' : 'assistant-text';
+  }
+  if (step.type === 'CHECKPOINT') return 'checkpoint';
+  if (step.type === 'USER_INPUT' || step.type === 'SYSTEM_MESSAGE' || step.type === 'ERROR_MESSAGE') {
+    return 'other';
+  }
+  return 'tool-result';
 }
 
 export function parseTranscript(lines: string[], baselineStepIndex = -1): ParsedTranscript {
@@ -90,6 +119,7 @@ export function parseTranscript(lines: string[], baselineStepIndex = -1): Parsed
     engagedAfterInput: false,
     checkpointAfterInput: false,
     isFinished: false,
+    tailKind: 'none',
   };
 
   // If a baseline is provided, only inspect steps generated AFTER the baseline step index
@@ -123,6 +153,10 @@ export function parseTranscript(lines: string[], baselineStepIndex = -1): Parsed
   const relevantSteps = parsedSteps.filter((s) => s.step_index > cutIndex);
 
   for (const step of relevantSteps) {
+    // Track the tail BEFORE anything else: the guard wants the classification of
+    // the very last valid entry, even when this iteration takes an early return.
+    result.tailKind = classifyTranscriptStep(step);
+
     if (step.created_at) {
       result.lastActiveAt = step.created_at;
     }
@@ -150,6 +184,7 @@ export function parseTranscript(lines: string[], baselineStepIndex = -1): Parsed
         errObj?.error?.short_error ??
         errObj?.error?.user_error_message ??
         httpSummary ??
+        (typeof step.content === 'string' && step.content ? step.content : undefined) ??
         `unknown agent error (raw: ${JSON.stringify(step).slice(0, 300)})`;
       return result;
     }
@@ -159,6 +194,14 @@ export function parseTranscript(lines: string[], baselineStepIndex = -1): Parsed
     }
 
     if (step.type === 'PLANNER_RESPONSE') {
+      if (step.status === 'ERROR') {
+        result.error =
+          step.content ||
+          (step as any).error ||
+          `Planner error at step ${step.step_index}`;
+        return result;
+      }
+
       if (step.content && step.status === 'DONE') {
         result.plannerContents.push(step.content);
       }
@@ -239,6 +282,90 @@ export function parseTranscript(lines: string[], baselineStepIndex = -1): Parsed
   return result;
 }
 
+// ---------------------------------------------------------------------------
+// Settlement tail guard (early-stop misjudgment fix)
+// ---------------------------------------------------------------------------
+
+export type AutoContinueReason = 'tool-tail' | 'no-assistant-text';
+
+export type SettleGuardAction = 'settle' | 'settle-exhausted' | 'continue' | 'wait';
+
+export interface SettleGuardInput {
+  snap: Pick<
+    TranscriptSnapshot,
+    'isFinished' | 'plannerContents' | 'tailKind' | 'engaged' | 'pendingApproval' | 'error'
+  >;
+  /** How long the transcript has produced no new steps (ms). */
+  tailQuietMs: number;
+  /** Auto-continue nudges already spent on the current turn. */
+  autoContinueCount: number;
+  /** Auto-continue nudge budget per turn. */
+  maxAutoContinue: number;
+  /** Required stillness before a clean final reply may settle (ms). */
+  settleStableMs: number;
+  /** Required stillness before a stalled turn may be nudged (ms). */
+  autoContinueQuietMs: number;
+}
+
+export interface SettleGuardDecision {
+  action: SettleGuardAction;
+  reason?: AutoContinueReason;
+}
+
+/**
+ * Decides whether a "finished-looking" cascade snapshot may settle as done, or
+ * whether the transcript tail proves the model merely paused mid-work and the
+ * bridge should nudge it with a "Continue" message instead.
+ *
+ * Guard conditions (checked at every done-settlement exit):
+ * - (a) `tool-tail`: the LAST valid entry is a tool call or tool result with no
+ *   assistant text after it. `isFinished` is then stale state left behind by an
+ *   earlier final text or CHECKPOINT (executor DONE steps never reset it) — the
+ *   classic false summary "I am waiting for the background test run to
+ *   complete." that the transcript carries while the model is actually stalled.
+ * - (b) `no-assistant-text`: the whole turn ended without ANY assistant text
+ *   reply (e.g. the model launched a background task and yielded silently).
+ *
+ * Both conditions keep the run unsettled and trigger one capped auto-continue;
+ * once the budget (`maxAutoContinue`) is spent the caller settles anyway and
+ * flags `autoContinueExhausted` so callers can verify the outcome.
+ */
+export function decideTailSettle(input: SettleGuardInput): SettleGuardDecision {
+  const { snap, tailQuietMs, autoContinueCount, maxAutoContinue, settleStableMs, autoContinueQuietMs } = input;
+  const finished = snap.isFinished === true;
+  const hasText = snap.plannerContents.length > 0;
+
+  // Not at a settlement point: errors / pending approvals / live turns are
+  // handled by their dedicated branches.
+  if (!finished || snap.error || snap.pendingApproval) {
+    return { action: 'wait' };
+  }
+
+  // (b) Turn ended without any assistant text reply.
+  if (!hasText) {
+    // A turn-setup CHECKPOINT (no model activity yet) is not a stall.
+    if (!snap.engaged) return { action: 'wait' };
+    if (tailQuietMs < autoContinueQuietMs) return { action: 'wait' };
+    if (autoContinueCount < maxAutoContinue) return { action: 'continue', reason: 'no-assistant-text' };
+    return { action: 'settle-exhausted', reason: 'no-assistant-text' };
+  }
+
+  // (a) Tool call / tool result tail: the model has not produced its closing
+  // reply after the latest tool activity.
+  if (snap.tailKind === 'tool-call' || snap.tailKind === 'tool-result') {
+    if (tailQuietMs < autoContinueQuietMs) return { action: 'wait' };
+    if (autoContinueCount < maxAutoContinue) return { action: 'continue', reason: 'tool-tail' };
+    return { action: 'settle-exhausted', reason: 'tool-tail' };
+  }
+
+  // Genuine-looking final reply (assistant text / checkpoint tail): settle, but
+  // only after the transcript has been still for a short window — late-landing
+  // executor steps (background tasks writing their results) flip the tail to a
+  // tool message and get caught by the guard above instead of settling first.
+  if (tailQuietMs < settleStableMs) return { action: 'wait' };
+  return { action: 'settle' };
+}
+
 export interface LoadedTranscript {
   path: string;
   text: string;
@@ -293,6 +420,7 @@ export async function readCascadeTranscript(
     pendingApproval: parsed.pendingApproval,
     isFinished: parsed.isFinished,
     error: parsed.error,
+    tailKind: parsed.tailKind,
   };
 }
 
@@ -348,7 +476,11 @@ export async function pollTranscript(
       }
       if (latestParsed.plannerContents.length > 0) {
         const stable = Date.now() - lastChange >= stableMs;
-        if (latestParsed.checkpointAfterInput || (latestParsed.isFinished && stable)) {
+        // Tail guard parity: a tool call/result as the last valid entry is
+        // mid-turn activity (stale isFinished), never a completed turn.
+        const tailSettleable =
+          latestParsed.tailKind !== 'tool-call' && latestParsed.tailKind !== 'tool-result';
+        if (latestParsed.checkpointAfterInput || (latestParsed.isFinished && tailSettleable && stable)) {
           return {
             done: true,
             status: 'done',

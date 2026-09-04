@@ -19,7 +19,14 @@ import {
   DEFAULT_MODEL_ID,
 } from './models.js';
 import { HubClient } from './hub/client.js';
-import { readCascadeTranscript, loadTranscriptFile, PendingToolApproval } from './hub/transcript.js';
+import {
+  readCascadeTranscript,
+  loadTranscriptFile,
+  PendingToolApproval,
+  decideTailSettle,
+  type TranscriptSnapshot,
+  type AutoContinueReason,
+} from './hub/transcript.js';
 import {
   classifyError,
   isTransientRetryableError,
@@ -41,6 +48,15 @@ export interface AutoResumeConfig {
   message?: string;
 }
 
+/** Default budget of tail-guard auto-"Continue" nudges per turn. */
+export const DEFAULT_AUTO_CONTINUE_MAX = 5;
+/** Default message sent by the tail-guard auto-continue. */
+export const DEFAULT_AUTO_CONTINUE_MESSAGE = 'Continue';
+/** Stillness (ms) required before a stalled tail may be nudged with "Continue". */
+export const AUTO_CONTINUE_QUIET_MS = 10_000;
+/** Stillness (ms) required before a final-looking assistant reply may settle. */
+export const SETTLE_STABLE_MS = 3_000;
+
 export interface AntigravityConfig {
   backend?: 'hub' | 'localharness';
   binaryPath?: string;
@@ -60,6 +76,16 @@ export interface AntigravityConfig {
   approvalGraceMs?: number;
   /** Transient error auto-resume configuration. */
   autoResume?: AutoResumeConfig;
+  /** Inactivity timeout (ms) for a mid-turn running cascade before triggering stall recovery (default 120_000, 2m).
+   *  When no new steps or heartbeats arrive for this duration, the bridge treats it as a network error / stalled stream
+   *  and sends an auto-resume nudge up to autoResume.maxRetries. */
+  stallTimeoutMs?: number;
+  /** Max consecutive auto-"Continue" nudges per turn when the transcript tail shows the turn is not
+   *  really finished (tool tail / no assistant text); 0 disables nudging and settles after the quiet
+   *  window with autoContinueExhausted flagged (default 5). */
+  autoContinueMax?: number;
+  /** Message sent to the cascade for each tail-guard auto-continue (default "Continue"). */
+  autoContinueMessage?: string;
 }
 
 export const Config: Schema<AntigravityConfig> = Schema.object({
@@ -87,6 +113,9 @@ export const Config: Schema<AntigravityConfig> = Schema.object({
     maxRetries: 3,
     message: '继续。按原计划继续执行当前任务，不要停止。',
   }).description('Transient error auto-resume configuration'),
+  autoContinueMax: Schema.number().default(DEFAULT_AUTO_CONTINUE_MAX).description('Max consecutive auto-"Continue" nudges per turn when the transcript tail shows unfinished work (tool tail / no assistant text); 0 disables nudging (default 5)'),
+  autoContinueMessage: Schema.string().default(DEFAULT_AUTO_CONTINUE_MESSAGE).description('Message sent to the cascade for each tail-guard auto-continue (default "Continue")'),
+  stallTimeoutMs: Schema.number().default(120_000).description('Inactivity timeout in ms for mid-turn running cascade before triggering stall recovery (default 120000, 2m)'),
 });
 
 declare module '@deepseek-ai/cordis' {
@@ -123,6 +152,12 @@ export interface HubRun {
   reportChars?: number;
   /** Consecutive auto-resume retry count for transient errors in the current turn/streak. */
   autoResumeRetries?: number;
+  /** Auto-"Continue" nudges already sent for the current turn's tail-guard stalls. */
+  autoContinueCount?: number;
+  /** True once the tail-guard nudge budget was exhausted (or delivery failed) and the run settled anyway. */
+  autoContinueExhausted?: boolean;
+  /** Reason the last tail-guard nudge was sent ('tool-tail' | 'no-assistant-text'). */
+  lastAutoContinueReason?: AutoContinueReason;
 }
 
 export interface CascadeDetailedResult {
@@ -131,6 +166,10 @@ export interface CascadeDetailedResult {
   lastActiveAt?: string;
   pendingTool?: PendingToolApproval;
   error?: string;
+  /** Auto-"Continue" nudges spent on the current turn. */
+  autoContinueCount?: number;
+  /** True when the tail guard burned the whole nudge budget and the run settled anyway. */
+  autoContinueExhausted?: boolean;
 }
 
 export interface SettlementNoticePayload {
@@ -180,6 +219,10 @@ export function buildSettlementNotice(run: HubRun): SettlementNoticePayload {
     emoji = '✅';
     label = 'Completed Successfully';
     detail = `耗时: ${elapsedSec}s${reportLine}\n\n摘要:\n${content.slice(0, 400)}${content.length > 400 ? `...(共 ${content.length} 字符，全文见上方路径)` : ''}`;
+  }
+
+  if (run.autoContinueExhausted) {
+    detail += `\n\n> ⚠️ **autoContinueExhausted**: 连续 ${run.autoContinueCount ?? 0} 次自动 "Continue" 后 transcript 尾部仍是工具消息/无文本回复，已达上限并按当前状态结算 — 请核实任务是否真正完成（可用 antigravity_check_run 再查）。`;
   }
 
   const summary = `${emoji} [Antigravity] ${run.cascadeId.slice(0, 8)} ${label}`;
@@ -543,6 +586,9 @@ export class AntigravityService extends Service {
     run.reportPath = undefined;
     run.reportChars = undefined;
     run.autoResumeRetries = 0;
+    run.autoContinueCount = 0;
+    run.autoContinueExhausted = undefined;
+    run.lastAutoContinueReason = undefined;
     if (callerAgent) run.callerAgent = callerAgent;
     return run;
   }
@@ -688,7 +734,14 @@ export class AntigravityService extends Service {
     const existingRun = this.runs.get(conversationId);
     let status: HubRun['status'] = existingRun?.status ?? 'running';
     if (snap?.error) {
-      status = 'error';
+      const isTransient = this.config.autoResume?.enabled !== false && isTransientRetryableError(snap.error);
+      const retries = existingRun?.autoResumeRetries ?? 0;
+      const maxRetries = this.config.autoResume?.maxRetries ?? 3;
+      if (isTransient && retries < maxRetries && existingRun?.status !== 'error') {
+        status = 'running';
+      } else {
+        status = 'error';
+      }
     } else if (snap?.pendingApproval) {
       const client = await this.getHubClient();
       const isReal = await client.isCascadeAwaitingApproval(conversationId);
@@ -696,7 +749,16 @@ export class AntigravityService extends Service {
     } else if (snap?.isFinished && snap.plannerContents.length > 0) {
       // Strict done: a bare isFinished (e.g. setup CHECKPOINT with zero planner
       // output) must not classify as done — that poisoned the registry before.
-      status = 'done';
+      // v0.2.6 tail guard: when the LAST valid entry is a tool call/tool result,
+      // the model has not produced its closing reply for this turn (an earlier
+      // final text or CHECKPOINT leaves a stale isFinished behind while late
+      // executor steps land). Report running so the single watcher poller can
+      // auto-continue instead of settling the cascade prematurely.
+      if (snap.tailKind === 'tool-call' || snap.tailKind === 'tool-result') {
+        status = 'running';
+      } else {
+        status = 'done';
+      }
     } else if (!snap && existingRun?.status === 'done') {
       status = 'done'; // transcript unreadable: keep the last known terminal state
     } else if (snap?.engaged) {
@@ -713,13 +775,17 @@ export class AntigravityService extends Service {
       priorContents: existingRun?.priorContents ?? [],
       lastActiveAt: snap?.lastActiveAt ?? existingRun?.lastActiveAt,
       content: snap?.plannerContents.join('\n\n') ?? existingRun?.content,
-      error: snap?.error ?? existingRun?.error,
+      error: existingRun?.error ?? snap?.error,
       pendingTool: snap?.pendingApproval ?? existingRun?.pendingTool,
       approvalNotified: existingRun?.approvalNotified,
       resumedNotified: existingRun?.resumedNotified,
       lastNotifiedTransition: existingRun?.lastNotifiedTransition,
       reportPath: existingRun?.reportPath,
       reportChars: existingRun?.reportChars,
+      autoResumeRetries: existingRun?.autoResumeRetries,
+      autoContinueCount: existingRun?.autoContinueCount,
+      autoContinueExhausted: existingRun?.autoContinueExhausted,
+      lastAutoContinueReason: existingRun?.lastAutoContinueReason,
     };
     this.runs.set(conversationId, updatedRun);
 
@@ -825,6 +891,56 @@ export class AntigravityService extends Service {
     return { resumed: false };
   }
 
+  /**
+   * Send one tail-guard auto-"Continue" nudge through the existing sendMessage
+   * channel and re-arm the run so the pre-nudge transcript is excluded from the
+   * next settlement decision (the watcher then judges the model's response TO
+   * the nudge, not the stale tail that triggered it). Returns false when the
+   * budget is spent or delivery fails — the caller settles with
+   * autoContinueExhausted in that case.
+   */
+  private async sendAutoContinue(
+    cascadeId: string,
+    run: HubRun,
+    snap: TranscriptSnapshot,
+    reason: AutoContinueReason,
+  ): Promise<boolean> {
+    if (this.disposed) return false;
+    const max = this.config.autoContinueMax ?? DEFAULT_AUTO_CONTINUE_MAX;
+    const count = run.autoContinueCount ?? 0;
+    if (count >= max) {
+      run.autoContinueExhausted = true;
+      this.runs.set(cascadeId, run);
+      return false;
+    }
+    const message = this.config.autoContinueMessage || DEFAULT_AUTO_CONTINUE_MESSAGE;
+    try {
+      const client = await this.getHubClient();
+      await client.sendMessage(cascadeId, message);
+    } catch (err) {
+      const errText = err instanceof Error ? err.message : String(err);
+      run.error = `发送续作指令失败: ${errText}`;
+      this.runs.set(cascadeId, run);
+      return false;
+    }
+    // Archive whatever text this turn produced so far (stays reachable in the
+    // full report) and re-baseline the observation window.
+    const prev = (run.content ?? '').trim();
+    if (prev) {
+      run.priorContents = [...(run.priorContents ?? []), prev];
+      run.content = undefined;
+    }
+    const newBaseline = snap.maxStepIndex >= 0 ? snap.maxStepIndex : (run.baselineStepIndex ?? -1);
+    run.baselineStepIndex = newBaseline;
+    run.status = 'running';
+    run.error = undefined;
+    run.pendingTool = undefined;
+    run.autoContinueCount = count + 1;
+    run.lastAutoContinueReason = reason;
+    this.runs.set(cascadeId, run);
+    return true;
+  }
+
   /** Unified active cascade loop — the SINGLE poller per cascade. Tracks running/approval/error/done
    *  transitions off the local transcript, notifies DSH, releases parked settlement waiters, and lands
    *  oversized reports on disk. WaitForConversationFullyIdle is deliberately NOT used here: the hub
@@ -836,20 +952,25 @@ export class AntigravityService extends Service {
     const watchMs = this.config.watchMaxMs ?? 43_200_000;
     const deadline = Date.now() + watchMs;
     let lastStepSeen = -2;
+    let lastActiveSeen: string | undefined;
     let idleCycles = 0;
+    /** Timestamp of the last transcript progress (maxStepIndex change or lastActiveAt bump); anchors the tail-guard quiet windows and stall recovery. */
+    let stallSince = Date.now();
 
     try {
       while (!this.disposed && Date.now() < deadline) {
-        const run = this.runs.get(cascadeId) ?? {
-          cascadeId,
-          status: 'running' as const,
-          startedAt: Date.now(),
-          baselineStepIndex: -1,
-          turnSeq: 1,
-          priorContents: [] as string[],
-        };
-        const baseline = run.baselineStepIndex ?? -1;
-        const snap = await readCascadeTranscript(brainDir, cascadeId, baseline);
+        let snap: TranscriptSnapshot | undefined;
+        try {
+          const run = this.runs.get(cascadeId) ?? {
+            cascadeId,
+            status: 'running' as const,
+            startedAt: Date.now(),
+            baselineStepIndex: -1,
+            turnSeq: 1,
+            priorContents: [] as string[],
+          };
+          const baseline = run.baselineStepIndex ?? -1;
+          snap = await readCascadeTranscript(brainDir, cascadeId, baseline);
 
         if (snap) {
           run.lastActiveAt = snap.lastActiveAt;
@@ -858,12 +979,44 @@ export class AntigravityService extends Service {
           }
         }
 
+        // Transcript progress tracking (refreshes stall quiet anchor on any transcript movement or heartbeat).
+        const stepNow = snap?.maxStepIndex ?? -1;
+        const lastActiveNow = snap?.lastActiveAt;
+        if (stepNow !== lastStepSeen || (lastActiveNow && lastActiveNow !== lastActiveSeen)) {
+          lastStepSeen = stepNow;
+          lastActiveSeen = lastActiveNow;
+          stallSince = Date.now();
+        }
+
         // 1. Error state
         if (snap?.error) {
           const { resumed } = await this.handleCascadeError(cascadeId, run, snap.error, snap.maxStepIndex);
           if (resumed) {
             idleCycles = 0;
             lastStepSeen = -2;
+            stallSince = Date.now();
+            continue;
+          }
+          break;
+        }
+
+        // 1.5 Mid-turn stall detection: cascade is in 'running' state, but no new steps
+        // or heartbeats have arrived for stallTimeoutMs (indicating a network error, hung stream, or silent freeze).
+        const stallTimeoutMs = this.config.stallTimeoutMs ?? 120_000;
+        const stalledMs = Date.now() - stallSince;
+        if (
+          run.status === 'running' &&
+          !snap?.pendingApproval &&
+          !snap?.isFinished &&
+          stalledMs >= stallTimeoutMs
+        ) {
+          const stalledSec = Math.round(stalledMs / 1000);
+          const stallError = `Cascade stalled: no progress or heartbeat for ${stalledSec}s (network error or stream interrupted)`;
+          const { resumed } = await this.handleCascadeError(cascadeId, run, stallError, snap?.maxStepIndex);
+          if (resumed) {
+            idleCycles = 0;
+            lastStepSeen = -2;
+            stallSince = Date.now();
             continue;
           }
           break;
@@ -930,6 +1083,7 @@ export class AntigravityService extends Service {
           }
 
           // Cascade is alive but blocked waiting for user approval in IDE
+          stallSince = Date.now();
           await new Promise((r) => setTimeout(r, 1000));
           continue;
         }
@@ -938,6 +1092,7 @@ export class AntigravityService extends Service {
         if (run.status === 'awaiting-approval' && !snap?.pendingApproval) {
           run.status = 'running';
           run.pendingTool = undefined;
+          stallSince = Date.now();
           // ONLY notify resumption if an approval notice was actually sent out before!
           if (run.approvalNotified && !run.resumedNotified) {
             run.resumedNotified = true;
@@ -950,27 +1105,107 @@ export class AntigravityService extends Service {
         // 4. Finished naturally. Strict predicate: only a definitive finished step
         //    (final PLANNER_RESPONSE without tool calls, or CHECKPOINT) settles the
         //    turn — intermediate planner narration must never count as done.
-        if (snap?.isFinished && snap.plannerContents.length > 0) {
-          run.status = 'done';
-          this.runs.set(cascadeId, run);
-          await this.landReport(run);
-          this.notifySettlementToDsh(run);
-          this.settleWaiters(cascadeId, { status: 'done', content: AntigravityService.fullReportText(run), lastActiveAt: run.lastActiveAt });
-          break;
+        //
+        //    v0.2.6 tail guard (early-stop misjudgment fix): before settling, inspect
+        //    the transcript tail. (a) A tool call/tool result as the LAST valid entry
+        //    (isFinished left stale by an earlier final text or CHECKPOINT) or (b) a
+        //    turn without ANY assistant text reply means the model merely paused
+        //    mid-work (e.g. launched a background task and is waiting on it). Instead
+        //    of settling, nudge the cascade with "Continue" through the existing
+        //    sendMessage channel (budget: autoContinueMax, default 5) and keep
+        //    polling; once the budget is spent, settle anyway and flag
+        //    autoContinueExhausted so callers can verify the outcome.
+        if (snap && !snap.error && !snap.pendingApproval && snap.isFinished) {
+          const decision = decideTailSettle({
+            snap,
+            tailQuietMs: Date.now() - stallSince,
+            autoContinueCount: run.autoContinueCount ?? 0,
+            maxAutoContinue: this.config.autoContinueMax ?? DEFAULT_AUTO_CONTINUE_MAX,
+            settleStableMs: SETTLE_STABLE_MS,
+            autoContinueQuietMs: AUTO_CONTINUE_QUIET_MS,
+          });
+
+          if (decision.action === 'continue' && decision.reason) {
+            const sent = await this.sendAutoContinue(cascadeId, run, snap, decision.reason);
+            if (sent) {
+              // Fresh observation window: the watcher re-evaluates against the
+              // model's response to the nudge, not the stale pre-nudge tail.
+              idleCycles = 0;
+              lastStepSeen = -2;
+              continue;
+            }
+            // Nudge delivery failed (or the budget raced): stop nudging and settle
+            // with the exhausted flag instead of spinning on an unreachable cascade.
+            run.autoContinueExhausted = true;
+          }
+
+          if (decision.action === 'settle' || decision.action === 'settle-exhausted' || run.autoContinueExhausted) {
+            const exhausted = decision.action === 'settle-exhausted' || run.autoContinueExhausted === true;
+            if (exhausted) run.autoContinueExhausted = true;
+            if (snap.plannerContents.length > 0) {
+              run.status = 'done';
+              this.runs.set(cascadeId, run);
+              await this.landReport(run);
+              this.notifySettlementToDsh(run);
+              this.settleWaiters(cascadeId, {
+                status: 'done',
+                content: AntigravityService.fullReportText(run),
+                lastActiveAt: run.lastActiveAt,
+                autoContinueCount: run.autoContinueCount,
+                autoContinueExhausted: run.autoContinueExhausted,
+              });
+            } else {
+              // Turn ended with zero assistant text and the nudge budget is gone:
+              // an honest error beats silently polling until the watcher cap.
+              run.status = 'error';
+              run.error = run.error ? `${run.error} (auto-continue exhausted)` : `Turn ended without any assistant text reply; auto-continue budget (${this.config.autoContinueMax ?? DEFAULT_AUTO_CONTINUE_MAX}) exhausted after ${run.autoContinueCount ?? 0} nudge(s).`;
+              this.runs.set(cascadeId, run);
+              await this.landReport(run);
+              this.notifySettlementToDsh(run);
+              this.settleWaiters(cascadeId, {
+                status: 'error',
+                content: AntigravityService.fullReportText(run),
+                error: run.error,
+                lastActiveAt: run.lastActiveAt,
+                autoContinueCount: run.autoContinueCount,
+                autoContinueExhausted: true,
+              });
+            }
+            break;
+          }
+          // decision.action === 'wait': the transcript is still moving (or a
+          // turn-setup CHECKPOINT is waiting for the model to start) — keep polling.
         }
 
         // Idle backoff: poll less aggressively while the cascade makes no progress.
-        const stepNow = snap?.maxStepIndex ?? -1;
         if (stepNow === lastStepSeen) {
           idleCycles = Math.min(idleCycles + 1, 5);
         } else {
           idleCycles = 0;
-          lastStepSeen = stepNow;
         }
         if (idleCycles > 0) {
           await new Promise((r) => setTimeout(r, idleCycles * 1000));
         }
+      } catch (loopErr) {
+        const run = this.runs.get(cascadeId) ?? {
+          cascadeId,
+          status: 'running' as const,
+          startedAt: Date.now(),
+          baselineStepIndex: -1,
+          turnSeq: 1,
+          priorContents: [] as string[],
+        };
+        const errText = loopErr instanceof Error ? loopErr.message : String(loopErr);
+        const { resumed } = await this.handleCascadeError(cascadeId, run, errText, snap?.maxStepIndex);
+        if (resumed) {
+          idleCycles = 0;
+          lastStepSeen = -2;
+          stallSince = Date.now();
+          continue;
+        }
+        break;
       }
+    }
 
       if (Date.now() >= deadline) {
         const run = this.runs.get(cascadeId);
@@ -1124,7 +1359,10 @@ export class AntigravityService extends Service {
         throw new Error(`${result.error || 'Antigravity execution failed'}${partial}`);
       }
       const shaped = await this.shapeResult(conversationId, result.content, run);
-      return shaped.content || '[Antigravity returned no planner output]';
+      const exhaustedNote = result.autoContinueExhausted
+        ? `\n\n[autoContinueExhausted] Settled after ${result.autoContinueCount ?? 0} auto-"Continue" nudges without a closing assistant reply; verify the task truly completed via antigravity_check_run.`
+        : '';
+      return (shaped.content || '[Antigravity returned no planner output]') + exhaustedNote;
     }
 
     // Short probe (3 seconds) for background runs to detect immediate fast refusal, error, or early completion
@@ -1134,7 +1372,12 @@ export class AntigravityService extends Service {
       const snap = await readCascadeTranscript(brainDir, conversationId, baselineStepIndex);
       // A CHECKPOINT right after USER_INPUT sets isFinished with zero planner
       // output — that is turn setup, not settlement. Done requires real content.
-      const terminalDone = !!(snap?.isFinished && snap.plannerContents.length > 0);
+      // v0.2.6 tail guard: a tool call/result as the LAST valid entry is mid-turn
+      // activity (stale isFinished from an earlier final text/CHECKPOINT), never
+      // an early-settleable completion — the lifecycle watcher's tail guard
+      // handles those with auto-continue instead.
+      const probeTailSettleable = snap?.tailKind !== 'tool-call' && snap?.tailKind !== 'tool-result';
+      const terminalDone = !!(snap?.isFinished && snap.plannerContents.length > 0 && probeTailSettleable);
       let pendingConfirmed = false;
       if (snap?.pendingApproval) {
         const isReal = await client.isCascadeAwaitingApproval(conversationId);
@@ -1217,10 +1460,18 @@ export class AntigravityService extends Service {
       // The watcher is the only poller; attach one when the cascade is genuinely live but
       // unwatched (e.g. after a plugin reload). Already-finished cascades skip this — the
       // fast path in waitForSettlement classifies them instantly.
+      // v0.2.6: the fast path no longer settles tail-guard stalls (tool tail / no
+      // assistant text), so attach a watcher for those too — its tail guard
+      // auto-continues them instead of leaving the cascade unwatched.
       if (!this.watchers.has(runId)) {
         const probe = await readCascadeTranscript(brainDir, runId, baselineStepIndex);
-        if (probe && !probe.isFinished && !probe.pendingApproval && probe.engaged) {
-          this.ensureActiveWatcher(runId, callerAgent || existingRun?.callerAgent, baselineStepIndex);
+        if (probe && probe.engaged && !probe.pendingApproval) {
+          const toolTail = probe.tailKind === 'tool-call' || probe.tailKind === 'tool-result';
+          const stalledNoText = probe.isFinished && probe.plannerContents.length === 0;
+          const stalledToolTail = probe.isFinished && probe.plannerContents.length > 0 && toolTail;
+          if (!probe.isFinished || stalledNoText || stalledToolTail) {
+            this.ensureActiveWatcher(runId, callerAgent || existingRun?.callerAgent, baselineStepIndex);
+          }
         }
       }
 
@@ -1239,6 +1490,8 @@ export class AntigravityService extends Service {
         totalChars: shaped.totalChars || null,
         reportPath: shaped.reportPath ?? null,
         error: detailed.error || null,
+        autoContinueCount: detailed.autoContinueCount ?? run?.autoContinueCount ?? 0,
+        autoContinueExhausted: detailed.autoContinueExhausted ?? run?.autoContinueExhausted ?? false,
       });
     }
 
@@ -1258,6 +1511,8 @@ export class AntigravityService extends Service {
       totalChars: shaped.totalChars || null,
       reportPath: shaped.reportPath ?? null,
       error: detailed.error || null,
+      autoContinueCount: detailed.autoContinueCount ?? run?.autoContinueCount ?? 0,
+      autoContinueExhausted: detailed.autoContinueExhausted ?? run?.autoContinueExhausted ?? false,
     });
   }
 
