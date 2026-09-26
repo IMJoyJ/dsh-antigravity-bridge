@@ -98,6 +98,32 @@ export interface StructuredCascadeTasksResult {
   activeTasks: ActiveBackgroundTask[];
   allTasks: ActiveBackgroundTask[];
   hasActiveChildren: boolean;
+  isCascadeActive?: boolean;
+}
+
+/**
+ * CascadeRunStatus mappings (from protobuf exa.cortex_pb.CascadeRunStatus):
+ * UNSPECIFIED=0, IDLE=1
+ * RUNNING=2, CANCELING=3, BUSY=4 (Active)
+ */
+export const CASCADE_RUN_ACTIVE_CODES = new Set<number>([2, 3, 4]);
+export const CASCADE_RUN_ACTIVE_NAMES = new Set<string>([
+  'RUNNING',
+  'CASCADE_RUN_STATUS_RUNNING',
+  'BUSY',
+  'CASCADE_RUN_STATUS_BUSY',
+  'CANCELING',
+  'CASCADE_RUN_STATUS_CANCELING',
+]);
+
+export function isCascadeRunStatusActive(status: unknown): boolean {
+  if (typeof status === 'number') return CASCADE_RUN_ACTIVE_CODES.has(status);
+  if (typeof status === 'string') {
+    const num = parseInt(status, 10);
+    if (!Number.isNaN(num) && CASCADE_RUN_ACTIVE_CODES.has(num)) return true;
+    return CASCADE_RUN_ACTIVE_NAMES.has(status.toUpperCase());
+  }
+  return false;
 }
 
 export function isCortexStatusActive(status: unknown): boolean {
@@ -263,7 +289,10 @@ export function parseStructuredTrajectoryTasks(
     }
   }
 
-  return { activeTasks, allTasks, hasActiveChildren };
+  const cascadeStatus = resp?.status ?? (resp as any)?.trajectoryStatus;
+  const isCascadeActive = isCascadeRunStatusActive(cascadeStatus);
+
+  return { activeTasks, allTasks, hasActiveChildren, isCascadeActive };
 }
 
 /**
@@ -401,7 +430,7 @@ export function readStructuredTasksFromSqlite(
         }
       }
 
-      return { activeTasks, allTasks, hasActiveChildren };
+      return { activeTasks, allTasks, hasActiveChildren, isCascadeActive: false };
     } finally {
       db.close();
     }

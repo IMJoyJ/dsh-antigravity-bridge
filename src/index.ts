@@ -61,8 +61,10 @@ export const DEFAULT_AUTO_CONTINUE_MAX = 5;
 export const DEFAULT_AUTO_CONTINUE_MESSAGE = 'Continue';
 /** Stillness (ms) required before a stalled tail may be nudged with "Continue". */
 export const AUTO_CONTINUE_QUIET_MS = 10_000;
-/** Stillness (ms) required before a final-looking assistant reply may settle. */
-export const SETTLE_STABLE_MS = 3_000;
+/** Stillness (ms) required before a final-looking assistant reply may enter two-phase settle confirmation (minimum 15s). */
+export const SETTLE_STABLE_MS = 15_000;
+/** Minimum interval (ms) required between first-round settle candidate snapshot and second-round fresh confirmation query (10s). */
+export const SETTLE_CONFIRMATION_INTERVAL_MS = 10_000;
 /** Default absolute cap on background lifecycle watcher in ms (12h). */
 export const DEFAULT_WATCH_MAX_MS = 43_200_000;
 
@@ -182,6 +184,25 @@ export interface HubRun {
   silencedTasks?: Record<string, TaskSilenceEntry>;
   /** Residual background task IDs that were alive (infinitely silenced) when cascade settled. */
   residualBackgroundTasks?: string[];
+  /** Two-phase settlement confirmation snapshot (Round 1). */
+  settleCandidateSnapshot?: {
+    stepIndex: number;
+    transcriptHash: string;
+    firstSeenAt: number;
+  };
+}
+
+export function computeTranscriptHash(snap: TranscriptSnapshot | undefined): string {
+  if (!snap) return '';
+  const hash = crypto.createHash('sha256');
+  hash.update(String(snap.maxStepIndex));
+  hash.update(':');
+  hash.update(snap.lastActiveAt ?? '');
+  hash.update(':');
+  hash.update(snap.plannerContents.join('\n\n'));
+  hash.update(':');
+  hash.update(snap.tailKind);
+  return hash.digest('hex');
 }
 
 export interface TaskSilenceEntry {
@@ -237,6 +258,12 @@ export interface PersistedRun {
   silencedTasks?: Record<string, TaskSilenceEntry>;
   /** Residual background task IDs that were alive (infinitely silenced) when cascade settled. */
   residualBackgroundTasks?: string[];
+  /** Two-phase settlement confirmation snapshot (Round 1). */
+  settleCandidateSnapshot?: {
+    stepIndex: number;
+    transcriptHash: string;
+    firstSeenAt: number;
+  };
 }
 
 export interface PersistedQueuedMessage {
@@ -2149,6 +2176,25 @@ export class AntigravityService extends Service {
           lastStepSeen = stepNow;
           lastActiveSeen = lastActiveNow;
           stallSince = Date.now();
+          if (run.settleCandidateSnapshot) {
+            console.log(
+              `[antigravity] Cascade ${cascadeId} step/active grew during confirmation window (step: ${run.settleCandidateSnapshot.stepIndex} -> ${stepNow}). Resetting settle gate.`
+            );
+            run.settleCandidateSnapshot = undefined;
+            this.runs.set(cascadeId, run);
+          }
+        }
+
+        // Window perception anchored to lastActiveAt (any step growth resets stallSince).
+        let quietMs = Date.now() - stallSince;
+        if (snap?.lastActiveAt) {
+          const activeMs = Date.parse(snap.lastActiveAt);
+          if (!Number.isNaN(activeMs)) {
+            const elapsedSinceActive = Date.now() - activeMs;
+            if (elapsedSinceActive >= 0 && elapsedSinceActive < quietMs) {
+              quietMs = elapsedSinceActive;
+            }
+          }
         }
 
         // 1. Error state
@@ -2171,12 +2217,14 @@ export class AntigravityService extends Service {
         const stalledMs = Date.now() - stallSince;
 
         // Structured task state query (GetCascadeTrajectory with throttling + caching + SQLite fallback)
+        // Requirement 2: Settlement decision path MUST bypass cache (forceRefresh = true).
+        // Non-settlement monitoring / notification path uses 3s cache throttling.
         const isSettleCandidate = snap && !snap.error && !snap.pendingApproval && snap.isFinished;
         const structuredTasks = await this.getStructuredCascadeTasks(
           cascadeId,
           brainDir,
           stepNow,
-          isSettleCandidate,
+          Boolean(isSettleCandidate),
         );
 
         if (snap) {
@@ -2195,8 +2243,12 @@ export class AntigravityService extends Service {
           const silence = this.isTaskSilenced(cascadeId, t.taskId);
           return silence.infinite;
         });
-        const hasBlockingTasks = blockingTasks.length > 0 || Boolean(snap?.hasActiveChildren || structuredTasks.hasActiveChildren);
-        const hasActiveTasks = activeTasks.length > 0 || Boolean(snap?.hasActiveChildren || structuredTasks.hasActiveChildren);
+        const hasBlockingTasks =
+          blockingTasks.length > 0 ||
+          Boolean(snap?.hasActiveChildren || structuredTasks.hasActiveChildren || structuredTasks.isCascadeActive);
+        const hasActiveTasks =
+          activeTasks.length > 0 ||
+          Boolean(snap?.hasActiveChildren || structuredTasks.hasActiveChildren || structuredTasks.isCascadeActive);
         if (
           run.status === 'running' &&
           !snap?.pendingApproval &&
@@ -2303,6 +2355,9 @@ export class AntigravityService extends Service {
         // Hub will send a message to AGY session when any background task completes to wake it up.
         // Do NOT settle, do NOT auto-continue, do NOT treat as stalled.
         if (hasBlockingTasks) {
+          if (run.settleCandidateSnapshot) {
+            run.settleCandidateSnapshot = undefined;
+          }
           if (run.status !== 'waiting-background' || !run.waitingBackgroundStartedAt) {
             run.status = 'waiting-background';
             run.waitingBackgroundStartedAt = Date.now();
@@ -2327,6 +2382,7 @@ export class AntigravityService extends Service {
           run.status = 'running';
           run.waitingBackgroundStartedAt = undefined;
           stallSince = Date.now();
+          idleCycles = 0;
           this.runs.set(cascadeId, run);
           this.saveStateDebounced();
         }
@@ -2347,16 +2403,20 @@ export class AntigravityService extends Service {
         if (snap && !snap.error && !snap.pendingApproval && snap.isFinished) {
           const decision = decideTailSettle({
             snap,
-            tailQuietMs: Date.now() - stallSince,
+            tailQuietMs: quietMs,
             autoContinueCount: run.autoContinueCount ?? 0,
             maxAutoContinue: this.config.autoContinueMax ?? DEFAULT_AUTO_CONTINUE_MAX,
             settleStableMs: SETTLE_STABLE_MS,
             autoContinueQuietMs: AUTO_CONTINUE_QUIET_MS,
             blockingBackgroundTasks: blockingTasks,
             hasActiveChildren: snap?.hasActiveChildren || structuredTasks.hasActiveChildren,
+            isCascadeActive: structuredTasks.isCascadeActive,
           });
 
           if (decision.action === 'wait-background') {
+            if (run.settleCandidateSnapshot) {
+              run.settleCandidateSnapshot = undefined;
+            }
             if ((run.status as string) !== 'waiting-background' || !run.waitingBackgroundStartedAt) {
               run.status = 'waiting-background';
               run.waitingBackgroundStartedAt = Date.now();
@@ -2377,6 +2437,9 @@ export class AntigravityService extends Service {
           }
 
           if (decision.action === 'continue' && decision.reason && decision.reason !== 'background-task') {
+            if (run.settleCandidateSnapshot) {
+              run.settleCandidateSnapshot = undefined;
+            }
             const sent = await this.sendAutoContinue(cascadeId, run, snap, decision.reason);
             if (sent) {
               // Fresh observation window: the watcher re-evaluates against the
@@ -2390,7 +2453,90 @@ export class AntigravityService extends Service {
             run.autoContinueExhausted = true;
           }
 
+          // If decision is 'wait' but tail is assistant-text without blocking tasks:
+          // Record Round 1 snapshot early so the confirmation interval begins!
+          if (
+            decision.action === 'wait' &&
+            snap.tailKind === 'assistant-text' &&
+            snap.plannerContents.length > 0 &&
+            !hasBlockingTasks
+          ) {
+            if (!run.settleCandidateSnapshot) {
+              run.settleCandidateSnapshot = {
+                stepIndex: snap.maxStepIndex,
+                transcriptHash: computeTranscriptHash(snap),
+                firstSeenAt: Date.now(),
+              };
+              this.runs.set(cascadeId, run);
+            }
+          }
+
           if (decision.action === 'settle' || decision.action === 'settle-exhausted' || run.autoContinueExhausted) {
+            const currentHash = computeTranscriptHash(snap);
+
+            // Round 1 check: initialize snapshot if not yet set
+            if (!run.settleCandidateSnapshot) {
+              run.settleCandidateSnapshot = {
+                stepIndex: snap.maxStepIndex,
+                transcriptHash: currentHash,
+                firstSeenAt: Date.now(),
+              };
+              this.runs.set(cascadeId, run);
+              await new Promise((r) => setTimeout(r, 1000));
+              continue;
+            }
+
+            // Check if confirmation interval (≥10s) has elapsed
+            const confirmationElapsed = Date.now() - run.settleCandidateSnapshot.firstSeenAt;
+            if (confirmationElapsed < SETTLE_CONFIRMATION_INTERVAL_MS) {
+              await new Promise((r) => setTimeout(r, 1000));
+              continue;
+            }
+
+            // Round 2: fresh query bypassing cache
+            const freshSnap = await readCascadeTranscript(brainDir, cascadeId, baseline);
+            const freshTasks = await this.getStructuredCascadeTasks(
+              cascadeId,
+              brainDir,
+              freshSnap?.maxStepIndex ?? -1,
+              true /* forceRefresh bypassing cache! */,
+            );
+            let freshPendingApproval = Boolean(freshSnap?.pendingApproval);
+            if (freshPendingApproval) {
+              const client = await this.getHubClient();
+              freshPendingApproval = await client.isCascadeAwaitingApproval(cascadeId);
+            }
+            const freshStepNow = freshSnap?.maxStepIndex ?? -1;
+            const freshHash = computeTranscriptHash(freshSnap);
+            const freshActiveTasks = freshTasks.activeTasks.filter(
+              (t) => !this.isTaskSilenced(cascadeId, t.taskId).infinite
+            );
+
+            const isConsistent =
+              freshSnap &&
+              !freshSnap.error &&
+              !freshPendingApproval &&
+              freshSnap.isFinished &&
+              freshStepNow === run.settleCandidateSnapshot.stepIndex &&
+              freshHash === run.settleCandidateSnapshot.transcriptHash &&
+              freshActiveTasks.length === 0 &&
+              !freshTasks.hasActiveChildren &&
+              !freshTasks.isCascadeActive;
+
+            if (!isConsistent) {
+              console.log(
+                `[antigravity] Cascade ${cascadeId} two-phase settle confirmation rejected: fresh read inconsistent with round 1 snapshot. `
+                + `(step: ${run.settleCandidateSnapshot.stepIndex} -> ${freshStepNow}, hashMatch: ${freshHash === run.settleCandidateSnapshot.transcriptHash}, `
+                + `tasks: ${freshActiveTasks.length}, activeChildren: ${freshTasks.hasActiveChildren}, cascadeActive: ${freshTasks.isCascadeActive}). Resetting settle gate.`
+              );
+              run.settleCandidateSnapshot = undefined;
+              stallSince = Date.now();
+              this.runs.set(cascadeId, run);
+              continue;
+            }
+
+            // Both rounds verified consistent! Clear candidate snapshot and settle.
+            run.settleCandidateSnapshot = undefined;
             const exhausted = decision.action === 'settle-exhausted' || run.autoContinueExhausted === true;
             if (exhausted) run.autoContinueExhausted = true;
             if (snap.plannerContents.length > 0) {

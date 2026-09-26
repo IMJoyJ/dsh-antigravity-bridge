@@ -700,6 +700,8 @@ export interface SettleGuardInput {
   blockingBackgroundTasks?: ActiveBackgroundTask[];
   /** 残余盲区①：Optional flag indicating active subagent child sessions. If omitted, defaults to snap.hasActiveChildren. */
   hasActiveChildren?: boolean;
+  /** Turn-level active status from GetCascadeTrajectory (CascadeRunStatus RUNNING/BUSY/CANCELING). */
+  isCascadeActive?: boolean;
   /** How long the transcript has produced no new steps (ms). */
   tailQuietMs: number;
   /** Auto-continue nudges already spent on the current turn. */
@@ -756,6 +758,11 @@ export function decideTailSettle(input: SettleGuardInput): SettleGuardDecision {
   // 残余盲区①：subagent 子会话（父帧只有 has_active_children 布尔——为 true 时视为阻塞 settle）
   const activeChildren = input.hasActiveChildren ?? snap.hasActiveChildren ?? false;
   if (activeChildren) {
+    return { action: 'wait-background', reason: 'background-task' };
+  }
+
+  // Turn-level cascade active status (CascadeRunStatus RUNNING/BUSY/CANCELING from GetCascadeTrajectory)
+  if (input.isCascadeActive) {
     return { action: 'wait-background', reason: 'background-task' };
   }
 

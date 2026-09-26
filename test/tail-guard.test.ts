@@ -1103,7 +1103,7 @@ describe('AntigravityService Background Task Watcher Lifecycle', () => {
 
     // Now complete the background task
     state = 'finished';
-    await vi.advanceTimersByTimeAsync(15_000); // settle stable window
+    await vi.advanceTimersByTimeAsync(20_000); // settle stable window (15s + confirmation)
 
     expect(run.status).toBe('done');
     expect(run.content).toContain('Background tests finished successfully!');
@@ -1321,8 +1321,8 @@ describe('AntigravityService Background Task Watcher Lifecycle', () => {
 
       svc.ensureActiveWatcher('cid-fake-done', undefined, -1);
 
-      // Advance timers past settleStableMs (3000ms) to trigger first settlement
-      await vi.advanceTimersByTimeAsync(5000);
+      // Advance timers past settleStableMs (15_000ms) and confirmation window (10_000ms) to trigger first settlement
+      await vi.advanceTimersByTimeAsync(20_000);
 
       const run = runOf(svc, 'cid-fake-done');
       expect(run.status).toBe('done');
@@ -1359,7 +1359,7 @@ describe('AntigravityService Background Task Watcher Lifecycle', () => {
         ],
       });
 
-      await vi.advanceTimersByTimeAsync(10_000);
+      await vi.advanceTimersByTimeAsync(20_000);
 
       expect(run.status).toBe('done');
       expect(run.settledStepIndex).toBe(20);
@@ -1415,8 +1415,8 @@ describe('AntigravityService Background Task Watcher Lifecycle', () => {
         activeBackgroundTasks: [],
       });
 
-      // Advance timers past settleStableMs (3000ms) and idleCycles
-      await vi.advanceTimersByTimeAsync(15_000);
+      // Advance timers past settleStableMs (15_000ms) and idleCycles
+      await vi.advanceTimersByTimeAsync(20_000);
 
       expect(run.status).toBe('done');
       expect(run.waitingBackgroundStartedAt).toBeUndefined();
@@ -1735,6 +1735,114 @@ describe('AntigravityService Background Task Watcher Lifecycle', () => {
 
       const snap2 = parseTranscript(rawWithDone, -1, 'cid-cn-test');
       expect(snap2.activeBackgroundTasks).toHaveLength(0);
+    });
+  });
+
+  describe('Two-Phase Settlement Confirmation (Phase 3 Regression)', () => {
+    it('rejects settlement when final-looking text has round 1 empty tasks but round 2 discovers active tasks', async () => {
+      const { svc } = makeService();
+      const notifySpy = vi.spyOn(svc, 'notifySettlementToDsh');
+
+      // Transcript has final-looking declaration text
+      const transcriptSnap = snap({
+        maxStepIndex: 100,
+        isFinished: true,
+        engaged: true,
+        tailKind: 'assistant-text',
+        plannerContents: ['I have launched benchmark run 1 of 3, please wait...'],
+        activeBackgroundTasks: [],
+      });
+      mockRead.mockResolvedValue(transcriptSnap);
+
+      // Mock getStructuredCascadeTasks:
+      // Call 1 (Round 1): 0 tasks (manifest window race)
+      // Call 2+ (Round 2 fresh read): task appears!
+      let taskQueryCount = 0;
+      vi.spyOn(svc, 'getStructuredCascadeTasks').mockImplementation(async () => {
+        taskQueryCount++;
+        if (taskQueryCount === 1) {
+          return { activeTasks: [], allTasks: [], hasActiveChildren: false, isCascadeActive: false };
+        }
+        return {
+          activeTasks: [{ taskId: 'task-101', description: 'cargo test', startStepIndex: 101 }],
+          allTasks: [{ taskId: 'task-101', description: 'cargo test', startStepIndex: 101 }],
+          hasActiveChildren: false,
+          isCascadeActive: false,
+        };
+      });
+
+      svc.ensureActiveWatcher('cid-two-phase-rejection', undefined, -1);
+
+      // Advance timers past SETTLE_STABLE_MS (15s) and confirmation interval (10s)
+      await vi.advanceTimersByTimeAsync(20_000);
+
+      const run = runOf(svc, 'cid-two-phase-rejection');
+      // Must NOT be settled as done!
+      expect(run.status).not.toBe('done');
+      expect(run.settledStepIndex).toBeUndefined();
+      expect(notifySpy).not.toHaveBeenCalled();
+    });
+
+    it('settles cleanly when two consecutive rounds are consistent and quiet', async () => {
+      const { svc } = makeService();
+      const notifySpy = vi.spyOn(svc, 'notifySettlementToDsh');
+
+      const transcriptSnap = snap({
+        maxStepIndex: 50,
+        isFinished: true,
+        engaged: true,
+        tailKind: 'assistant-text',
+        plannerContents: ['All tasks completed successfully. Here are the results.'],
+        activeBackgroundTasks: [],
+      });
+      mockRead.mockResolvedValue(transcriptSnap);
+
+      vi.spyOn(svc, 'getStructuredCascadeTasks').mockResolvedValue({
+        activeTasks: [],
+        allTasks: [],
+        hasActiveChildren: false,
+        isCascadeActive: false,
+      });
+
+      svc.ensureActiveWatcher('cid-two-phase-settle', undefined, -1);
+
+      // Advance timers past SETTLE_STABLE_MS (15s) and confirmation interval (10s)
+      await vi.advanceTimersByTimeAsync(20_000);
+
+      const run = runOf(svc, 'cid-two-phase-settle');
+      expect(run.status).toBe('done');
+      expect(run.settledStepIndex).toBe(50);
+      expect(notifySpy).toHaveBeenCalledTimes(1);
+    });
+
+    it('rejects settlement when trajectory indicates cascade is active (isCascadeActive: true)', async () => {
+      const { svc } = makeService();
+      const notifySpy = vi.spyOn(svc, 'notifySettlementToDsh');
+
+      const transcriptSnap = snap({
+        maxStepIndex: 50,
+        isFinished: true,
+        engaged: true,
+        tailKind: 'assistant-text',
+        plannerContents: ['Working on it...'],
+        activeBackgroundTasks: [],
+      });
+      mockRead.mockResolvedValue(transcriptSnap);
+
+      vi.spyOn(svc, 'getStructuredCascadeTasks').mockResolvedValue({
+        activeTasks: [],
+        allTasks: [],
+        hasActiveChildren: false,
+        isCascadeActive: true, // cascade is still running at the turn level
+      });
+
+      svc.ensureActiveWatcher('cid-two-phase-cascade-active', undefined, -1);
+
+      await vi.advanceTimersByTimeAsync(20_000);
+
+      const run = runOf(svc, 'cid-two-phase-cascade-active');
+      expect(run.status).not.toBe('done');
+      expect(notifySpy).not.toHaveBeenCalled();
     });
   });
 });

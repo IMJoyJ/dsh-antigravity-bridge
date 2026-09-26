@@ -12,6 +12,7 @@ import {
   parseStructuredTrajectoryTasks,
   decodeProtobufTaskDetails,
   readStructuredTasksFromSqlite,
+  isCascadeRunStatusActive,
 } from '../src/hub/trajectory.js';
 
 describe('Structured Trajectory & SQLite Task Tracking (Phase 2)', () => {
@@ -267,5 +268,35 @@ describe('Structured Trajectory & SQLite Task Tracking (Phase 2)', () => {
       expect(result!.activeTasks).toEqual([]);
       expect(result!.hasActiveChildren).toBe(false);
     });
+
+    it('correctly maps CascadeRunStatus active and idle states', () => {
+      // 0: UNSPECIFIED (false), 1: IDLE (false), 2: RUNNING (true), 3: CANCELING (true), 4: BUSY (true)
+      expect(isCascadeRunStatusActive(0)).toBe(false);
+      expect(isCascadeRunStatusActive(1)).toBe(false);
+      expect(isCascadeRunStatusActive(2)).toBe(true);
+      expect(isCascadeRunStatusActive(3)).toBe(true);
+      expect(isCascadeRunStatusActive(4)).toBe(true);
+      expect(isCascadeRunStatusActive('CASCADE_RUN_STATUS_RUNNING')).toBe(true);
+      expect(isCascadeRunStatusActive('RUNNING')).toBe(true);
+      expect(isCascadeRunStatusActive('BUSY')).toBe(true);
+      expect(isCascadeRunStatusActive('CASCADE_RUN_STATUS_IDLE')).toBe(false);
+      expect(isCascadeRunStatusActive('IDLE')).toBe(false);
+      expect(isCascadeRunStatusActive(undefined)).toBe(false);
+    });
+
+    it('parseStructuredTrajectoryTasks flags isCascadeActive when cascade status is active', () => {
+      const respRunning = {
+        trajectory: { cascadeId: 'cid-active', steps: [] },
+        status: 2, // RUNNING
+      };
+      expect(parseStructuredTrajectoryTasks(respRunning, 'cid-active').isCascadeActive).toBe(true);
+
+      const respIdle = {
+        trajectory: { cascadeId: 'cid-idle', steps: [] },
+        status: 1, // IDLE
+      };
+      expect(parseStructuredTrajectoryTasks(respIdle, 'cid-idle').isCascadeActive).toBe(false);
+    });
   });
 });
+
