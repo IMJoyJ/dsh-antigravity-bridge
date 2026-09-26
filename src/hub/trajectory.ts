@@ -1,0 +1,412 @@
+import { DatabaseSync } from 'node:sqlite';
+import { homedir } from 'node:os';
+import { join } from 'node:path';
+import { existsSync } from 'node:fs';
+import type { ActiveBackgroundTask } from './transcript.js';
+
+/**
+ * CortexStepStatus code mappings:
+ * PENDING=1, RUNNING=2, WAITING=9, GENERATING=8, QUEUED=11 (Active)
+ * DONE=3, CLEARED=5, CANCELED=6, ERROR=7, INTERRUPTED=12 (Terminal)
+ */
+export const CORTEX_ACTIVE_STATUS_CODES = new Set<number>([1, 2, 8, 9, 11]);
+export const CORTEX_TERMINAL_STATUS_CODES = new Set<number>([3, 5, 6, 7, 12]);
+
+export const CORTEX_ACTIVE_STATUS_NAMES = new Set<string>([
+  'PENDING',
+  'CORTEX_STEP_STATUS_PENDING',
+  'RUNNING',
+  'CORTEX_STEP_STATUS_RUNNING',
+  'WAITING',
+  'CORTEX_STEP_STATUS_WAITING',
+  'GENERATING',
+  'CORTEX_STEP_STATUS_GENERATING',
+  'QUEUED',
+  'CORTEX_STEP_STATUS_QUEUED',
+]);
+
+export const CORTEX_TERMINAL_STATUS_NAMES = new Set<string>([
+  'DONE',
+  'CORTEX_STEP_STATUS_DONE',
+  'CLEARED',
+  'CORTEX_STEP_STATUS_CLEARED',
+  'CANCELED',
+  'CORTEX_STEP_STATUS_CANCELED',
+  'CANCELLED',
+  'CORTEX_STEP_STATUS_CANCELLED',
+  'ERROR',
+  'CORTEX_STEP_STATUS_ERROR',
+  'INTERRUPTED',
+  'CORTEX_STEP_STATUS_INTERRUPTED',
+]);
+
+export interface StatusTransition {
+  updatedStatus?: string | number;
+  timestamp?: string;
+}
+
+export interface TrajectoryStepDetail {
+  id?: string;
+  logUri?: string;
+  log_uri?: string;
+  description?: string;
+  summary?: string;
+  toolSummary?: string;
+  tool_summary?: string;
+}
+
+export interface TrajectoryStepMetadata {
+  createdAt?: string;
+  created_at?: string;
+  internalMetadata?: {
+    statusTransitions?: StatusTransition[];
+  };
+  internal_metadata?: {
+    status_transitions?: StatusTransition[];
+  };
+  hasActiveChildren?: boolean;
+  has_active_children?: boolean;
+}
+
+export interface TrajectoryStep {
+  stepIndex?: number;
+  step_index?: number;
+  type?: string | number;
+  status?: string | number;
+  taskDetails?: TrajectoryStepDetail;
+  task_details?: TrajectoryStepDetail;
+  metadata?: TrajectoryStepMetadata;
+  hasSubtrajectory?: boolean;
+  has_subtrajectory?: boolean;
+  [key: string]: unknown;
+}
+
+export interface TrajectoryResponse {
+  trajectory?: {
+    cascadeId?: string;
+    steps?: TrajectoryStep[];
+    metadata?: Record<string, unknown>;
+    hasActiveChildren?: boolean;
+    has_active_children?: boolean;
+  };
+  status?: string | number;
+  hasActiveChildren?: boolean;
+  has_active_children?: boolean;
+}
+
+export interface StructuredCascadeTasksResult {
+  activeTasks: ActiveBackgroundTask[];
+  allTasks: ActiveBackgroundTask[];
+  hasActiveChildren: boolean;
+}
+
+export function isCortexStatusActive(status: unknown): boolean {
+  if (typeof status === 'number') return CORTEX_ACTIVE_STATUS_CODES.has(status);
+  if (typeof status === 'string') {
+    const num = parseInt(status, 10);
+    if (!Number.isNaN(num) && CORTEX_ACTIVE_STATUS_CODES.has(num)) return true;
+    return CORTEX_ACTIVE_STATUS_NAMES.has(status.toUpperCase());
+  }
+  return false;
+}
+
+export function isCortexStatusTerminal(status: unknown): boolean {
+  if (typeof status === 'number') return CORTEX_TERMINAL_STATUS_CODES.has(status);
+  if (typeof status === 'string') {
+    const num = parseInt(status, 10);
+    if (!Number.isNaN(num) && CORTEX_TERMINAL_STATUS_CODES.has(num)) return true;
+    return CORTEX_TERMINAL_STATUS_NAMES.has(status.toUpperCase());
+  }
+  return false;
+}
+
+/**
+ * Resolves the effective status of a trajectory step, taking into account both
+ * the top-level status and the latest transition in metadata.internalMetadata.statusTransitions.
+ */
+export function getStepEffectiveStatus(step: TrajectoryStep): {
+  isActive: boolean;
+  isTerminal: boolean;
+  status: string | number;
+} {
+  const transitions =
+    step.metadata?.internalMetadata?.statusTransitions ||
+    step.metadata?.internal_metadata?.status_transitions;
+
+  let latestTransitionStatus: string | number | undefined;
+  if (Array.isArray(transitions) && transitions.length > 0) {
+    const last = transitions[transitions.length - 1];
+    if (last && last.updatedStatus !== undefined && last.updatedStatus !== null) {
+      latestTransitionStatus = last.updatedStatus;
+    }
+  }
+
+  const stepStatus = step.status ?? '';
+
+  // 1. If step.status is terminal, it has reached its terminal lifecycle
+  if (isCortexStatusTerminal(stepStatus)) {
+    return { isActive: false, isTerminal: true, status: stepStatus };
+  }
+  if (latestTransitionStatus !== undefined && isCortexStatusTerminal(latestTransitionStatus)) {
+    return { isActive: false, isTerminal: true, status: latestTransitionStatus };
+  }
+
+  // 2. If step.status or transition is active
+  if (isCortexStatusActive(stepStatus)) {
+    return { isActive: true, isTerminal: false, status: stepStatus };
+  }
+  if (latestTransitionStatus !== undefined && isCortexStatusActive(latestTransitionStatus)) {
+    return { isActive: true, isTerminal: false, status: latestTransitionStatus };
+  }
+
+  return { isActive: false, isTerminal: false, status: stepStatus };
+}
+
+/**
+ * Parses full GetCascadeTrajectory response into structured tasks and active child session flag.
+ *
+ * 活跃任务判定（零正则）：
+ * taskDetails != null 且最新状态 ∈ 活跃集合 (PENDING=1, RUNNING=2, WAITING=9, GENERATING=8, QUEUED=11)
+ *
+ * 残余盲区①：
+ * subagent 子会话：父帧/轨迹中 has_active_children 布尔或 INVOKE_SUBAGENT 处于活跃状态时，hasActiveChildren 为 true。
+ */
+export function parseStructuredTrajectoryTasks(
+  trajectoryResp: unknown,
+  targetCascadeId?: string,
+): StructuredCascadeTasksResult {
+  const resp = trajectoryResp as TrajectoryResponse | undefined;
+  const steps = resp?.trajectory?.steps || (resp as any)?.steps || [];
+
+  let hasActiveChildren = Boolean(
+    resp?.hasActiveChildren ||
+    resp?.has_active_children ||
+    resp?.trajectory?.hasActiveChildren ||
+    resp?.trajectory?.has_active_children ||
+    (resp?.trajectory?.metadata as any)?.hasActiveChildren ||
+    (resp?.trajectory?.metadata as any)?.has_active_children
+  );
+
+  const tasksMap = new Map<string, ActiveBackgroundTask & { isActive: boolean }>();
+
+  for (const step of steps) {
+    const statusInfo = getStepEffectiveStatus(step);
+
+    // 残余盲区①：subagent 子会话。如果 INVOKE_SUBAGENT 步骤或 subtrajectory 处于活跃状态，视为阻塞 settle
+    const isSubagentStep =
+      step.type === 'CORTEX_STEP_TYPE_INVOKE_SUBAGENT' ||
+      step.type === 'INVOKE_SUBAGENT' ||
+      step.type === 127 ||
+      step.hasSubtrajectory === true ||
+      step.has_subtrajectory === true;
+
+    if (isSubagentStep && statusInfo.isActive) {
+      hasActiveChildren = true;
+    }
+
+    const td = step.taskDetails || step.task_details;
+    if (!td || typeof td !== 'object' || !td.id) {
+      continue;
+    }
+
+    let cascadePrefix: string | undefined;
+    let rawTaskId: string;
+    const idParts = String(td.id).split('/');
+    if (idParts.length === 2) {
+      cascadePrefix = idParts[0];
+      rawTaskId = idParts[1];
+    } else {
+      rawTaskId = idParts[0];
+    }
+
+    // Cascade isolation
+    if (cascadePrefix && targetCascadeId && cascadePrefix !== targetCascadeId) {
+      continue;
+    }
+
+    const taskId = rawTaskId.toLowerCase();
+    if (!/^task-\d+$/.test(taskId)) {
+      continue;
+    }
+
+    const desc = td.description || td.summary || td.toolSummary || td.tool_summary;
+    const description = desc ? String(desc).trim() : undefined;
+    const startedAt =
+      step.metadata?.createdAt ||
+      step.metadata?.created_at ||
+      (step as any).created_at ||
+      (step as any).createdAt;
+    const stepIndex = step.stepIndex ?? step.step_index ?? 0;
+
+    tasksMap.set(taskId, {
+      taskId,
+      description,
+      startedAt,
+      startStepIndex: stepIndex,
+      isActive: statusInfo.isActive,
+    });
+  }
+
+  const allTasks: ActiveBackgroundTask[] = [];
+  const activeTasks: ActiveBackgroundTask[] = [];
+
+  for (const [, item] of tasksMap) {
+    const task: ActiveBackgroundTask = {
+      taskId: item.taskId,
+      description: item.description,
+      startedAt: item.startedAt,
+      startStepIndex: item.startStepIndex,
+    };
+    allTasks.push(task);
+    if (item.isActive) {
+      activeTasks.push(task);
+    }
+  }
+
+  return { activeTasks, allTasks, hasActiveChildren };
+}
+
+/**
+ * Decodes a protobuf serialized task_details blob from SQLite steps table.
+ * Wire format:
+ * Field 1: string id
+ * Field 2: string log_uri
+ * Field 4: string description
+ */
+export function decodeProtobufTaskDetails(buf: Buffer): {
+  id?: string;
+  logUri?: string;
+  log_uri?: string;
+  description?: string;
+} {
+  let i = 0;
+  let id: string | undefined;
+  let logUri: string | undefined;
+  let description: string | undefined;
+
+  while (i < buf.length) {
+    let tag = 0;
+    let shift = 0;
+    while (i < buf.length) {
+      const b = buf[i++];
+      tag |= (b & 0x7f) << shift;
+      if (!(b & 0x80)) break;
+      shift += 7;
+    }
+    const fieldNo = tag >> 3;
+    const wireType = tag & 7;
+
+    if (wireType === 2) {
+      let len = 0;
+      let s2 = 0;
+      while (i < buf.length) {
+        const b = buf[i++];
+        len |= (b & 0x7f) << s2;
+        if (!(b & 0x80)) break;
+        s2 += 7;
+      }
+      if (i + len > buf.length) break;
+      const str = buf.subarray(i, i + len).toString('utf8');
+      i += len;
+      if (fieldNo === 1) id = str;
+      else if (fieldNo === 2) logUri = str;
+      else if (fieldNo === 3 || fieldNo === 4) description = str;
+    } else if (wireType === 0) {
+      while (i < buf.length && buf[i++] & 0x80) {}
+    } else if (wireType === 1) {
+      i += 8;
+    } else if (wireType === 5) {
+      i += 4;
+    } else {
+      break;
+    }
+  }
+
+  return { id, logUri, log_uri: logUri, description };
+}
+
+/**
+ * Reads background tasks directly from SQLite conversation database as a reliable fallback.
+ * Path: ~/.gemini/antigravity/conversations/<cascadeId>.db
+ */
+export function readStructuredTasksFromSqlite(
+  cascadeId: string,
+  customDbDir?: string,
+): StructuredCascadeTasksResult | undefined {
+  const dir = customDbDir || join(homedir(), '.gemini', 'antigravity', 'conversations');
+  const dbPath = join(dir, `${cascadeId}.db`);
+
+  if (!existsSync(dbPath)) {
+    return undefined;
+  }
+
+  try {
+    const db = new DatabaseSync(dbPath, { readOnly: true });
+    try {
+      const rows = db
+        .prepare(
+          'SELECT idx, step_type, status, has_subtrajectory, task_details, metadata FROM steps WHERE task_details IS NOT NULL OR step_type = 127 OR has_subtrajectory = 1'
+        )
+        .all() as Array<{
+        idx: number;
+        step_type: number;
+        status: number;
+        has_subtrajectory: number;
+        task_details: Buffer | null;
+        metadata: Buffer | null;
+      }>;
+
+      let hasActiveChildren = false;
+      const tasksMap = new Map<string, ActiveBackgroundTask & { isActive: boolean }>();
+
+      for (const row of rows) {
+        const statusActive = isCortexStatusActive(row.status);
+        if ((row.step_type === 127 || row.has_subtrajectory === 1) && statusActive) {
+          hasActiveChildren = true;
+        }
+
+        if (row.task_details) {
+          const td = decodeProtobufTaskDetails(Buffer.from(row.task_details));
+          if (!td.id) continue;
+
+          const parts = td.id.split('/');
+          const prefix = parts.length === 2 ? parts[0] : undefined;
+          const rawId = parts.length === 2 ? parts[1] : parts[0];
+
+          if (prefix && prefix !== cascadeId) continue;
+          const taskId = rawId.toLowerCase();
+          if (!/^task-\d+$/.test(taskId)) continue;
+
+          tasksMap.set(taskId, {
+            taskId,
+            description: td.description,
+            startStepIndex: row.idx,
+            isActive: statusActive,
+          });
+        }
+      }
+
+      const allTasks: ActiveBackgroundTask[] = [];
+      const activeTasks: ActiveBackgroundTask[] = [];
+
+      for (const [, item] of tasksMap) {
+        const task: ActiveBackgroundTask = {
+          taskId: item.taskId,
+          description: item.description,
+          startStepIndex: item.startStepIndex,
+        };
+        allTasks.push(task);
+        if (item.isActive) {
+          activeTasks.push(task);
+        }
+      }
+
+      return { activeTasks, allTasks, hasActiveChildren };
+    } finally {
+      db.close();
+    }
+  } catch (err) {
+    console.warn(`[antigravity] Failed reading SQLite conversation ${cascadeId}:`, err);
+    return undefined;
+  }
+}

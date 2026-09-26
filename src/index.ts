@@ -26,11 +26,13 @@ import {
   loadTranscriptFile,
   PendingToolApproval,
   decideTailSettle,
-  isWaitingSpeech,
   pruneStaleBackgroundTasks,
+  parseStructuredTrajectoryTasks,
+  readStructuredTasksFromSqlite,
   type TranscriptSnapshot,
   type AutoContinueReason,
   type ActiveBackgroundTask,
+  type StructuredCascadeTasksResult,
 } from './hub/transcript.js';
 import {
   classifyError,
@@ -370,6 +372,14 @@ export class AntigravityService extends Service {
   private saveStateTimer?: NodeJS.Timeout;
   stateInitPromise?: Promise<void>;
   private globalTaskSilences = new Map<string, TaskSilenceEntry>();
+  private trajectoryTaskCache = new Map<
+    string,
+    {
+      lastFetchedAt: number;
+      lastMaxStepIndex: number;
+      result: StructuredCascadeTasksResult;
+    }
+  >();
   private disposed = false;
 
   constructor(ctx: Context, config: AntigravityConfig) {
@@ -676,14 +686,12 @@ export class AntigravityService extends Service {
       if (run.status === 'running' || run.status === 'awaiting-approval' || run.status === 'waiting-background') {
         try {
           const snap = await readCascadeTranscript(brainDir, cascadeId, run.baselineStepIndex ?? -1);
-          const hasActiveTasks = Boolean(snap?.activeBackgroundTasks && snap.activeBackgroundTasks.length > 0);
-          const lastPlannerText =
-            snap?.plannerContents && snap.plannerContents.length > 0
-              ? snap.plannerContents[snap.plannerContents.length - 1]
-              : undefined;
-          const isWaiting = isWaitingSpeech(lastPlannerText);
+          const hasActiveTasks = Boolean(
+            (snap?.activeBackgroundTasks && snap.activeBackgroundTasks.length > 0) ||
+            snap?.hasActiveChildren,
+          );
 
-          if (snap && ((snap.isFinished && !hasActiveTasks && !isWaiting) || snap.error)) {
+          if (snap && ((snap.isFinished && !hasActiveTasks) || snap.error)) {
             console.log(
               `[antigravity] Cascade ${cascadeId} settled during downtime (isFinished=${snap.isFinished}, error=${!!snap.error})`,
             );
@@ -1458,6 +1466,77 @@ export class AntigravityService extends Service {
   }
 
   /**
+   * Retrieves structured background tasks and subagent child status for a cascade.
+   * 1. Checks memory cache with throttling to prevent heavy GetCascadeTrajectory polling on every watcher tick.
+   * 2. Attempts HubClient.getCascadeTasks(cascadeId).
+   * 3. Falls back to SQLite database (~/.gemini/antigravity/conversations/<cascadeId>.db).
+   * 4. Falls back to empty list.
+   */
+  async getStructuredCascadeTasks(
+    cascadeId: string,
+    brainDir?: string,
+    currentMaxStep = -1,
+    forceRefresh = false,
+  ): Promise<StructuredCascadeTasksResult> {
+    const cached = this.trajectoryTaskCache.get(cascadeId);
+    const now = Date.now();
+    const THROTTLE_MS = 3000;
+    const timeElapsed = now - (cached?.lastFetchedAt ?? 0);
+    const stepChanged = currentMaxStep >= 0 && currentMaxStep !== (cached?.lastMaxStepIndex ?? -1);
+
+    if (!forceRefresh && cached && timeElapsed < THROTTLE_MS && !stepChanged) {
+      return cached.result;
+    }
+
+    // 1. Try HubClient.getCascadeTasks / getCascadeTrajectory
+    try {
+      const client = await this.getHubClient();
+      if (client && typeof (client as any).getCascadeTasks === 'function') {
+        const result = await (client as any).getCascadeTasks(cascadeId);
+        this.trajectoryTaskCache.set(cascadeId, {
+          lastFetchedAt: now,
+          lastMaxStepIndex: currentMaxStep,
+          result,
+        });
+        return result;
+      } else if (client && typeof (client as any).getCascadeTrajectory === 'function') {
+        const resp = await (client as any).getCascadeTrajectory(cascadeId);
+        const result = parseStructuredTrajectoryTasks(resp, cascadeId);
+        this.trajectoryTaskCache.set(cascadeId, {
+          lastFetchedAt: now,
+          lastMaxStepIndex: currentMaxStep,
+          result,
+        });
+        return result;
+      }
+    } catch {
+      // Hub unavailable or error, fall through to SQLite fallback
+    }
+
+    // 2. Try SQLite conversation fallback
+    try {
+      const sqliteResult = readStructuredTasksFromSqlite(cascadeId);
+      if (sqliteResult) {
+        this.trajectoryTaskCache.set(cascadeId, {
+          lastFetchedAt: now,
+          lastMaxStepIndex: currentMaxStep,
+          result: sqliteResult,
+        });
+        return sqliteResult;
+      }
+    } catch {
+      // SQLite unavailable
+    }
+
+    // 3. Fallback to existing cached result if present
+    if (cached) {
+      return cached.result;
+    }
+
+    return { activeTasks: [], allTasks: [], hasActiveChildren: false };
+  }
+
+  /**
    * Display-id model chosen for each bridge-started cascade; cascades the bridge
    * did not start fall back to the configured default model.
    */
@@ -1728,15 +1807,28 @@ export class AntigravityService extends Service {
     const snap = await readCascadeTranscript(brainDir, conversationId, baselineStepIndex);
     const existingRun = this.runs.get(conversationId);
     let status: HubRun['status'] = existingRun?.status ?? 'running';
-    const activeTasks = snap?.activeBackgroundTasks ?? [];
+    const structuredTasks = await this.getStructuredCascadeTasks(
+      conversationId,
+      brainDir,
+      snap?.maxStepIndex ?? -1,
+    );
+    if (structuredTasks.activeTasks.length > 0 || structuredTasks.allTasks.length > 0 || structuredTasks.hasActiveChildren) {
+      if (snap) {
+        snap.activeBackgroundTasks = structuredTasks.activeTasks;
+        snap.hasActiveChildren = structuredTasks.hasActiveChildren;
+      }
+    }
+
+    const activeTasks = snap?.activeBackgroundTasks ?? structuredTasks.activeTasks;
     const blockingTasks = activeTasks.filter((t) => {
       const silence = this.isTaskSilenced(conversationId, t.taskId);
-      return !silence || !silence.isInfinite;
+      return !silence || !silence.infinite;
     });
     const residualTasks = activeTasks.filter((t) => {
       const silence = this.isTaskSilenced(conversationId, t.taskId);
-      return !!silence && silence.isInfinite;
+      return !!silence && silence.infinite;
     });
+    const hasActiveChildren = Boolean(snap?.hasActiveChildren || structuredTasks.hasActiveChildren);
 
     if (snap?.error) {
       const isTransient = this.config.autoResume?.enabled !== false && isTransientRetryableError(snap.error);
@@ -1751,7 +1843,7 @@ export class AntigravityService extends Service {
       const client = await this.getHubClient();
       const isReal = await client.isCascadeAwaitingApproval(conversationId);
       status = isReal ? 'awaiting-approval' : 'running';
-    } else if (blockingTasks.length > 0) {
+    } else if (blockingTasks.length > 0 || hasActiveChildren) {
       status = 'waiting-background';
     } else if (snap?.isFinished && snap.plannerContents.length > 0) {
       // Strict done: a bare isFinished (e.g. setup CHECKPOINT with zero planner
@@ -1764,12 +1856,8 @@ export class AntigravityService extends Service {
       if (snap.tailKind === 'tool-call' || snap.tailKind === 'tool-result') {
         status = 'running';
       } else {
-        const lastPlannerText = snap.plannerContents[snap.plannerContents.length - 1];
-        if (isWaitingSpeech(lastPlannerText)) {
-          status = 'running';
-        } else {
-          status = 'done';
-        }
+        // Zero-regex settle: isWaitingSpeech is no longer evaluated here!
+        status = 'done';
       }
     } else if (!snap && existingRun?.status === 'done') {
       status = 'done'; // transcript unreadable: keep the last known terminal state
@@ -2081,17 +2169,34 @@ export class AntigravityService extends Service {
         // must not trigger stall error auto-resumes.
         const stallTimeoutMs = this.config.stallTimeoutMs ?? 120_000;
         const stalledMs = Date.now() - stallSince;
-        const activeTasks = snap?.activeBackgroundTasks ?? [];
+
+        // Structured task state query (GetCascadeTrajectory with throttling + caching + SQLite fallback)
+        const isSettleCandidate = snap && !snap.error && !snap.pendingApproval && snap.isFinished;
+        const structuredTasks = await this.getStructuredCascadeTasks(
+          cascadeId,
+          brainDir,
+          stepNow,
+          isSettleCandidate,
+        );
+
+        if (snap) {
+          if (structuredTasks.activeTasks.length > 0 || structuredTasks.allTasks.length > 0 || structuredTasks.hasActiveChildren) {
+            snap.activeBackgroundTasks = structuredTasks.activeTasks;
+            snap.hasActiveChildren = structuredTasks.hasActiveChildren;
+          }
+        }
+
+        const activeTasks = snap?.activeBackgroundTasks ?? structuredTasks.activeTasks;
         const blockingTasks = activeTasks.filter((t) => {
           const silence = this.isTaskSilenced(cascadeId, t.taskId);
-          return !silence || !silence.isInfinite;
+          return !silence.infinite;
         });
         const residualTasks = activeTasks.filter((t) => {
           const silence = this.isTaskSilenced(cascadeId, t.taskId);
-          return !!silence && silence.isInfinite;
+          return silence.infinite;
         });
-        const hasBlockingTasks = blockingTasks.length > 0;
-        const hasActiveTasks = activeTasks.length > 0;
+        const hasBlockingTasks = blockingTasks.length > 0 || Boolean(snap?.hasActiveChildren || structuredTasks.hasActiveChildren);
+        const hasActiveTasks = activeTasks.length > 0 || Boolean(snap?.hasActiveChildren || structuredTasks.hasActiveChildren);
         if (
           run.status === 'running' &&
           !snap?.pendingApproval &&
@@ -2248,6 +2353,7 @@ export class AntigravityService extends Service {
             settleStableMs: SETTLE_STABLE_MS,
             autoContinueQuietMs: AUTO_CONTINUE_QUIET_MS,
             blockingBackgroundTasks: blockingTasks,
+            hasActiveChildren: snap?.hasActiveChildren || structuredTasks.hasActiveChildren,
           });
 
           if (decision.action === 'wait-background') {
@@ -2566,21 +2672,30 @@ export class AntigravityService extends Service {
       // an early-settleable completion — the lifecycle watcher's tail guard
       // handles those with auto-continue instead.
       const probeTailSettleable = snap?.tailKind !== 'tool-call' && snap?.tailKind !== 'tool-result';
-      const activeTasks = snap?.activeBackgroundTasks ?? [];
+      const isCandidate = snap && !snap.error && !snap.pendingApproval && snap.isFinished;
+      let structuredTasks: StructuredCascadeTasksResult = { activeTasks: [], allTasks: [], hasActiveChildren: false };
+      if (isCandidate) {
+        structuredTasks = await this.getStructuredCascadeTasks(
+          conversationId,
+          brainDir,
+          snap.maxStepIndex,
+          true,
+        );
+        if (structuredTasks.activeTasks.length > 0 || structuredTasks.allTasks.length > 0 || structuredTasks.hasActiveChildren) {
+          snap.activeBackgroundTasks = structuredTasks.activeTasks;
+          snap.hasActiveChildren = structuredTasks.hasActiveChildren;
+        }
+      }
+      const activeTasks = snap?.activeBackgroundTasks ?? structuredTasks.activeTasks;
       const hasBlockingTasks = activeTasks.some((t) => {
         const silence = this.isTaskSilenced(conversationId, t.taskId);
-        return !silence || !silence.isInfinite;
-      });
-      const lastPlanner = snap?.plannerContents && snap.plannerContents.length > 0
-        ? snap.plannerContents[snap.plannerContents.length - 1]
-        : undefined;
-      const isWaiting = lastPlanner ? isWaitingSpeech(lastPlanner) : false;
+        return !silence.infinite;
+      }) || Boolean(snap?.hasActiveChildren || structuredTasks.hasActiveChildren);
       const terminalDone = !!(
         snap?.isFinished &&
         snap.plannerContents.length > 0 &&
         probeTailSettleable &&
-        !hasBlockingTasks &&
-        !isWaiting
+        !hasBlockingTasks
       );
       let pendingConfirmed = false;
       if (snap?.pendingApproval) {
@@ -2617,7 +2732,7 @@ export class AntigravityService extends Service {
         if (status === 'done') {
           const residualTasks = activeTasks.filter((t) => {
             const silence = this.isTaskSilenced(conversationId, t.taskId);
-            return !!silence && silence.isInfinite;
+            return silence.infinite;
           });
           run.residualBackgroundTasks = residualTasks.length > 0 ? residualTasks.map((t) => t.taskId) : undefined;
           run.settledStepIndex = snap.maxStepIndex;

@@ -192,6 +192,110 @@ declare const DEFAULT_MODEL_ID = "gemini-3.8-flash";
  */
 declare function normalizeModelName(input?: string): string;
 //#endregion
+//#region src/hub/trajectory.d.ts
+/**
+ * CortexStepStatus code mappings:
+ * PENDING=1, RUNNING=2, WAITING=9, GENERATING=8, QUEUED=11 (Active)
+ * DONE=3, CLEARED=5, CANCELED=6, ERROR=7, INTERRUPTED=12 (Terminal)
+ */
+declare const CORTEX_ACTIVE_STATUS_CODES: Set<number>;
+declare const CORTEX_TERMINAL_STATUS_CODES: Set<number>;
+declare const CORTEX_ACTIVE_STATUS_NAMES: Set<string>;
+declare const CORTEX_TERMINAL_STATUS_NAMES: Set<string>;
+interface StatusTransition {
+  updatedStatus?: string | number;
+  timestamp?: string;
+}
+interface TrajectoryStepDetail {
+  id?: string;
+  logUri?: string;
+  log_uri?: string;
+  description?: string;
+  summary?: string;
+  toolSummary?: string;
+  tool_summary?: string;
+}
+interface TrajectoryStepMetadata {
+  createdAt?: string;
+  created_at?: string;
+  internalMetadata?: {
+    statusTransitions?: StatusTransition[];
+  };
+  internal_metadata?: {
+    status_transitions?: StatusTransition[];
+  };
+  hasActiveChildren?: boolean;
+  has_active_children?: boolean;
+}
+interface TrajectoryStep {
+  stepIndex?: number;
+  step_index?: number;
+  type?: string | number;
+  status?: string | number;
+  taskDetails?: TrajectoryStepDetail;
+  task_details?: TrajectoryStepDetail;
+  metadata?: TrajectoryStepMetadata;
+  hasSubtrajectory?: boolean;
+  has_subtrajectory?: boolean;
+  [key: string]: unknown;
+}
+interface TrajectoryResponse {
+  trajectory?: {
+    cascadeId?: string;
+    steps?: TrajectoryStep[];
+    metadata?: Record<string, unknown>;
+    hasActiveChildren?: boolean;
+    has_active_children?: boolean;
+  };
+  status?: string | number;
+  hasActiveChildren?: boolean;
+  has_active_children?: boolean;
+}
+interface StructuredCascadeTasksResult {
+  activeTasks: ActiveBackgroundTask[];
+  allTasks: ActiveBackgroundTask[];
+  hasActiveChildren: boolean;
+}
+declare function isCortexStatusActive(status: unknown): boolean;
+declare function isCortexStatusTerminal(status: unknown): boolean;
+/**
+ * Resolves the effective status of a trajectory step, taking into account both
+ * the top-level status and the latest transition in metadata.internalMetadata.statusTransitions.
+ */
+declare function getStepEffectiveStatus(step: TrajectoryStep): {
+  isActive: boolean;
+  isTerminal: boolean;
+  status: string | number;
+};
+/**
+ * Parses full GetCascadeTrajectory response into structured tasks and active child session flag.
+ *
+ * 活跃任务判定（零正则）：
+ * taskDetails != null 且最新状态 ∈ 活跃集合 (PENDING=1, RUNNING=2, WAITING=9, GENERATING=8, QUEUED=11)
+ *
+ * 残余盲区①：
+ * subagent 子会话：父帧/轨迹中 has_active_children 布尔或 INVOKE_SUBAGENT 处于活跃状态时，hasActiveChildren 为 true。
+ */
+declare function parseStructuredTrajectoryTasks(trajectoryResp: unknown, targetCascadeId?: string): StructuredCascadeTasksResult;
+/**
+ * Decodes a protobuf serialized task_details blob from SQLite steps table.
+ * Wire format:
+ * Field 1: string id
+ * Field 2: string log_uri
+ * Field 4: string description
+ */
+declare function decodeProtobufTaskDetails(buf: Buffer): {
+  id?: string;
+  logUri?: string;
+  log_uri?: string;
+  description?: string;
+};
+/**
+ * Reads background tasks directly from SQLite conversation database as a reliable fallback.
+ * Path: ~/.gemini/antigravity/conversations/<cascadeId>.db
+ */
+declare function readStructuredTasksFromSqlite(cascadeId: string, customDbDir?: string): StructuredCascadeTasksResult | undefined;
+//#endregion
 //#region src/hub/transcript.d.ts
 interface TranscriptStep {
   step_index: number;
@@ -248,6 +352,8 @@ interface TranscriptSnapshot {
   tailKind: TranscriptTailKind;
   /** Active (uncompleted) background tasks discovered in the transcript. */
   activeBackgroundTasks?: ActiveBackgroundTask[];
+  /** 残余盲区①：whether subagent child sessions are currently active. */
+  hasActiveChildren?: boolean;
 }
 interface ParsedTranscript {
   maxStepIndex: number;
@@ -271,6 +377,8 @@ interface ParsedTranscript {
   error?: string;
   /** Active (uncompleted) background tasks discovered in the transcript. */
   activeBackgroundTasks: ActiveBackgroundTask[];
+  /** 残余盲区①：whether subagent child sessions are currently active. */
+  hasActiveChildren?: boolean;
 }
 /**
  * Pure observational tools that do not constitute substantive foreground work.
@@ -285,6 +393,12 @@ declare const OBSERVATIONAL_TOOL_NAMES: Set<string>;
 declare function isWaitingSpeech(text: string | undefined | null): boolean;
 declare function isTaskIdMatch(a: string, b: string): boolean;
 /**
+ * 残余盲区②：结构化不可得的唯一例外。
+ * IDE 层定时调度任务（如 schedule 工具创建的计时器），其触发完成通知仅以 SYSTEM_MESSAGE 注入，
+ * 不产生独立的 tool execution step 状态变更。因此保留且仅保留这一条窄正则识别该通知，提取完成的任务 ID。
+ */
+declare const IDE_TIMER_SYSTEM_MESSAGE_REGEX: RegExp;
+/**
  * Parses raw JSON lines from a cascade transcript into a structured snapshot.
  *
  * @param lines Raw lines read from transcript_full.jsonl or transcript.jsonl
@@ -297,9 +411,11 @@ declare function parseTranscript(lines: string[], baselineStepIndex?: number, ca
 type AutoContinueReason = 'tool-tail' | 'no-assistant-text';
 type SettleGuardAction = 'settle' | 'settle-exhausted' | 'continue' | 'wait' | 'wait-background';
 interface SettleGuardInput {
-  snap: Pick<TranscriptSnapshot, 'isFinished' | 'plannerContents' | 'tailKind' | 'engaged' | 'pendingApproval' | 'error' | 'activeBackgroundTasks'>;
+  snap: Pick<TranscriptSnapshot, 'isFinished' | 'plannerContents' | 'tailKind' | 'engaged' | 'pendingApproval' | 'error' | 'activeBackgroundTasks' | 'hasActiveChildren'>;
   /** Optional active background tasks that block settlement (non-infinite-silenced). If omitted, defaults to snap.activeBackgroundTasks. */
   blockingBackgroundTasks?: ActiveBackgroundTask[];
+  /** 残余盲区①：Optional flag indicating active subagent child sessions. If omitted, defaults to snap.hasActiveChildren. */
+  hasActiveChildren?: boolean;
   /** How long the transcript has produced no new steps (ms). */
   tailQuietMs: number;
   /** Auto-continue nudges already spent on the current turn. */
@@ -482,6 +598,12 @@ declare class HubClient {
   cancelCascade(cascadeId: string, killBackgroundTasks?: boolean): Promise<unknown>;
   /** Fetch the full cascade trajectory (steps carry requestedInteraction when awaiting approval). */
   getCascadeTrajectory(cascadeId: string): Promise<unknown>;
+  /**
+   * Fetches and parses structured background tasks directly from GetCascadeTrajectory.
+   * 活跃任务判定（零正则）：taskDetails != null 且最新状态 ∈ 活跃集合。
+   * 残余盲区①：subagent 子会话 has_active_children 阻塞。
+   */
+  getCascadeTasks(cascadeId: string): Promise<StructuredCascadeTasksResult>;
   /** Answer a pending cascade user interaction (the IDE approval dialog's RPC). */
   handleCascadeUserInteraction(cascadeId: string, interaction: Record<string, unknown>): Promise<unknown>;
   /**
@@ -765,6 +887,7 @@ declare class AntigravityService extends Service {
   private saveStateTimer?;
   stateInitPromise?: Promise<void>;
   private globalTaskSilences;
+  private trajectoryTaskCache;
   private disposed;
   constructor(ctx: Context, config: AntigravityConfig);
   getAgentsService(): any;
@@ -836,6 +959,14 @@ declare class AntigravityService extends Service {
   }>;
   runOneShot(prompt: PromptContent, options?: RunOneShotOptions): Promise<string>;
   private getHubClient;
+  /**
+   * Retrieves structured background tasks and subagent child status for a cascade.
+   * 1. Checks memory cache with throttling to prevent heavy GetCascadeTrajectory polling on every watcher tick.
+   * 2. Attempts HubClient.getCascadeTasks(cascadeId).
+   * 3. Falls back to SQLite database (~/.gemini/antigravity/conversations/<cascadeId>.db).
+   * 4. Falls back to empty list.
+   */
+  getStructuredCascadeTasks(cascadeId: string, brainDir?: string, currentMaxStep?: number, forceRefresh?: boolean): Promise<StructuredCascadeTasksResult>;
   /**
    * Display-id model chosen for each bridge-started cascade; cascades the bridge
    * did not start fall back to the configured default model.
@@ -936,5 +1067,5 @@ declare class AntigravityBridgePlugin {
   constructor(ctx: Context, config: AntigravityConfig);
 }
 //#endregion
-export { ANTIGRAVITY_MODELS, AUTO_CONTINUE_QUIET_MS, ActiveBackgroundTask, AgentInitConfig, AgentStep, AntigravityAgent, AntigravityConfig, AntigravityEngine, AntigravityModelInfo, AntigravityService, AutoContinueReason, AutoResumeConfig, BACKOFF_SCHEDULE_MS, CascadeDetailedResult, Config, ConversationSummary, ConversationTreeNode, DEFAULT_AUTO_CONTINUE_MAX, DEFAULT_AUTO_CONTINUE_MESSAGE, DEFAULT_MODEL_ID, DEFAULT_WATCH_MAX_MS, EngineConfig, ErrorClassification, HarnessSessionInfo, HubCallOptions, HubClient, HubInfo, HubRun, ListConversationsOptions, LoadedTranscript, MediaInput, OBSERVATIONAL_TOOL_NAMES, PendingToolApproval, PersistedBridgeState, PersistedQueuedMessage, PersistedRun, PollResult, PromptContent, PromptItem, ProtoMediaPart, PruneStaleTasksOptions, RunOneShotOptions, SETTLE_STABLE_MS, SessionContinuationMode, SettleGuardAction, SettleGuardDecision, SettleGuardInput, SettlementNoticePayload, SettlementOutboxItem, StartCascadeOptions, TaskSilenceEntry, TokenUsage, TranscriptSnapshot, TranscriptStep, TranscriptTailKind, TransientErrorSignature, buildConversationGraph, buildSettlementNotice, classifyError, clearHubCache, decideTailSettle, AntigravityBridgePlugin as default, discoverHub, extractErrorMessage, fileToMedia, formatAuthExpiredTerminalError, formatExhaustedRetryError, getAutoResumeBackoffMs, getConversationTree, getDefaultAppDataDir, getMaxRetriesForSignature, guessMimeType, isAuthTokenExpiredError, isNetworkError, isStaleHubError, isTaskIdMatch, isTransientRetryableError, isWaitingSpeech, listConversations, loadTranscriptFile, normalizeModelName, normalizePromptParts, parseTranscript, pollTranscript, pruneStaleBackgroundTasks, readCascadeTranscript, renderAsciiTree };
+export { ANTIGRAVITY_MODELS, AUTO_CONTINUE_QUIET_MS, ActiveBackgroundTask, AgentInitConfig, AgentStep, AntigravityAgent, AntigravityConfig, AntigravityEngine, AntigravityModelInfo, AntigravityService, AutoContinueReason, AutoResumeConfig, BACKOFF_SCHEDULE_MS, CORTEX_ACTIVE_STATUS_CODES, CORTEX_ACTIVE_STATUS_NAMES, CORTEX_TERMINAL_STATUS_CODES, CORTEX_TERMINAL_STATUS_NAMES, CascadeDetailedResult, Config, ConversationSummary, ConversationTreeNode, DEFAULT_AUTO_CONTINUE_MAX, DEFAULT_AUTO_CONTINUE_MESSAGE, DEFAULT_MODEL_ID, DEFAULT_WATCH_MAX_MS, EngineConfig, ErrorClassification, HarnessSessionInfo, HubCallOptions, HubClient, HubInfo, HubRun, IDE_TIMER_SYSTEM_MESSAGE_REGEX, ListConversationsOptions, LoadedTranscript, MediaInput, OBSERVATIONAL_TOOL_NAMES, PendingToolApproval, PersistedBridgeState, PersistedQueuedMessage, PersistedRun, PollResult, PromptContent, PromptItem, ProtoMediaPart, PruneStaleTasksOptions, RunOneShotOptions, SETTLE_STABLE_MS, SessionContinuationMode, SettleGuardAction, SettleGuardDecision, SettleGuardInput, SettlementNoticePayload, SettlementOutboxItem, StartCascadeOptions, StatusTransition, StructuredCascadeTasksResult, TaskSilenceEntry, TokenUsage, TrajectoryResponse, TrajectoryStep, TrajectoryStepDetail, TrajectoryStepMetadata, TranscriptSnapshot, TranscriptStep, TranscriptTailKind, TransientErrorSignature, buildConversationGraph, buildSettlementNotice, classifyError, clearHubCache, decideTailSettle, decodeProtobufTaskDetails, AntigravityBridgePlugin as default, discoverHub, extractErrorMessage, fileToMedia, formatAuthExpiredTerminalError, formatExhaustedRetryError, getAutoResumeBackoffMs, getConversationTree, getDefaultAppDataDir, getMaxRetriesForSignature, getStepEffectiveStatus, guessMimeType, isAuthTokenExpiredError, isCortexStatusActive, isCortexStatusTerminal, isNetworkError, isStaleHubError, isTaskIdMatch, isTransientRetryableError, isWaitingSpeech, listConversations, loadTranscriptFile, normalizeModelName, normalizePromptParts, parseStructuredTrajectoryTasks, parseTranscript, pollTranscript, pruneStaleBackgroundTasks, readCascadeTranscript, readStructuredTasksFromSqlite, renderAsciiTree };
 //# sourceMappingURL=index.d.mts.map

@@ -4,6 +4,8 @@ import { discoverHub, clearHubCache } from './discovery.js';
 import type { HubInfo } from './discovery.js';
 import { ProjectResolver } from './projects.js';
 import type { ResolvedProject } from './projects.js';
+import { parseStructuredTrajectoryTasks } from './trajectory.js';
+import type { StructuredCascadeTasksResult } from './trajectory.js';
 
 export interface StartCascadeOptions {
   cascadeId: string;
@@ -251,6 +253,16 @@ export class HubClient {
   /** Fetch the full cascade trajectory (steps carry requestedInteraction when awaiting approval). */
   async getCascadeTrajectory(cascadeId: string): Promise<unknown> {
     return this.call('GetCascadeTrajectory', { cascadeId }, { emptyResponse: 'reject' });
+  }
+
+  /**
+   * Fetches and parses structured background tasks directly from GetCascadeTrajectory.
+   * 活跃任务判定（零正则）：taskDetails != null 且最新状态 ∈ 活跃集合。
+   * 残余盲区①：subagent 子会话 has_active_children 阻塞。
+   */
+  async getCascadeTasks(cascadeId: string): Promise<StructuredCascadeTasksResult> {
+    const resp = await this.getCascadeTrajectory(cascadeId);
+    return parseStructuredTrajectoryTasks(resp, cascadeId);
   }
 
   /** Answer a pending cascade user interaction (the IDE approval dialog's RPC). */

@@ -470,6 +470,7 @@ describe('Background Task Tracking in parseTranscript', () => {
         type: 'TOOL_RESULT',
         status: 'RUNNING',
         source: 'EXECUTOR',
+        taskDetails: { id: 'task-602', description: 'dotnet run tools/SelfPlay' },
         content:
           'Command launched in background.\nTool is running as a background task with task id: task-602\nTask Description: dotnet run tools/SelfPlay',
       }),
@@ -602,6 +603,7 @@ describe('Background Task Tracking in parseTranscript', () => {
           step_index: 10,
           type: 'GENERIC',
           status: 'RUNNING',
+          taskDetails: { id: '32294fd3-4c5e-40df-bbc3-f518adbe83b1/task-255', description: 'dotnet build' },
           content:
             'Tool is running as a background task with task id: 32294fd3-4c5e-40df-bbc3-f518adbe83b1/task-255\nTask Description: dotnet build',
         }),
@@ -650,6 +652,7 @@ describe('Background Task Tracking in parseTranscript', () => {
         step_index: 11,
         type: 'GENERIC',
         status: 'RUNNING',
+        taskDetails: { id: '32294fd3-4c5e-40df-bbc3-f518adbe83b1/task-605', description: 'schedule timer' },
         content:
           'Tool is running as a background task with task id: 32294fd3-4c5e-40df-bbc3-f518adbe83b1/task-605\nTask Description: schedule timer',
       }),
@@ -678,6 +681,7 @@ describe('Background Task Tracking in parseTranscript', () => {
         step_index: 1,
         type: 'GENERIC',
         status: 'RUNNING',
+        taskDetails: { id: 'foreign-cascade-uuid/task-999', description: 'foreign task' },
         content:
           'Tool is running as a background task with task id: foreign-cascade-uuid/task-999\nTask Description: foreign task',
       }),
@@ -685,6 +689,7 @@ describe('Background Task Tracking in parseTranscript', () => {
         step_index: 2,
         type: 'GENERIC',
         status: 'RUNNING',
+        taskDetails: { id: 'target-cascade-uuid/task-123', description: 'target task' },
         content:
           'Tool is running as a background task with task id: target-cascade-uuid/task-123\nTask Description: target task',
       }),
@@ -1236,7 +1241,7 @@ describe('AntigravityService Background Task Watcher Lifecycle', () => {
       expect(isWaitingSpeech('')).toBe(false);
     });
 
-    it('decideTailSettle returns wait when planner output contains waiting speech', () => {
+    it('decideTailSettle does NOT wait on waiting speech alone (zero-regex settle)', () => {
       const snapWait = snap({
         maxStepIndex: 10,
         isFinished: true,
@@ -1252,7 +1257,29 @@ describe('AntigravityService Background Task Watcher Lifecycle', () => {
         settleStableMs: 3_000,
         autoContinueQuietMs: 5_000,
       });
-      expect(decision.action).toBe('wait');
+      // Zero-regex settle: speech text does NOT gate settlement
+      expect(decision.action).toBe('settle');
+    });
+
+    it('decideTailSettle returns wait-background when hasActiveChildren is true (blindspot 1)', () => {
+      const snapChild = snap({
+        maxStepIndex: 10,
+        isFinished: true,
+        tailKind: 'assistant-text',
+        plannerContents: ['Delegated subagent task.'],
+        activeBackgroundTasks: [],
+        hasActiveChildren: true,
+      });
+      const decision = decideTailSettle({
+        snap: snapChild,
+        tailQuietMs: 10_000,
+        autoContinueCount: 0,
+        maxAutoContinue: 5,
+        settleStableMs: 3_000,
+        autoContinueQuietMs: 5_000,
+      });
+      expect(decision.action).toBe('wait-background');
+      expect(decision.reason).toBe('background-task');
     });
 
     it('decideTailSettle settles when planner output is genuine completion', () => {
@@ -1678,13 +1705,14 @@ describe('AntigravityService Background Task Watcher Lifecycle', () => {
       expect(completedSnapshot.activeBackgroundTasks).toHaveLength(0);
     });
 
-    it('parseTranscript: supports multi-language Chinese launch and completion patterns', () => {
+    it('parseTranscript: supports structured task launch and IDE timer completion patterns', () => {
       const rawLines = [
         JSON.stringify({
           step_index: 1,
           type: 'TOOL_EXECUTION',
           source: 'SYSTEM',
           status: 'RUNNING',
+          task_details: { id: 'cid-cn-test/task-101', description: '执行命令' },
           content: '执行命令中，已转入后台运行 (task-101)',
         }),
       ];
@@ -1693,15 +1721,15 @@ describe('AntigravityService Background Task Watcher Lifecycle', () => {
       expect(snap1.activeBackgroundTasks).toHaveLength(1);
       expect(snap1.activeBackgroundTasks![0].taskId).toBe('task-101');
 
-      // Chinese completion pattern
+      // IDE timer completion pattern via SYSTEM_MESSAGE (Blindspot 2)
       const rawWithDone = [
         ...rawLines,
         JSON.stringify({
           step_index: 2,
-          type: 'GENERIC',
+          type: 'SYSTEM_MESSAGE',
           source: 'SYSTEM',
           status: 'DONE',
-          content: '后台任务已完成 (task-101)，所有结果收集完毕。',
+          content: '任务 "task-101" 已完成，所有结果收集完毕。',
         }),
       ];
 
