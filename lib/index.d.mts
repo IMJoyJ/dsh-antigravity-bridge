@@ -228,6 +228,14 @@ interface PollResult {
  * waiting on it).
  */
 type TranscriptTailKind = 'none' | 'assistant-text' | 'tool-call' | 'tool-result' | 'checkpoint' | 'other';
+interface ActiveBackgroundTask {
+  taskId: string;
+  description?: string;
+  startedAt?: string;
+  startStepIndex: number;
+  durationSeconds?: number;
+  isSchedule?: boolean;
+}
 interface TranscriptSnapshot {
   maxStepIndex: number;
   engaged: boolean;
@@ -238,6 +246,8 @@ interface TranscriptSnapshot {
   error?: string;
   /** Kind of the last valid entry in the turn window (settlement tail guard). */
   tailKind: TranscriptTailKind;
+  /** Active (uncompleted) background tasks discovered in the transcript. */
+  activeBackgroundTasks?: ActiveBackgroundTask[];
 }
 interface ParsedTranscript {
   maxStepIndex: number;
@@ -259,12 +269,37 @@ interface ParsedTranscript {
   tailKind: TranscriptTailKind;
   /** short_error from the first ERROR_MESSAGE step, if any. */
   error?: string;
+  /** Active (uncompleted) background tasks discovered in the transcript. */
+  activeBackgroundTasks: ActiveBackgroundTask[];
 }
-declare function parseTranscript(lines: string[], baselineStepIndex?: number): ParsedTranscript;
+/**
+ * Pure observational tools that do not constitute substantive foreground work.
+ * Invoking these tools does not imply that previous background tasks have finished.
+ */
+declare const OBSERVATIONAL_TOOL_NAMES: Set<string>;
+/**
+ * R2 等待话术门:
+ * Inspects whether the planner's final text output conveys waiting on a background task,
+ * timer, or background execution without genuine completion semantics.
+ */
+declare function isWaitingSpeech(text: string | undefined | null): boolean;
+declare function isTaskIdMatch(a: string, b: string): boolean;
+/**
+ * Parses raw JSON lines from a cascade transcript into a structured snapshot.
+ *
+ * @param lines Raw lines read from transcript_full.jsonl or transcript.jsonl
+ * @param baselineStepIndex If >= 0, only steps with step_index > baselineStepIndex
+ *        are inspected for user input and completion signals.
+ * @param cascadeId Target cascade ID for task isolation. Tasks belonging to a
+ *        different cascade prefix are discarded.
+ */
+declare function parseTranscript(lines: string[], baselineStepIndex?: number, cascadeId?: string): ParsedTranscript;
 type AutoContinueReason = 'tool-tail' | 'no-assistant-text';
-type SettleGuardAction = 'settle' | 'settle-exhausted' | 'continue' | 'wait';
+type SettleGuardAction = 'settle' | 'settle-exhausted' | 'continue' | 'wait' | 'wait-background';
 interface SettleGuardInput {
-  snap: Pick<TranscriptSnapshot, 'isFinished' | 'plannerContents' | 'tailKind' | 'engaged' | 'pendingApproval' | 'error'>;
+  snap: Pick<TranscriptSnapshot, 'isFinished' | 'plannerContents' | 'tailKind' | 'engaged' | 'pendingApproval' | 'error' | 'activeBackgroundTasks'>;
+  /** Optional active background tasks that block settlement (non-infinite-silenced). If omitted, defaults to snap.activeBackgroundTasks. */
+  blockingBackgroundTasks?: ActiveBackgroundTask[];
   /** How long the transcript has produced no new steps (ms). */
   tailQuietMs: number;
   /** Auto-continue nudges already spent on the current turn. */
@@ -278,7 +313,8 @@ interface SettleGuardInput {
 }
 interface SettleGuardDecision {
   action: SettleGuardAction;
-  reason?: AutoContinueReason;
+  reason?: AutoContinueReason | 'background-task';
+  activeTasks?: ActiveBackgroundTask[];
 }
 /**
  * Decides whether a "finished-looking" cascade snapshot may settle as done, or
@@ -286,6 +322,9 @@ interface SettleGuardDecision {
  * bridge should nudge it with a "Continue" message instead.
  *
  * Guard conditions (checked at every done-settlement exit):
+ * - (0) `background-task`: active background tasks are still running in the
+ *   session. Any background task completion sends a message to AGY session from
+ *   the hub, waking it up. The turn is NOT complete; do not settle or continue.
  * - (a) `tool-tail`: the LAST valid entry is a tool call or tool result with no
  *   assistant text after it. `isFinished` is then stale state left behind by an
  *   earlier final text or CHECKPOINT (executor DONE steps never reset it) — the
@@ -304,6 +343,22 @@ interface LoadedTranscript {
   text: string;
   mtimeMs: number;
 }
+interface PruneStaleTasksOptions {
+  nowMs?: number;
+  lastActiveAtMs?: number;
+}
+/**
+ * Prunes stale orphan background tasks that have exceeded their expected lifetime
+ * AND whose transcript has ceased growing for at least 15 minutes.
+ *
+ * Counter-example protection:
+ * If the transcript is actively growing (nowMs - lastActiveAtMs < 15 minutes),
+ * long-running processes (e.g. `node ygopro-server.js`) MUST NEVER be pruned.
+ */
+declare function pruneStaleBackgroundTasks(tasks: ActiveBackgroundTask[] | undefined, options?: PruneStaleTasksOptions): {
+  activeTasks: ActiveBackgroundTask[];
+  prunedTasks: ActiveBackgroundTask[];
+};
 /**
  * Loads the cascade transcript from disk, preferring the full fidelity transcript
  * (`transcript_full.jsonl`) over the compact/truncated view (`transcript.jsonl`).
@@ -332,7 +387,9 @@ declare function clearHubCache(): void;
 //#endregion
 //#region src/hub/projects.d.ts
 interface ResolvedProject {
-  projectId: string;
+  /** Registered project UUID. Undefined when a freshly created project failed
+   *  the hub persistence check — callers must then bind via {@link workspaceUri}. */
+  projectId?: string;
   workspaceUri: string;
   projectName: string;
   created: boolean;
@@ -392,8 +449,19 @@ declare class HubClient {
   /** Maps a display id (e.g. "gemini-3.8-flash-high") to the hub's
    *  MODEL_* enum name. Response shape: { response: { models: { id: {...} } } }. */
   resolveModel(displayId: string): Promise<string | undefined>;
+  private readonly modelEnumCache;
+  /** resolveModel with a per-client cache: one GetAvailableModels RPC per display id. */
+  resolveModelCached(displayId: string): Promise<string | undefined>;
   startCascade(opts: StartCascadeOptions): Promise<unknown>;
-  sendMessage(cascadeId: string, text: string): Promise<unknown>;
+  /**
+   * planModel is REQUIRED whenever the hub may construct a fresh executor for
+   * the cascade (idle/hibernated resume): a send without cascadeConfig resets
+   * the cascade's model selection to None, and the turn then dies with
+   * "neither PlanModel nor RequestedModel specified".
+   */
+  sendMessage(cascadeId: string, text: string, opts?: {
+    planModel?: string;
+  }): Promise<unknown>;
   /** Server-side wait until the conversation is fully idle. Returns
    *  { timedOut?: boolean } — an empty object means the idle state was reached. */
   waitForIdle(conversationId: string, inactivityTimeoutSeconds: number, stabilizationDurationSeconds: number): Promise<{
@@ -509,6 +577,8 @@ declare const DEFAULT_AUTO_CONTINUE_MESSAGE = "Continue";
 declare const AUTO_CONTINUE_QUIET_MS = 10000;
 /** Stillness (ms) required before a final-looking assistant reply may settle. */
 declare const SETTLE_STABLE_MS = 3000;
+/** Default absolute cap on background lifecycle watcher in ms (12h). */
+declare const DEFAULT_WATCH_MAX_MS = 43200000;
 interface AntigravityConfig {
   backend?: 'hub' | 'localharness';
   binaryPath?: string;
@@ -551,10 +621,11 @@ interface RunOneShotOptions extends AgentInitConfig {
 /** Live state of one background hub delegation, keyed by cascade id. */
 interface HubRun {
   cascadeId: string;
-  status: 'running' | 'done' | 'error' | 'awaiting-approval' | 'timeout';
+  status: 'running' | 'done' | 'error' | 'awaiting-approval' | 'timeout' | 'waiting-background';
   startedAt: number;
   baselineStepIndex?: number;
   callerAgent?: any;
+  callerAgentId?: string;
   lastActiveAt?: string;
   content?: string;
   error?: string;
@@ -562,6 +633,8 @@ interface HubRun {
   approvalNotified?: boolean;
   resumedNotified?: boolean;
   lastNotifiedTransition?: string;
+  /** Turn index when the resumption notice was last delivered to DSH. */
+  lastResumedNotifiedTurn?: number;
   /** 1-based user-turn counter; bumped on every new delegation or injected message into this cascade. */
   turnSeq?: number;
   /** Final planner text of completed prior turns; keeps history reachable after baseline resets. */
@@ -578,9 +651,87 @@ interface HubRun {
   autoContinueExhausted?: boolean;
   /** Reason the last tail-guard nudge was sent ('tool-tail' | 'no-assistant-text'). */
   lastAutoContinueReason?: AutoContinueReason;
+  /** Timestamp when the 5-minute waiting-background warning notice was last sent. */
+  lastBackgroundWarningAt?: number;
+  /** Timestamp when the current waiting-background episode began. */
+  waitingBackgroundStartedAt?: number;
+  /** R1: The maxStepIndex at which the cascade was settled as done; used by resident watcher to detect growth. */
+  settledStepIndex?: number;
+  /** R1: Content hash of planner output when cascade was settled as done. */
+  settledContentHash?: string;
+  /** Silenced tasks by normalized task id (e.g. 'task-114' or 'cascadeId/task-114'). */
+  silencedTasks?: Record<string, TaskSilenceEntry>;
+  /** Residual background task IDs that were alive (infinitely silenced) when cascade settled. */
+  residualBackgroundTasks?: string[];
+}
+interface TaskSilenceEntry {
+  taskId: string;
+  infinite: boolean;
+  until?: number;
+  silencedAt: number;
+}
+interface SettlementOutboxItem {
+  id: string;
+  cascadeId: string;
+  turnSeq: number;
+  transitionKey: string;
+  summary: string;
+  noticeText: string;
+  callerAgentId?: string;
+  enqueuedAt: number;
+  lastAttemptAt?: number;
+  attempts: number;
+}
+interface PersistedRun {
+  cascadeId: string;
+  status: 'running' | 'done' | 'error' | 'awaiting-approval' | 'timeout' | 'waiting-background';
+  startedAt: number;
+  baselineStepIndex?: number;
+  callerAgentId?: string;
+  lastActiveAt?: string;
+  content?: string;
+  error?: string;
+  pendingTool?: PendingToolApproval;
+  approvalNotified?: boolean;
+  resumedNotified?: boolean;
+  lastNotifiedTransition?: string;
+  lastResumedNotifiedTurn?: number;
+  turnSeq?: number;
+  priorContents?: string[];
+  reportPath?: string;
+  reportChars?: number;
+  autoResumeRetries?: number;
+  autoContinueCount?: number;
+  autoContinueExhausted?: boolean;
+  lastAutoContinueReason?: AutoContinueReason;
+  lastBackgroundWarningAt?: number;
+  /** Timestamp when the current waiting-background episode began. */
+  waitingBackgroundStartedAt?: number;
+  /** R1: The maxStepIndex at which the cascade was settled as done. */
+  settledStepIndex?: number;
+  /** R1: Content hash of planner output when cascade was settled as done. */
+  settledContentHash?: string;
+  /** Silenced tasks by normalized task id. */
+  silencedTasks?: Record<string, TaskSilenceEntry>;
+  /** Residual background task IDs that were alive (infinitely silenced) when cascade settled. */
+  residualBackgroundTasks?: string[];
+}
+interface PersistedQueuedMessage {
+  content: string;
+  wait?: boolean | number;
+  mode?: 'step-end' | 'turn-end' | 'interrupt';
+  callerAgentId?: string;
+  enqueuedAt: number;
+}
+interface PersistedBridgeState {
+  version: 1;
+  savedAt: string;
+  runs: Record<string, PersistedRun>;
+  messageQueues: Record<string, PersistedQueuedMessage[]>;
+  settlementOutbox: SettlementOutboxItem[];
 }
 interface CascadeDetailedResult {
-  status: 'done' | 'awaiting-approval' | 'running' | 'timeout' | 'error';
+  status: 'done' | 'awaiting-approval' | 'running' | 'timeout' | 'error' | 'waiting-background';
   content: string;
   lastActiveAt?: string;
   pendingTool?: PendingToolApproval;
@@ -589,6 +740,10 @@ interface CascadeDetailedResult {
   autoContinueCount?: number;
   /** True when the tail guard burned the whole nudge budget and the run settled anyway. */
   autoContinueExhausted?: boolean;
+  /** Active (uncompleted) background tasks discovered in the transcript. */
+  activeBackgroundTasks?: ActiveBackgroundTask[];
+  /** Residual background tasks running (infinitely silenced) when settled. */
+  residualBackgroundTasks?: string[];
 }
 interface SettlementNoticePayload {
   summary: string;
@@ -605,14 +760,68 @@ declare class AntigravityService extends Service {
   private messageQueues;
   /** Callers parked inside waitForSettlement, keyed by cascade id; resolved by the watcher's transitions. */
   private settlementWaiters;
+  private settlementOutbox;
+  private outboxTimer?;
+  private saveStateTimer?;
+  stateInitPromise?: Promise<void>;
+  private globalTaskSilences;
   private disposed;
   constructor(ctx: Context, config: AntigravityConfig);
+  getAgentsService(): any;
+  findLiveAgent(agentId?: string): any;
+  rebindAgents(): Promise<void>;
+  private getStateFilePath;
+  private shouldPersist;
+  saveStateDebounced(): void;
+  saveStateNow(): Promise<void>;
+  private initState;
+  private startOutboxTimer;
+  private retrySettlementOutbox;
+  private enqueueSettlementOutbox;
+  private removeFromSettlementOutbox;
+  private deliverMessageToAgent;
+  /** Normalize a task id for dictionary matching. */
+  normalizeTaskId(taskId: string): string;
+  /**
+   * Silence waiting-background warning notifications for a specific task ID.
+   * If durationSeconds is omitted or <= 0, silences indefinitely.
+   * Infinitely silenced tasks do not block cascade settlement when idle.
+   */
+  silenceTask(cascadeId: string, rawTaskId: string, durationSeconds?: number): {
+    success: boolean;
+    cascadeId?: string;
+    taskId: string;
+    infinite: boolean;
+    silencedUntil?: string;
+    durationSeconds?: number;
+    note: string;
+  };
+  /**
+   * Checks whether a task is currently silenced.
+   * Returns { silenced: boolean, infinite: boolean }.
+   */
+  isTaskSilenced(runOrCascadeId: HubRun | string | undefined, taskId: string, now?: number): {
+    silenced: boolean;
+    infinite: boolean;
+  };
   /** Hot-swap live config (settings namespace onChange). All fields are read at use-time. */
   updateConfig(config: AntigravityConfig): void;
   /** Proactively push a settlement/approval notice to DSH session (steering / followup) with idempotency. */
   notifySettlementToDsh(run: HubRun, callerAgent?: any): void;
   /** Push a resumption notice when user approvals in IDE are granted. */
   notifyResumedToDsh(run: HubRun, callerAgent?: any): void;
+  /** Push a settlement revocation notice when R1 detects that a settled cascade resumed activity. */
+  notifyRevertedFromDoneToDsh(run: HubRun, details: {
+    oldSettledStep?: number;
+    currentStep?: number;
+    oldActiveAt?: string;
+    currentActiveAt?: string;
+  }, callerAgent?: any): void;
+  /**
+   * Proactively push a waiting-background warning notice to DSH session.
+   * Rate-limited to once every 5 minutes (300,000ms) for the same running background task state.
+   */
+  notifyWaitingBackgroundToDsh(run: HubRun, activeTasks: ActiveBackgroundTask[], callerAgent?: any): void;
   createAgent(initConfig?: AgentInitConfig): AntigravityAgent;
   listModels(): AntigravityModelInfo[];
   /** Coalesce undefined leaves to null so tool output stays lossless JSON. */
@@ -627,6 +836,19 @@ declare class AntigravityService extends Service {
   }>;
   runOneShot(prompt: PromptContent, options?: RunOneShotOptions): Promise<string>;
   private getHubClient;
+  /**
+   * Display-id model chosen for each bridge-started cascade; cascades the bridge
+   * did not start fall back to the configured default model.
+   */
+  private readonly cascadeModelDisplays;
+  /**
+   * Resolve the MODEL_* enum to attach to SendUserCascadeMessage. Required
+   * whenever the hub may construct a fresh executor (idle resume): a send
+   * without cascadeConfig resets the cascade's model to None and the turn dies
+   * with "neither PlanModel nor RequestedModel specified". Never throws — on
+   * resolution failure the caller sends without a model (legacy behavior).
+   */
+  private planModelFor;
   /** Hub GetAvailableModels, slimmed to the fields a model caller needs. */
   hubListModels(): Promise<unknown>;
   /** Ensure an active background watcher exists and monitors this cascade's lifecycle until final settlement.
@@ -714,5 +936,5 @@ declare class AntigravityBridgePlugin {
   constructor(ctx: Context, config: AntigravityConfig);
 }
 //#endregion
-export { ANTIGRAVITY_MODELS, AUTO_CONTINUE_QUIET_MS, AgentInitConfig, AgentStep, AntigravityAgent, AntigravityConfig, AntigravityEngine, AntigravityModelInfo, AntigravityService, AutoContinueReason, AutoResumeConfig, BACKOFF_SCHEDULE_MS, CascadeDetailedResult, Config, ConversationSummary, ConversationTreeNode, DEFAULT_AUTO_CONTINUE_MAX, DEFAULT_AUTO_CONTINUE_MESSAGE, DEFAULT_MODEL_ID, EngineConfig, ErrorClassification, HarnessSessionInfo, HubCallOptions, HubClient, HubInfo, HubRun, ListConversationsOptions, LoadedTranscript, MediaInput, PendingToolApproval, PollResult, PromptContent, PromptItem, ProtoMediaPart, RunOneShotOptions, SETTLE_STABLE_MS, SessionContinuationMode, SettleGuardAction, SettleGuardDecision, SettleGuardInput, SettlementNoticePayload, StartCascadeOptions, TokenUsage, TranscriptSnapshot, TranscriptStep, TranscriptTailKind, TransientErrorSignature, buildConversationGraph, buildSettlementNotice, classifyError, clearHubCache, decideTailSettle, AntigravityBridgePlugin as default, discoverHub, extractErrorMessage, fileToMedia, formatAuthExpiredTerminalError, formatExhaustedRetryError, getAutoResumeBackoffMs, getConversationTree, getDefaultAppDataDir, getMaxRetriesForSignature, guessMimeType, isAuthTokenExpiredError, isNetworkError, isStaleHubError, isTransientRetryableError, listConversations, loadTranscriptFile, normalizeModelName, normalizePromptParts, parseTranscript, pollTranscript, readCascadeTranscript, renderAsciiTree };
+export { ANTIGRAVITY_MODELS, AUTO_CONTINUE_QUIET_MS, ActiveBackgroundTask, AgentInitConfig, AgentStep, AntigravityAgent, AntigravityConfig, AntigravityEngine, AntigravityModelInfo, AntigravityService, AutoContinueReason, AutoResumeConfig, BACKOFF_SCHEDULE_MS, CascadeDetailedResult, Config, ConversationSummary, ConversationTreeNode, DEFAULT_AUTO_CONTINUE_MAX, DEFAULT_AUTO_CONTINUE_MESSAGE, DEFAULT_MODEL_ID, DEFAULT_WATCH_MAX_MS, EngineConfig, ErrorClassification, HarnessSessionInfo, HubCallOptions, HubClient, HubInfo, HubRun, ListConversationsOptions, LoadedTranscript, MediaInput, OBSERVATIONAL_TOOL_NAMES, PendingToolApproval, PersistedBridgeState, PersistedQueuedMessage, PersistedRun, PollResult, PromptContent, PromptItem, ProtoMediaPart, PruneStaleTasksOptions, RunOneShotOptions, SETTLE_STABLE_MS, SessionContinuationMode, SettleGuardAction, SettleGuardDecision, SettleGuardInput, SettlementNoticePayload, SettlementOutboxItem, StartCascadeOptions, TaskSilenceEntry, TokenUsage, TranscriptSnapshot, TranscriptStep, TranscriptTailKind, TransientErrorSignature, buildConversationGraph, buildSettlementNotice, classifyError, clearHubCache, decideTailSettle, AntigravityBridgePlugin as default, discoverHub, extractErrorMessage, fileToMedia, formatAuthExpiredTerminalError, formatExhaustedRetryError, getAutoResumeBackoffMs, getConversationTree, getDefaultAppDataDir, getMaxRetriesForSignature, guessMimeType, isAuthTokenExpiredError, isNetworkError, isStaleHubError, isTaskIdMatch, isTransientRetryableError, isWaitingSpeech, listConversations, loadTranscriptFile, normalizeModelName, normalizePromptParts, parseTranscript, pollTranscript, pruneStaleBackgroundTasks, readCascadeTranscript, renderAsciiTree };
 //# sourceMappingURL=index.d.mts.map

@@ -94,6 +94,16 @@ export class HubClient {
     return resp.response?.models?.[displayId]?.model;
   }
 
+  private readonly modelEnumCache = new Map<string, string | undefined>();
+
+  /** resolveModel with a per-client cache: one GetAvailableModels RPC per display id. */
+  async resolveModelCached(displayId: string): Promise<string | undefined> {
+    if (!this.modelEnumCache.has(displayId)) {
+      this.modelEnumCache.set(displayId, await this.resolveModel(displayId));
+    }
+    return this.modelEnumCache.get(displayId);
+  }
+
   async startCascade(opts: StartCascadeOptions): Promise<unknown> {
     const body: Record<string, unknown> = {
       cascadeId: opts.cascadeId,
@@ -113,6 +123,14 @@ export class HubClient {
         },
       },
     };
+    // agy ≥ 2.15.1 sidebar rendering relies on indexes.projectAssociated, which filters:
+    // a => koa(a) && !!a.trajectoryMetadata?.projectId
+    // Passing projectEnvConfig tells the hub to bind the registered project and record
+    // its projectId in trajectoryMetadata & conversation_summaries.db.
+    // NOTE: The hub REJECTS sending BOTH workspaceUris and projectEnvConfig (returns empty {}).
+    // Therefore, if projectId is provided, send projectEnvConfig first.
+    // If projectId is rejected (unpersisted/stale) and workspaceUri is available,
+    // fallback gracefully to direct workspaceUris binding.
     if (opts.projectId) {
       body.projectEnvConfig = {
         projectId: opts.projectId,
@@ -121,9 +139,21 @@ export class HubClient {
     } else if (opts.workspaceUri) {
       body.workspaceUris = [opts.workspaceUri];
     }
-    const resp = await this.call('StartCascade', body);
+
+    let resp = await this.call('StartCascade', body);
+
+    if ((!resp || typeof resp !== 'object' || !('cascadeId' in resp)) && opts.projectId && opts.workspaceUri) {
+      // Fallback: If projectEnvConfig was rejected (e.g. stale or unpersisted project ID),
+      // invalidate project cache and retry with direct workspaceUri binding.
+      this.projectResolver.invalidate();
+      const fallbackBody = { ...body };
+      delete fallbackBody.projectEnvConfig;
+      fallbackBody.workspaceUris = [opts.workspaceUri];
+      resp = await this.call('StartCascade', fallbackBody);
+    }
+
     // The hub silently no-ops (grpc status 0, empty message) when the given
-    // projectId is not registered. A real start echoes the cascadeId.
+    // projectId is not registered or payload was rejected. A real start echoes the cascadeId.
     if (!resp || typeof resp !== 'object' || !('cascadeId' in resp)) {
       throw new Error(
         'StartCascade was silently rejected by the hub (empty response): the projectId is not registered. '
@@ -134,10 +164,19 @@ export class HubClient {
     return resp;
   }
 
-  async sendMessage(cascadeId: string, text: string): Promise<unknown> {
+  /**
+   * planModel is REQUIRED whenever the hub may construct a fresh executor for
+   * the cascade (idle/hibernated resume): a send without cascadeConfig resets
+   * the cascade's model selection to None, and the turn then dies with
+   * "neither PlanModel nor RequestedModel specified".
+   */
+  async sendMessage(cascadeId: string, text: string, opts?: { planModel?: string }): Promise<unknown> {
     return this.call('SendUserCascadeMessage', {
       cascadeId,
       items: [{ text }],
+      ...(opts?.planModel === undefined ? {} : {
+        cascadeConfig: { plannerConfig: { planModel: opts.planModel } },
+      }),
     });
   }
 

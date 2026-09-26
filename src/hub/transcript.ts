@@ -46,6 +46,15 @@ export type TranscriptTailKind =
   | 'checkpoint'     // CHECKPOINT
   | 'other';         // USER_INPUT / SYSTEM_MESSAGE / ERROR_MESSAGE / unknown
 
+export interface ActiveBackgroundTask {
+  taskId: string;
+  description?: string;
+  startedAt?: string;
+  startStepIndex: number;
+  durationSeconds?: number;
+  isSchedule?: boolean;
+}
+
 export interface TranscriptSnapshot {
   maxStepIndex: number;
   engaged: boolean;
@@ -56,6 +65,8 @@ export interface TranscriptSnapshot {
   error?: string;
   /** Kind of the last valid entry in the turn window (settlement tail guard). */
   tailKind: TranscriptTailKind;
+  /** Active (uncompleted) background tasks discovered in the transcript. */
+  activeBackgroundTasks?: ActiveBackgroundTask[];
 }
 
 interface ParsedTranscript {
@@ -78,6 +89,8 @@ interface ParsedTranscript {
   tailKind: TranscriptTailKind;
   /** short_error from the first ERROR_MESSAGE step, if any. */
   error?: string;
+  /** Active (uncompleted) background tasks discovered in the transcript. */
+  activeBackgroundTasks: ActiveBackgroundTask[];
 }
 
 function classifyTranscriptStep(step: TranscriptStep): TranscriptTailKind {
@@ -91,7 +104,149 @@ function classifyTranscriptStep(step: TranscriptStep): TranscriptTailKind {
   return 'tool-result';
 }
 
-export function parseTranscript(lines: string[], baselineStepIndex = -1): ParsedTranscript {
+/**
+ * Pure observational tools that do not constitute substantive foreground work.
+ * Invoking these tools does not imply that previous background tasks have finished.
+ */
+export const OBSERVATIONAL_TOOL_NAMES = new Set([
+  'manage_task',
+  'schedule',
+  'view_file',
+  'list_dir',
+  'grep_search',
+  'find_by_name',
+  'read_url_content',
+  'search_web',
+  'read_resource',
+  'list_resources',
+]);
+
+/**
+ * R2 等待话术门:
+ * Inspects whether the planner's final text output conveys waiting on a background task,
+ * timer, or background execution without genuine completion semantics.
+ */
+export function isWaitingSpeech(text: string | undefined | null): boolean {
+  if (!text || typeof text !== 'string') return false;
+  const trimmed = text.trim();
+  if (!trimmed) return false;
+
+  // Inspect the trailing portion of the text (last paragraph or last 600 chars)
+  const paragraphs = trimmed.split(/\n\s*\n/).map((p) => p.trim()).filter(Boolean);
+  const tail = paragraphs.length > 0 ? paragraphs[paragraphs.length - 1] : trimmed;
+
+  // 1. Completion semantics veto: if the tail clearly indicates completion has ALREADY occurred
+  // e.g. "has finished", "is completed", "completed successfully", "已运行完成，测试全部通过"
+  const hasCompletion =
+    /(?:has|have|is|are)\s+(?:completed|finished|terminated|succeeded|done)\b|(?:completed|finished|terminated)\s+successfully|all\s+tasks\s+(?:finished|done|completed)|(?:已运行完成|已执行完毕|执行完毕|运行完成|全部完成|已全部完成|已结束)\s*[,，。、;；\s]*(?:测试|所有|全部|任务|结果)?/i.test(
+      tail
+    );
+
+  // If completion is declared AND it doesn't have an ongoing future-wait clause (like "请等待" or "静待")
+  if (hasCompletion && !/(?:请等待|静待|耐心等待|稍后|正在等待|等待中)/i.test(tail)) {
+    return false;
+  }
+
+  // 2. Explicit task waiting: /waiting for .*task-\d+/i or Chinese equivalent
+  if (
+    /waiting\s+(?:for|on)\s+.*task-\d+/i.test(tail) ||
+    /(?:等待|静待|请稍候|稍后|耐心等待).*(?:task-\d+|后台任务)/i.test(tail)
+  ) {
+    return true;
+  }
+
+  // 3. Waiting for background process / job / command / test / build / output / notification / timer
+  if (
+    /(?:wait|waiting)\s+(?:for|on)\s+(?:the\s+)?(?:background\s+)?(?:task|process|job|command|build|test|run|output|completion|notification|result|timer)/i.test(
+      tail
+    )
+  ) {
+    return true;
+  }
+
+  // 4. Still running in background / running as background / awaiting timer / wake on notification / pausing to await
+  if (
+    /(?:still\s+running\s+in\s+(?:the\s+)?background|running\s+as\s+a\s+background\s+task|awaiting?\s+(?:timer|background|completion)|will\s+notify\s+(?:you|me|us)\s+when|wake\s+(?:when|up|upon)|pause\s+(?:and\s+wait|to\s+await))/i.test(
+      tail
+    ) ||
+    /(?:后台仍在运行|在后台运行|转入后台|已提交后台|后台执行中|正在后台运行|等待唤醒|等待通知|等待.*完成|静待.*结果|已启动后台)/i.test(tail)
+  ) {
+    return true;
+  }
+
+  // 5. General waiting clauses (e.g. "Please wait a moment", "请稍候", "耐心等待")
+  if (
+    /(?:please\s+wait|wait\s+a\s+moment|waiting\s+for\s+(?:it\s+to\s+finish|completion))/i.test(tail) ||
+    /(?:请稍候|请等待|耐心等待)/i.test(tail)
+  ) {
+    return true;
+  }
+
+  // Also check across the full text if it's relatively short (<1000 chars)
+  if (trimmed.length < 1000) {
+    if (
+      /waiting\s+(?:for|on)\s+.*task-\d+/i.test(trimmed) ||
+      /(?:等待|静待|请稍候|稍后|耐心等待).*(?:task-\d+|后台任务)/i.test(trimmed) ||
+      /(?:后台仍在运行|在后台运行|转入后台|已提交后台)/i.test(trimmed) ||
+      /(?:please\s+wait|wait\s+a\s+moment)/i.test(trimmed) ||
+      /(?:请稍候|请等待|耐心等待)/i.test(trimmed)
+    ) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+interface TrackedBackgroundTask {
+  taskId: string;
+  cascadeId?: string;
+  description?: string;
+  startedAt?: string;
+  startStepIndex: number;
+  timerCondition?: string | null;
+  isSchedule?: boolean;
+  durationSeconds?: number;
+  finished: boolean;
+}
+
+export function isTaskIdMatch(a: string, b: string): boolean {
+  if (a === b) return true;
+  if (!a || !b) return false;
+
+  const parseParts = (id: string) => {
+    const slashIdx = id.lastIndexOf('/');
+    const colonIdx = id.lastIndexOf(':');
+    const sepIdx = Math.max(slashIdx, colonIdx);
+    if (sepIdx >= 0) {
+      return { prefix: id.slice(0, sepIdx).trim(), base: id.slice(sepIdx + 1).trim() };
+    }
+    return { prefix: undefined, base: id.trim() };
+  };
+
+  const pA = parseParts(a);
+  const pB = parseParts(b);
+
+  if (pA.prefix && pB.prefix && pA.prefix.toLowerCase() !== pB.prefix.toLowerCase()) {
+    return false;
+  }
+  return pA.base.toLowerCase() === pB.base.toLowerCase();
+}
+
+/**
+ * Parses raw JSON lines from a cascade transcript into a structured snapshot.
+ *
+ * @param lines Raw lines read from transcript_full.jsonl or transcript.jsonl
+ * @param baselineStepIndex If >= 0, only steps with step_index > baselineStepIndex
+ *        are inspected for user input and completion signals.
+ * @param cascadeId Target cascade ID for task isolation. Tasks belonging to a
+ *        different cascade prefix are discarded.
+ */
+export function parseTranscript(
+  lines: string[],
+  baselineStepIndex = -1,
+  cascadeId?: string,
+): ParsedTranscript {
   const parsedSteps: TranscriptStep[] = [];
   let fileMaxStepIndex = -1;
   let latestGlobalUserInputIndex = -1;
@@ -112,6 +267,323 @@ export function parseTranscript(lines: string[], baselineStepIndex = -1): Parsed
     }
   }
 
+  // Scan trajectory for active (uncompleted) background tasks
+  const tasksMap = new Map<string, TrackedBackgroundTask>();
+  let lastTimerCondition: string | null = null;
+  let lastToolWasSchedule = false;
+  let lastDurationSeconds: number | undefined = undefined;
+
+  for (const step of parsedSteps) {
+    if (step.tool_calls) {
+      for (const tc of step.tool_calls) {
+        const tName = tc.name || (tc as any).tool_name;
+        if (tName === 'schedule') {
+          lastToolWasSchedule = true;
+          const tArgs = tc.args || (tc as any).tool_args;
+          if (tArgs) {
+            if (typeof tArgs.TimerCondition === 'string') {
+              lastTimerCondition = tArgs.TimerCondition;
+            }
+            if (typeof tArgs.DurationSeconds === 'number') {
+              lastDurationSeconds = tArgs.DurationSeconds;
+            } else if (typeof tArgs.DurationSeconds === 'string') {
+              const parsedSec = parseInt(tArgs.DurationSeconds, 10);
+              if (!Number.isNaN(parsedSec)) lastDurationSeconds = parsedSec;
+            }
+          }
+        }
+      }
+    }
+
+    // 1. Structured Task Launch
+    // Must be status === 'RUNNING' and a tool executor step (GENERIC, TOOL_RESULT, RUN_COMMAND).
+    // Excludes PLANNER_RESPONSE, USER_INPUT, CHECKPOINT, SYSTEM_MESSAGE, etc.
+    const isLaunchStepType =
+      step.type === 'GENERIC' ||
+      step.type === 'TOOL_RESULT' ||
+      step.type === 'TOOL_EXECUTION' ||
+      step.type === 'RUN_COMMAND';
+    if (
+      step.status === 'RUNNING' &&
+      isLaunchStepType &&
+      (typeof step.content === 'string' || (step as any).taskDetails || (step as any).task_details)
+    ) {
+      let cascadePrefix: string | undefined;
+      let rawTaskId: string | undefined;
+      let description: string | undefined;
+
+      const structDetails = (step as any).taskDetails || (step as any).task_details;
+      if (structDetails && typeof structDetails.id === 'string') {
+        const idParts = structDetails.id.split('/');
+        if (idParts.length === 2) {
+          cascadePrefix = idParts[0];
+          rawTaskId = idParts[1];
+        } else {
+          rawTaskId = idParts[0];
+        }
+        if (structDetails.description) {
+          description = String(structDetails.description).trim();
+        }
+      }
+
+      if (!rawTaskId && typeof step.content === 'string') {
+        const startMatch = step.content.match(
+          /(?:Tool|Command|Process|Task)?\s*(?:is\s+)?(?:running\s+as\s+(?:a\s+)?background\s+task|后台任务(?:已启动|在后台运行|ID)?|(?:已)?转入后台运行)(?:\s*(?:with\s+task\s+id|ID)?[:\s：(（]+)?\s*(?:([a-zA-Z0-9_-]+)\/)?(task-\d+)\b/i
+        ) || step.content.match(
+          /(?:Task id|task id|任务\s*ID)[:\s：(（]+(?:([a-zA-Z0-9_-]+)\/)?(task-\d+)\b/i
+        );
+        if (startMatch) {
+          cascadePrefix = startMatch[1];
+          rawTaskId = startMatch[2];
+        }
+      }
+
+      if (rawTaskId) {
+        // Cascade isolation: if a cascade prefix exists and target cascadeId is specified, must match
+        if (cascadePrefix && cascadeId && cascadePrefix !== cascadeId) {
+          console.warn(
+            `[antigravity] Rejecting background task ${rawTaskId} from foreign cascade ${cascadePrefix} (target: ${cascadeId})`
+          );
+          continue;
+        }
+
+        const taskId = rawTaskId.toLowerCase();
+        // Validation: taskId must strictly match task-\d+
+        if (!/^task-\d+$/.test(taskId)) {
+          console.warn(
+            `[antigravity] Dropping invalid taskId: "${taskId}" in cascade ${cascadeId ?? 'unknown'}`
+          );
+          continue;
+        }
+
+        if (!description && typeof step.content === 'string') {
+          const descM = step.content.match(/(?:Task Description|任务描述)[:\s：]+([^\r\n]+)/i);
+          description = descM ? descM[1].trim() : undefined;
+        }
+
+        // Validation on description: no newlines, no standalone file URIs
+        if (description) {
+          if (
+            /[\r\n]/.test(description) ||
+            /^file:\/\/\//i.test(description)
+          ) {
+            console.warn(
+              `[antigravity] Dropping invalid task description for ${taskId}: "${description}"`
+            );
+            description = undefined;
+          } else if (description.length > 300) {
+            description = description.slice(0, 300);
+          }
+        }
+
+        let durationSeconds = lastDurationSeconds;
+        if (durationSeconds === undefined && description) {
+          const durM = description.match(/\bTimer:\s*(\d+)\s*s(?:ec(?:ond)?)?\b/i);
+          if (durM) {
+            const parsedSec = parseInt(durM[1], 10);
+            if (!Number.isNaN(parsedSec)) durationSeconds = parsedSec;
+          }
+        }
+
+        const isSchedule =
+          lastToolWasSchedule ||
+          Boolean(lastTimerCondition) ||
+          durationSeconds !== undefined ||
+          Boolean(description && /timer|schedule|cron/i.test(description));
+
+        tasksMap.set(taskId, {
+          taskId,
+          cascadeId: cascadePrefix || cascadeId,
+          description,
+          startedAt: step.created_at,
+          startStepIndex: step.step_index ?? 0,
+          timerCondition: lastTimerCondition,
+          isSchedule,
+          durationSeconds,
+          finished: false,
+        });
+        lastTimerCondition = null;
+        lastToolWasSchedule = false;
+        lastDurationSeconds = undefined;
+      }
+    }
+
+    // 2. Structured Task Finish
+    // 2a. SYSTEM_MESSAGE from hub
+    if (step.type === 'SYSTEM_MESSAGE' && typeof step.content === 'string') {
+      const senders: string[] = [];
+      if ((step as any).sender) senders.push(String((step as any).sender).trim());
+
+      const senderM = step.content.match(/sender=(?:([a-zA-Z0-9_-]+)\/)?(task-\d+)\b/i);
+      if (senderM) {
+        const prefix = senderM[1];
+        if (!prefix || !cascadeId || prefix === cascadeId) {
+          senders.push(senderM[2].toLowerCase());
+        }
+      }
+
+      const finMsgM = step.content.match(
+        /Task id "(?:([a-zA-Z0-9_-]+)\/)?(task-\d+)" (?:finished|was canceled|canceled|failed|terminated|completed)/i
+      ) || step.content.match(
+        /(?:任务|后台任务)\s*"(?:([a-zA-Z0-9_-]+)\/)?(task-\d+)"\s*(?:已完成|已结束|已取消|执行完毕|失败)/i
+      );
+      if (finMsgM) {
+        const prefix = finMsgM[1];
+        if (!prefix || !cascadeId || prefix === cascadeId) {
+          senders.push(finMsgM[2].toLowerCase());
+        }
+      }
+
+      for (const s of senders) {
+        const matched = findMatchingTask(s);
+        if (matched) {
+          matched.finished = true;
+          markTimerConditionSatisfied(matched.taskId);
+        }
+        markTimerConditionSatisfied(s);
+      }
+    }
+
+    // 2b. Structured Task Finish via step.taskDetails or step.task_details
+    const finDetails = (step as any).taskDetails || (step as any).task_details;
+    if (step.status === 'DONE' && finDetails && typeof finDetails.id === 'string') {
+      const parts = finDetails.id.split('/');
+      const rawId = parts.length === 2 ? parts[1] : parts[0];
+      const matched = findMatchingTask(rawId.toLowerCase());
+      if (matched) {
+        matched.finished = true;
+        markTimerConditionSatisfied(matched.taskId);
+      }
+      markTimerConditionSatisfied(rawId.toLowerCase());
+    }
+
+    // 2c. manage_task execution result: Status: DONE / CANCELLED / FAILED / KILLED
+    const isToolResultType =
+      step.type === 'GENERIC' ||
+      step.type === 'TOOL_RESULT' ||
+      step.type === 'TOOL_EXECUTION' ||
+      step.type === 'MANAGE_TASK';
+    if (
+      step.status === 'DONE' &&
+      isToolResultType &&
+      typeof step.content === 'string'
+    ) {
+      if (
+        step.content.includes('Status: DONE') ||
+        step.content.includes('Status: CANCELLED') ||
+        step.content.includes('Status: FAILED') ||
+        step.content.includes('Status: KILLED') ||
+        step.content.includes('状态: 已完成') ||
+        step.content.includes('状态: 已终止')
+      ) {
+        const statusTaskM = step.content.match(/(?:Task|任务)[:\s：]+(?:([a-zA-Z0-9_-]+)\/)?(task-\d+)\b/i);
+        if (statusTaskM) {
+          const prefix = statusTaskM[1];
+          if (!prefix || !cascadeId || prefix === cascadeId) {
+            const finId = statusTaskM[2].toLowerCase();
+            const matched = findMatchingTask(finId);
+            if (matched) {
+              matched.finished = true;
+              markTimerConditionSatisfied(matched.taskId);
+            }
+            markTimerConditionSatisfied(finId);
+          }
+        }
+      }
+
+      const killM = step.content.match(
+        /(?:Task|任务|后台任务)\s*"?([a-zA-Z0-9_-]+(?:\/task-\d+)?|task-\d+)"?\s*(?:cancelled|killed|was canceled|terminated|completed|finished|已取消|已终止|已关闭|已完成|执行完毕)/i
+      ) || step.content.match(
+        /(?:后台任务|任务)\s*(?:已完成|执行完毕|已结束)\s*[\(（]?(task-\d+)/i
+      );
+      if (killM) {
+        const fullId = killM[1];
+        const parts = fullId.split('/');
+        const prefix = parts.length === 2 ? parts[0] : undefined;
+        const rawId = parts.length === 2 ? parts[1] : parts[0];
+        if (!prefix || !cascadeId || prefix === cascadeId) {
+          const finId = rawId.toLowerCase();
+          const matched = findMatchingTask(finId);
+          if (matched) {
+            matched.finished = true;
+            markTimerConditionSatisfied(matched.taskId);
+          }
+          markTimerConditionSatisfied(finId);
+        }
+      }
+
+      if (/No background tasks are currently running/i.test(step.content)) {
+        for (const [, t] of tasksMap) {
+          t.finished = true;
+        }
+      }
+    }
+
+    // 3. Foreground Progress Fallback (前台步骤推进兜底)
+    // If a subsequent step shows active foreground progress (new USER_INPUT or PLANNER_RESPONSE
+    // invoking substantive tools other than pure observational tools), any standard background task
+    // started BEFORE this step has necessarily finished (hub wakes session upon background task exit).
+    // R3: 纯观测类工具排除，且 schedule / timerCondition 任务永不被兜底误清。
+    const stepIdx = step.step_index ?? 0;
+    let isForegroundProgress = false;
+
+    if (step.type === 'USER_INPUT') {
+      isForegroundProgress = true;
+    } else if (step.type === 'PLANNER_RESPONSE' && step.tool_calls && step.tool_calls.length > 0) {
+      const hasSubstantiveTools = step.tool_calls.some((tc) => {
+        const name = (tc.name || (tc as any).tool_name || '').trim();
+        return name.length > 0 && !OBSERVATIONAL_TOOL_NAMES.has(name);
+      });
+      if (hasSubstantiveTools) isForegroundProgress = true;
+    }
+
+    if (isForegroundProgress) {
+      for (const [id, t] of tasksMap) {
+        // schedule / timerCondition tasks must NEVER be cleared by foreground progress fallback!
+        const isTimerOrSchedule =
+          Boolean(t.timerCondition) ||
+          t.isSchedule ||
+          t.taskId.includes('timer') ||
+          Boolean(t.description && /timer|schedule|cron/i.test(t.description));
+        if (isTimerOrSchedule) {
+          continue;
+        }
+
+        if (!t.finished && stepIdx > t.startStepIndex) {
+          t.finished = true;
+          markTimerConditionSatisfied(id);
+        }
+      }
+    }
+  }
+
+  function findMatchingTask(candidateId: string): TrackedBackgroundTask | undefined {
+    const raw = candidateId.toLowerCase();
+    for (const [id, t] of tasksMap) {
+      if (isTaskIdMatch(id, raw)) return t;
+    }
+    return undefined;
+  }
+
+  function markTimerConditionSatisfied(targetId: string) {
+    for (const [, otherT] of tasksMap) {
+      if (!otherT.finished && otherT.timerCondition && isTaskIdMatch(otherT.timerCondition, targetId)) {
+        otherT.finished = true;
+      }
+    }
+  }
+
+  const activeBackgroundTasks: ActiveBackgroundTask[] = Array.from(tasksMap.values())
+    .filter((t) => !t.finished)
+    .map((t) => ({
+      taskId: t.taskId,
+      description: t.description,
+      startedAt: t.startedAt,
+      startStepIndex: t.startStepIndex,
+      durationSeconds: t.durationSeconds,
+      isSchedule: t.isSchedule,
+    }));
+
   const result: ParsedTranscript = {
     maxStepIndex: fileMaxStepIndex,
     userInputIndex: -1,
@@ -120,6 +592,7 @@ export function parseTranscript(lines: string[], baselineStepIndex = -1): Parsed
     checkpointAfterInput: false,
     isFinished: false,
     tailKind: 'none',
+    activeBackgroundTasks,
   };
 
   // If a baseline is provided, only inspect steps generated AFTER the baseline step index
@@ -288,13 +761,15 @@ export function parseTranscript(lines: string[], baselineStepIndex = -1): Parsed
 
 export type AutoContinueReason = 'tool-tail' | 'no-assistant-text';
 
-export type SettleGuardAction = 'settle' | 'settle-exhausted' | 'continue' | 'wait';
+export type SettleGuardAction = 'settle' | 'settle-exhausted' | 'continue' | 'wait' | 'wait-background';
 
 export interface SettleGuardInput {
   snap: Pick<
     TranscriptSnapshot,
-    'isFinished' | 'plannerContents' | 'tailKind' | 'engaged' | 'pendingApproval' | 'error'
+    'isFinished' | 'plannerContents' | 'tailKind' | 'engaged' | 'pendingApproval' | 'error' | 'activeBackgroundTasks'
   >;
+  /** Optional active background tasks that block settlement (non-infinite-silenced). If omitted, defaults to snap.activeBackgroundTasks. */
+  blockingBackgroundTasks?: ActiveBackgroundTask[];
   /** How long the transcript has produced no new steps (ms). */
   tailQuietMs: number;
   /** Auto-continue nudges already spent on the current turn. */
@@ -309,7 +784,8 @@ export interface SettleGuardInput {
 
 export interface SettleGuardDecision {
   action: SettleGuardAction;
-  reason?: AutoContinueReason;
+  reason?: AutoContinueReason | 'background-task';
+  activeTasks?: ActiveBackgroundTask[];
 }
 
 /**
@@ -318,6 +794,9 @@ export interface SettleGuardDecision {
  * bridge should nudge it with a "Continue" message instead.
  *
  * Guard conditions (checked at every done-settlement exit):
+ * - (0) `background-task`: active background tasks are still running in the
+ *   session. Any background task completion sends a message to AGY session from
+ *   the hub, waking it up. The turn is NOT complete; do not settle or continue.
  * - (a) `tool-tail`: the LAST valid entry is a tool call or tool result with no
  *   assistant text after it. `isFinished` is then stale state left behind by an
  *   earlier final text or CHECKPOINT (executor DONE steps never reset it) — the
@@ -334,6 +813,15 @@ export function decideTailSettle(input: SettleGuardInput): SettleGuardDecision {
   const { snap, tailQuietMs, autoContinueCount, maxAutoContinue, settleStableMs, autoContinueQuietMs } = input;
   const finished = snap.isFinished === true;
   const hasText = snap.plannerContents.length > 0;
+
+  // Background task guard: when there are blocking (non-infinite-silenced) background tasks,
+  // the turn is NOT finished regardless of whether the model output text or finished turn.
+  // The hub will send a message to AGY session when any background task completes to wake it up.
+  // Do NOT settle, do NOT auto-continue.
+  const blockingTasks = input.blockingBackgroundTasks ?? snap.activeBackgroundTasks;
+  if (blockingTasks && blockingTasks.length > 0) {
+    return { action: 'wait-background', reason: 'background-task', activeTasks: blockingTasks };
+  }
 
   // Not at a settlement point: errors / pending approvals / live turns are
   // handled by their dedicated branches.
@@ -362,6 +850,13 @@ export function decideTailSettle(input: SettleGuardInput): SettleGuardDecision {
   // only after the transcript has been still for a short window — late-landing
   // executor steps (background tasks writing their results) flip the tail to a
   // tool message and get caught by the guard above instead of settling first.
+  // R2 等待话术门: if the planner's final text conveys waiting on a background task/timer
+  // without completion semantics, do NOT settle — continue waiting.
+  const lastPlannerText = snap.plannerContents[snap.plannerContents.length - 1];
+  if (isWaitingSpeech(lastPlannerText)) {
+    return { action: 'wait' };
+  }
+
   if (tailQuietMs < settleStableMs) return { action: 'wait' };
   return { action: 'settle' };
 }
@@ -370,6 +865,90 @@ export interface LoadedTranscript {
   path: string;
   text: string;
   mtimeMs: number;
+}
+
+export interface PruneStaleTasksOptions {
+  nowMs?: number;
+  lastActiveAtMs?: number;
+}
+
+/**
+ * Prunes stale orphan background tasks that have exceeded their expected lifetime
+ * AND whose transcript has ceased growing for at least 15 minutes.
+ *
+ * Counter-example protection:
+ * If the transcript is actively growing (nowMs - lastActiveAtMs < 15 minutes),
+ * long-running processes (e.g. `node ygopro-server.js`) MUST NEVER be pruned.
+ */
+export function pruneStaleBackgroundTasks(
+  tasks: ActiveBackgroundTask[] | undefined,
+  options?: PruneStaleTasksOptions,
+): { activeTasks: ActiveBackgroundTask[]; prunedTasks: ActiveBackgroundTask[] } {
+  if (!tasks || tasks.length === 0) {
+    return { activeTasks: [], prunedTasks: [] };
+  }
+
+  const nowMs = options?.nowMs ?? Date.now();
+  const lastActiveAtMs = options?.lastActiveAtMs ?? nowMs;
+
+  const FIFTEEN_MIN_MS = 15 * 60 * 1000;
+  const transcriptIsStale = nowMs - lastActiveAtMs >= FIFTEEN_MIN_MS;
+
+  // Condition (c) protection: If transcript is still actively growing, NEVER prune any task!
+  if (!transcriptIsStale) {
+    return { activeTasks: tasks, prunedTasks: [] };
+  }
+
+  const activeTasks: ActiveBackgroundTask[] = [];
+  const prunedTasks: ActiveBackgroundTask[] = [];
+
+  for (const t of tasks) {
+    let expectedLifetimeMs: number;
+    const isTimer = Boolean(
+      t.isSchedule ||
+      t.durationSeconds !== undefined ||
+      t.taskId.includes('timer') ||
+      (t.description && /timer|schedule|cron/i.test(t.description))
+    );
+
+    if (isTimer) {
+      if (typeof t.durationSeconds === 'number' && t.durationSeconds > 0) {
+        expectedLifetimeMs = t.durationSeconds * 10 * 1000;
+      } else {
+        const descM = t.description?.match(/\bTimer:\s*(\d+)\s*s(?:ec(?:ond)?)?\b/i);
+        if (descM) {
+          expectedLifetimeMs = parseInt(descM[1], 10) * 10 * 1000;
+        } else {
+          expectedLifetimeMs = FIFTEEN_MIN_MS;
+        }
+      }
+    } else {
+      expectedLifetimeMs = FIFTEEN_MIN_MS;
+    }
+
+    let isTaskOverdue = false;
+    if (t.startedAt) {
+      const taskStartMs = Date.parse(t.startedAt);
+      if (!Number.isNaN(taskStartMs)) {
+        isTaskOverdue = nowMs - taskStartMs >= expectedLifetimeMs;
+      } else {
+        isTaskOverdue = true;
+      }
+    } else {
+      isTaskOverdue = true;
+    }
+
+    if (isTaskOverdue && transcriptIsStale) {
+      console.warn(
+        `[antigravity] Pruning stale background task ${t.taskId} (desc: "${t.description ?? 'none'}", startedAt: ${t.startedAt}, expectedLifetimeMs: ${expectedLifetimeMs}ms, transcriptIdleMs: ${nowMs - lastActiveAtMs}ms)`
+      );
+      prunedTasks.push(t);
+    } else {
+      activeTasks.push(t);
+    }
+  }
+
+  return { activeTasks, prunedTasks };
 }
 
 /**
@@ -411,7 +990,15 @@ export async function readCascadeTranscript(
     return undefined; // transcript not materialized yet
   }
   const lines = loaded.text.split('\n').filter((l) => l.trim());
-  const parsed = parseTranscript(lines, baselineStepIndex);
+  const parsed = parseTranscript(lines, baselineStepIndex, cascadeId);
+
+  const lastActiveAtMs = parsed.lastActiveAt ? Date.parse(parsed.lastActiveAt) : loaded.mtimeMs;
+  const effectiveLastActiveMs = Number.isNaN(lastActiveAtMs) ? loaded.mtimeMs : lastActiveAtMs;
+  const { activeTasks } = pruneStaleBackgroundTasks(parsed.activeBackgroundTasks, {
+    nowMs: Date.now(),
+    lastActiveAtMs: effectiveLastActiveMs,
+  });
+
   return {
     maxStepIndex: parsed.maxStepIndex,
     engaged: parsed.engagedAfterInput,
@@ -421,6 +1008,7 @@ export async function readCascadeTranscript(
     isFinished: parsed.isFinished,
     error: parsed.error,
     tailKind: parsed.tailKind,
+    activeBackgroundTasks: activeTasks,
   };
 }
 
@@ -455,7 +1043,18 @@ export async function pollTranscript(
     }
 
     if (lines) {
-      latestParsed = parseTranscript(lines, baselineStepIndex);
+      latestParsed = parseTranscript(lines, baselineStepIndex, cascadeId);
+      const lastActiveAtMs = latestParsed.lastActiveAt
+        ? Date.parse(latestParsed.lastActiveAt)
+        : (loaded?.mtimeMs ?? Date.now());
+      const effectiveLastActiveMs = Number.isNaN(lastActiveAtMs)
+        ? (loaded?.mtimeMs ?? Date.now())
+        : lastActiveAtMs;
+      const { activeTasks } = pruneStaleBackgroundTasks(latestParsed.activeBackgroundTasks, {
+        nowMs: Date.now(),
+        lastActiveAtMs: effectiveLastActiveMs,
+      });
+      latestParsed.activeBackgroundTasks = activeTasks;
       if (latestParsed.error) {
         return {
           done: true,
@@ -480,7 +1079,15 @@ export async function pollTranscript(
         // mid-turn activity (stale isFinished), never a completed turn.
         const tailSettleable =
           latestParsed.tailKind !== 'tool-call' && latestParsed.tailKind !== 'tool-result';
-        if (latestParsed.checkpointAfterInput || (latestParsed.isFinished && tailSettleable && stable)) {
+        const hasActiveTasks =
+          Boolean(latestParsed.activeBackgroundTasks && latestParsed.activeBackgroundTasks.length > 0);
+        const lastPlannerText = latestParsed.plannerContents[latestParsed.plannerContents.length - 1];
+        const isWaiting = isWaitingSpeech(lastPlannerText);
+        if (
+          !hasActiveTasks &&
+          !isWaiting &&
+          (latestParsed.checkpointAfterInput || (latestParsed.isFinished && tailSettleable && stable))
+        ) {
           return {
             done: true,
             status: 'done',

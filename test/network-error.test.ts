@@ -45,10 +45,11 @@ async function driveUntilSettled(svc: AntigravityService, cascadeId: string, max
   const watchers = (svc as unknown as { watchers: Map<string, Promise<void>> }).watchers;
   const watcherPromise = watchers.get(cascadeId);
   for (let i = 0; i < maxSeconds; i++) {
-    if (!watchers.has(cascadeId)) break;
+    const run = runOf(svc, cascadeId);
+    if (!watchers.has(cascadeId) || (run && (run.status === 'done' || run.status === 'error'))) break;
     await vi.advanceTimersByTimeAsync(1000);
   }
-  if (watcherPromise) await watcherPromise;
+  if (!watchers.has(cascadeId) && watcherPromise) await watcherPromise;
 }
 
 function runOf(svc: AntigravityService, cascadeId: string): HubRun {
@@ -85,7 +86,7 @@ describe('Network Error and In-flight Stall Handling', () => {
     // Advance enough time to exceed stallTimeoutMs (5s) + backoff delay (2s)
     await vi.advanceTimersByTimeAsync(10000);
 
-    expect(sendMessage).toHaveBeenCalledWith('cid-stall-1', '继续。按原计划继续执行当前任务，不要停止。');
+    expect(sendMessage).toHaveBeenCalledWith('cid-stall-1', '继续。按原计划继续执行当前任务，不要停止。', { planModel: undefined });
     const run = runOf(svc, 'cid-stall-1');
     expect(run.autoResumeRetries).toBe(1);
     expect(run.baselineStepIndex).toBe(10);
@@ -167,7 +168,7 @@ describe('Network Error and In-flight Stall Handling', () => {
     // 2s backoff + idle poll
     await vi.advanceTimersByTimeAsync(4000);
 
-    expect(sendMessage).toHaveBeenCalledWith('cid-fetch-fail', '继续。按原计划继续执行当前任务，不要停止。');
+    expect(sendMessage).toHaveBeenCalledWith('cid-fetch-fail', '继续。按原计划继续执行当前任务，不要停止。', { planModel: undefined });
     expect(runOf(svc, 'cid-fetch-fail').autoResumeRetries).toBe(1);
 
     // Let it settle to completion

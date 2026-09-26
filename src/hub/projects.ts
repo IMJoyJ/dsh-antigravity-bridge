@@ -3,7 +3,7 @@ import { fromBinary, toJson } from '@bufbuild/protobuf';
 import type { HubClient } from './client.js';
 import type { HubInfo } from './discovery.js';
 import { getHubRegistry } from './registry.js';
-import { encodeGrpcWebFrame, parseGrpcWebFrames } from './transport.js';
+import { encodeGrpcWebFrame } from './transport.js';
 
 export interface ProjectResource {
   folderUri?: string;
@@ -24,7 +24,9 @@ export interface HubProject {
 }
 
 export interface ResolvedProject {
-  projectId: string;
+  /** Registered project UUID. Undefined when a freshly created project failed
+   *  the hub persistence check — callers must then bind via {@link workspaceUri}. */
+  projectId?: string;
   workspaceUri: string;
   projectName: string;
   created: boolean;
@@ -100,22 +102,78 @@ export class ProjectResolver {
         body: frame as unknown as BodyInit,
       });
 
-      if (!res.ok) return;
+      if (!res.ok) {
+        console.warn(`[antigravity] ProjectUpdatesStream refresh: hub answered HTTP ${res.status}; keeping the previous project cache.`);
+        return;
+      }
       if (!res.body) return;
-      const reader = res.body.getReader();
-      const { value } = await reader.read();
-      reader.cancel().catch(() => {});
 
-      if (!value) return;
+      // The hub sends the initial project snapshot split across an unknown
+      // number of stream chunks (a single read() can end mid-frame and lose
+      // every project id after it), then keeps the stream open forever —
+      // so read-to-end would hang. Instead: accumulate chunks, decode every
+      // complete frame, and stop on an idle gap once a projectIds message
+      // has been seen (or when the stream itself ends).
+      const reader = res.body.getReader();
+      let buffer = new Uint8Array(0);
       let projectIds: string[] = [];
-      for (const f of parseGrpcWebFrames(value)) {
-        if (!(f.flag & 0x80)) {
-          const msg = fromBinary(method.output, f.data);
-          const json = toJson(method.output, msg) as { projectList?: { projectIds?: string[] } };
-          if (json?.projectList?.projectIds) {
-            projectIds = json.projectList.projectIds;
+      let sawProjectIds = false;
+      let ended = false;
+      const deadline = Date.now() + 10_000;
+
+      while (!ended && Date.now() < deadline) {
+        const readPromise = reader.read();
+        const idleMs = sawProjectIds ? 750 : 3000;
+        let step: ReadableStreamReadResult<Uint8Array> | null = null;
+        try {
+          step = await Promise.race([
+            readPromise,
+            new Promise<null>((r) => setTimeout(() => r(null), idleMs)),
+          ]);
+        } catch (err) {
+          console.warn('[antigravity] ProjectUpdatesStream read failed; keeping the previous project cache:', err);
+          ended = true;
+          break;
+        }
+        if (step === null) {
+          if (sawProjectIds) break; // snapshot settled: idle gap reached
+          continue; // still waiting for the snapshot within the overall deadline
+        }
+        if (step.done) { ended = true; break; }
+        if (!step.value) continue;
+
+        const merged = new Uint8Array(buffer.length + step.value.length);
+        merged.set(buffer);
+        merged.set(step.value, buffer.length);
+        buffer = merged;
+
+        let pos = 0;
+        while (pos + 5 <= buffer.length) {
+          const flag = buffer[pos];
+          const len = ((buffer[pos + 1] << 24) | (buffer[pos + 2] << 16) | (buffer[pos + 3] << 8) | buffer[pos + 4]) >>> 0;
+          if (pos + 5 + len > buffer.length) break;
+          const data = buffer.subarray(pos + 5, pos + 5 + len);
+          pos += 5 + len;
+          if (flag & 0x80) { ended = true; continue; }
+          try {
+            const json = toJson(method.output, fromBinary(method.output, data)) as {
+              projectList?: { projectIds?: string[] };
+            };
+            if (json?.projectList?.projectIds?.length) {
+              projectIds = json.projectList.projectIds;
+              sawProjectIds = true;
+            }
+          } catch (err) {
+            console.warn('[antigravity] ProjectUpdatesStream: failed to decode a project frame:', err);
           }
         }
+        buffer = buffer.subarray(pos);
+      }
+      if (!ended) reader.cancel().catch(() => {});
+
+      if (projectIds.length === 0) {
+        console.warn('[antigravity] ProjectUpdatesStream refresh decoded no project ids; keeping the previous project cache.');
+        return;
       }
 
       // Fetch metadata for all project IDs concurrently
@@ -124,8 +182,8 @@ export class ProjectResolver {
           try {
             const resp = (await this.client.call('ReadProject', { id }, { emptyResponse: 'reject' })) as { project?: HubProject };
             if (resp?.project) return resp.project;
-          } catch {
-            // Project might be stale or not readable
+          } catch (err) {
+            console.warn(`[antigravity] project cache refresh: ReadProject(${id}) failed, project skipped:`, err);
           }
           return undefined;
         }),
@@ -137,7 +195,9 @@ export class ProjectResolver {
       }
       this.lastFetched = Date.now();
     } catch (err) {
-      // Hub streaming failed or unauthenticated; fallback quietly
+      // Hub streaming failed or unauthenticated; keep the previous cache instead
+      // of silently pretending the refresh succeeded.
+      console.warn('[antigravity] ProjectUpdatesStream refresh failed; keeping the previous project cache:', err);
     }
   }
 
@@ -145,7 +205,10 @@ export class ProjectResolver {
    * Resolves a folder path, URI, or project UUID:
    * 1. If it is an existing registered project UUID -> returns that project;
    * 2. If it matches an existing registered project's workspace folder -> returns the first matching project;
-   * 3. If not matched -> automatically creates a new project on the hub and returns its new UUID.
+   * 3. If not matched -> automatically creates a new project on the hub and returns its new UUID —
+   *    but only after verifying the hub actually persisted it; when persistence fails,
+   *    {@link ResolvedProject.projectId} is left undefined so callers bind the cascade
+   *    to {@link ResolvedProject.workspaceUri} directly (workspaceUris on StartCascade).
    */
   async resolveOrCreateProject(folderOrId?: string, hubInfo?: HubInfo): Promise<ResolvedProject> {
     const raw = folderOrId?.trim() || '';
@@ -192,7 +255,7 @@ export class ProjectResolver {
     const targetFolderUri = toFolderUri(raw || process.cwd());
     const normTarget = normalizeFolderUri(targetFolderUri);
 
-    // Check if any existing project matches this workspace folder (first hit)
+    // Check if any existing project matches this workspace folder (first exact hit)
     for (const [id, proj] of this.cache.entries()) {
       const resources = proj.projectResources?.resources || [];
       for (const r of resources) {
@@ -208,7 +271,35 @@ export class ProjectResolver {
       }
     }
 
-    // 3. Not found -> Automatically create a new project on the hub
+    // Prefix match: check if targetFolder is a subdirectory inside an existing registered workspace
+    let bestPrefixMatch: { id: string; proj: HubProject; rUri: string; prefixLen: number } | null = null;
+    for (const [id, proj] of this.cache.entries()) {
+      const resources = proj.projectResources?.resources || [];
+      for (const r of resources) {
+        const rUri = r.folderUri || r.gitFolder?.folderUri;
+        if (!rUri) continue;
+        const normR = normalizeFolderUri(rUri);
+        if (normTarget.startsWith(normR + '/')) {
+          if (!bestPrefixMatch || normR.length > bestPrefixMatch.prefixLen) {
+            bestPrefixMatch = { id, proj, rUri, prefixLen: normR.length };
+          }
+        }
+      }
+    }
+    if (bestPrefixMatch) {
+      return {
+        projectId: bestPrefixMatch.id,
+        workspaceUri: bestPrefixMatch.rUri,
+        projectName: bestPrefixMatch.proj.name || 'Project',
+        created: false,
+      };
+    }
+
+    // 3. Not found -> Automatically create a new project on the hub. The hub
+    // accepts CreateProject (grpc status 0) but does not persist every bare
+    // RPC-created project (ReadProject then reports notFoundOnDisk), and a
+    // StartCascade for such an id is silently no-op'ed. So verify persistence
+    // before handing the id out; on failure fall back to folder binding.
     const newId = crypto.randomUUID();
     const rawPath = targetFolderUri.replace(/^file:\/\/\/?/i, '').replace(/\\/g, '/');
     const folderName = rawPath.split('/').filter(Boolean).pop() || 'Workspace';
@@ -226,13 +317,36 @@ export class ProjectResolver {
     };
 
     await this.client.call('CreateProject', { project: newProject });
-    this.cache.set(newId, newProject);
 
+    for (let attempt = 0; attempt < 3; attempt++) {
+      await new Promise((r) => setTimeout(r, 500 * (attempt + 1)));
+      try {
+        const resp = (await this.client.call('ReadProject', { id: newId }, { emptyResponse: 'reject' })) as
+          | { project?: HubProject }
+          | undefined;
+        if (resp && typeof resp === 'object' && resp.project) {
+          this.cache.set(newId, resp.project);
+          return {
+            projectId: newId,
+            workspaceUri: targetFolderUri,
+            projectName: folderName,
+            created: true,
+          };
+        }
+      } catch (err) {
+        console.warn(`[antigravity] project persistence check attempt ${attempt + 1} failed for ${newId}:`, err);
+      }
+    }
+
+    console.warn(
+      `[antigravity] CreateProject accepted but "${folderName}" (${newId}) was never persisted on the hub; `
+      + 'falling back to direct workspace binding (workspaceUris).',
+    );
     return {
-      projectId: newId,
+      projectId: undefined,
       workspaceUri: targetFolderUri,
       projectName: folderName,
-      created: true,
+      created: false,
     };
   }
 }
