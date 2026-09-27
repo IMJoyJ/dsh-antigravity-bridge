@@ -344,11 +344,13 @@ describe('Error Signature Classifier', () => {
 
   describe('Config Schema & Defaults', () => {
     it('should apply autoResume default values in Config schema', () => {
+      // Volatile fields resolve into Volatile boxes; unwrap with get().
       const parsed = Config({});
-      expect(parsed.autoResume).toBeDefined();
-      expect(parsed.autoResume?.enabled).toBe(true);
-      expect(parsed.autoResume?.maxRetries).toBe(3);
-      expect(parsed.autoResume?.message).toBe('继续。按原计划继续执行当前任务，不要停止。');
+      const autoResume = parsed.autoResume?.get();
+      expect(autoResume).toBeDefined();
+      expect(autoResume?.enabled).toBe(true);
+      expect(autoResume?.maxRetries).toBe(3);
+      expect(autoResume?.message).toBe('继续。按原计划继续执行当前任务，不要停止。');
     });
 
     it('should respect custom autoResume configurations', () => {
@@ -359,9 +361,10 @@ describe('Error Signature Classifier', () => {
           message: '自定义继续指令',
         },
       });
-      expect(custom.autoResume?.enabled).toBe(false);
-      expect(custom.autoResume?.maxRetries).toBe(5);
-      expect(custom.autoResume?.message).toBe('自定义继续指令');
+      const autoResume = custom.autoResume?.get();
+      expect(autoResume?.enabled).toBe(false);
+      expect(autoResume?.maxRetries).toBe(5);
+      expect(autoResume?.message).toBe('自定义继续指令');
     });
   });
 });

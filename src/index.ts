@@ -1,4 +1,4 @@
-import { Context, Service } from '@deepseek-ai/cordis';
+import { Context, Service, type Volatile } from '@deepseek-ai/cordis';
 import { promises as fsp } from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
@@ -99,22 +99,26 @@ export interface AntigravityConfig {
   autoContinueMessage?: string;
 }
 
-export const Config: Schema<AntigravityConfig> = Schema.object({
+// NOTE: intentionally unannotated (sibling-vertex-bridge style). Direct-call
+// parse output carries Volatile boxes (schemastery wraps volatile fields on
+// resolve); the plain-values contract for Loader delivery is LiveAntigravityConfig.
+export const Config = Schema.object({
   backend: Schema.union(['hub', 'localharness'])
     .default('hub')
-    .description('Backend: hub = local Antigravity IDE gRPC (agy quota), localharness = standalone SDK binary (API key)'),
-  binaryPath: Schema.string().description('Path to localharness.exe binary (localharness backend only)'),
-  protoDir: Schema.string().description('Path to proto directory (localharness backend only)'),
-  defaultModel: Schema.string().default(DEFAULT_MODEL_ID).description('Default model display id'),
-  appDataDir: Schema.string().description('Custom Antigravity app data directory'),
-  projectId: Schema.string().description('Default Antigravity project id for new conversations'),
-  hubAddress: Schema.string().description('Override hub address (e.g. 127.0.0.1:7778); skips discovery when both overrides are set'),
-  hubCsrfToken: Schema.string().description('Override hub CSRF token'),
-  pollTimeoutMs: Schema.number().default(300_000).description('Settlement-wait timeout in ms (sync delegate replies and check_run wait=true)'),
-  watchMaxMs: Schema.number().default(43_200_000).description('Background lifecycle watcher absolute cap in ms (default 12h); settlement watching never expires before this'),
-  inlineCharBudget: Schema.number().default(4_000).description('Inline character budget for report bodies; longer reports are persisted to a file and referenced by path (default 4000)'),
-  sidebarVisible: Schema.boolean().default(true).description('Show bridge-created cascades in the Antigravity IDE sidebar (agy >= 2.9.1 hides source=CASCADE_CLIENT sessions; uses JETBOX which the hub accepts and the frontend treats as local); false keeps them external/search-only'),
-  approvalGraceMs: Schema.number().default(3_000).description('Grace window in ms for IDE YOLO auto-approval before pushing an awaiting-approval notice (default 3000)'),
+    .description('Backend: hub = local Antigravity IDE gRPC (agy quota), localharness = standalone SDK binary (API key)')
+    .volatile(),
+  binaryPath: Schema.string().description('Path to localharness.exe binary (localharness backend only)').volatile(),
+  protoDir: Schema.string().description('Path to proto directory (localharness backend only)').volatile(),
+  defaultModel: Schema.string().default(DEFAULT_MODEL_ID).description('Default model display id').volatile(),
+  appDataDir: Schema.string().description('Custom Antigravity app data directory').volatile(),
+  projectId: Schema.string().description('Default Antigravity project id for new conversations').volatile(),
+  hubAddress: Schema.string().description('Override hub address (e.g. 127.0.0.1:7778); skips discovery when both overrides are set').volatile(),
+  hubCsrfToken: Schema.string().description('Override hub CSRF token').volatile(),
+  pollTimeoutMs: Schema.number().default(300_000).description('Settlement-wait timeout in ms (sync delegate replies and check_run wait=true)').volatile(),
+  watchMaxMs: Schema.number().default(43_200_000).description('Background lifecycle watcher absolute cap in ms (default 12h); settlement watching never expires before this').volatile(),
+  inlineCharBudget: Schema.number().default(4_000).description('Inline character budget for report bodies; longer reports are persisted to a file and referenced by path (default 4000)').volatile(),
+  sidebarVisible: Schema.boolean().default(true).description('Show bridge-created cascades in the Antigravity IDE sidebar (agy >= 2.9.1 hides source=CASCADE_CLIENT sessions; uses JETBOX which the hub accepts and the frontend treats as local); false keeps them external/search-only').volatile(),
+  approvalGraceMs: Schema.number().default(3_000).description('Grace window in ms for IDE YOLO auto-approval before pushing an awaiting-approval notice (default 3000)').volatile(),
   autoResume: Schema.object({
     enabled: Schema.boolean().default(true).description('Automatically resume cascade on transient errors (default true)'),
     maxRetries: Schema.number().default(3).description('Maximum consecutive auto-resume retries per cascade (default 3)'),
@@ -123,15 +127,66 @@ export const Config: Schema<AntigravityConfig> = Schema.object({
     enabled: true,
     maxRetries: 3,
     message: '继续。按原计划继续执行当前任务，不要停止。',
-  }).description('Transient error auto-resume configuration'),
-  autoContinueMax: Schema.number().default(DEFAULT_AUTO_CONTINUE_MAX).description('Max consecutive auto-"Continue" nudges per turn when the transcript tail shows unfinished work (tool tail / no assistant text); 0 disables nudging (default 5)'),
-  autoContinueMessage: Schema.string().default(DEFAULT_AUTO_CONTINUE_MESSAGE).description('Message sent to the cascade for each tail-guard auto-continue (default "Continue")'),
-  stallTimeoutMs: Schema.number().default(120_000).description('Inactivity timeout in ms for mid-turn running cascade before triggering stall recovery (default 120000, 2m)'),
+  }).description('Transient error auto-resume configuration').volatile(),
+  autoContinueMax: Schema.number().default(DEFAULT_AUTO_CONTINUE_MAX).description('Max consecutive auto-"Continue" nudges per turn when the transcript tail shows unfinished work (tool tail / no assistant text); 0 disables nudging (default 5)').volatile(),
+  autoContinueMessage: Schema.string().default(DEFAULT_AUTO_CONTINUE_MESSAGE).description('Message sent to the cascade for each tail-guard auto-continue (default "Continue")').volatile(),
+  stallTimeoutMs: Schema.number().default(120_000).description('Inactivity timeout in ms for mid-turn running cascade before triggering stall recovery (default 120000, 2m)').volatile(),
 });
+
+/** Live volatile references delivered by the Loader; snapshot into {@link AntigravityConfig} to read. */
+export interface LiveAntigravityConfig {
+  backend: Volatile<'hub' | 'localharness'>;
+  binaryPath: Volatile<string | undefined>;
+  protoDir: Volatile<string | undefined>;
+  defaultModel: Volatile<string>;
+  appDataDir: Volatile<string | undefined>;
+  projectId: Volatile<string | undefined>;
+  hubAddress: Volatile<string | undefined>;
+  hubCsrfToken: Volatile<string | undefined>;
+  pollTimeoutMs: Volatile<number>;
+  watchMaxMs: Volatile<number>;
+  inlineCharBudget: Volatile<number>;
+  sidebarVisible: Volatile<boolean>;
+  approvalGraceMs: Volatile<number>;
+  autoResume: Volatile<AutoResumeConfig>;
+  autoContinueMax: Volatile<number>;
+  autoContinueMessage: Volatile<string>;
+  stallTimeoutMs: Volatile<number>;
+}
+
+/** Snapshot the live volatile references into plain values. The Loader commits Settings form edits into the running references and emits `loader/volatile-update`; `get()` reads the just-committed value. */
+export function snapshotAntigravityConfig(live: LiveAntigravityConfig): AntigravityConfig {
+  return {
+    backend: live.backend.get(),
+    binaryPath: live.binaryPath.get(),
+    protoDir: live.protoDir.get(),
+    defaultModel: live.defaultModel.get(),
+    appDataDir: live.appDataDir.get(),
+    projectId: live.projectId.get(),
+    hubAddress: live.hubAddress.get(),
+    hubCsrfToken: live.hubCsrfToken.get(),
+    pollTimeoutMs: live.pollTimeoutMs.get(),
+    watchMaxMs: live.watchMaxMs.get(),
+    inlineCharBudget: live.inlineCharBudget.get(),
+    sidebarVisible: live.sidebarVisible.get(),
+    approvalGraceMs: live.approvalGraceMs.get(),
+    autoResume: live.autoResume.get(),
+    autoContinueMax: live.autoContinueMax.get(),
+    autoContinueMessage: live.autoContinueMessage.get(),
+    stallTimeoutMs: live.stallTimeoutMs.get(),
+  };
+}
 
 declare module '@deepseek-ai/cordis' {
   interface Context {
     antigravity: AntigravityService;
+  }
+  interface Events {
+    /**
+     * Volatile config values were committed into the running fiber without a
+     * remount; dispatched to the owning fiber only.
+     */
+    'loader/volatile-update'(paths: readonly (readonly string[])[]): void;
   }
 }
 
@@ -1132,7 +1187,7 @@ export class AntigravityService extends Service {
     return { silenced: false, infinite: false };
   }
 
-  /** Hot-swap live config (settings namespace onChange). All fields are read at use-time. */
+  /** Hot-swap live config (loader/volatile-update snapshot). All fields are read at use-time. */
   updateConfig(config: AntigravityConfig): void {
     this.config = config;
   }
@@ -3302,29 +3357,33 @@ export default class AntigravityBridgePlugin {
   static Config = Config;
   static inject = ['tools', 'systemPrompt'];
 
-  constructor(ctx: Context, config: AntigravityConfig) {
-    ctx.plugin(AntigravityService, config);
+  constructor(ctx: Context, config: LiveAntigravityConfig) {
+    // Snapshot the live volatile references into plain values once; refresh on
+    // `loader/volatile-update` below. All service fields are read at use-time,
+    // so replacing the service reference is sufficient (no remount).
+    const current = () => snapshotAntigravityConfig(config);
+    ctx.plugin(AntigravityService, current());
 
-    // Hot-reloadable settings namespace (Web Settings UI); config fields are
-    // read at use-time, so updating the service reference is sufficient.
-    let current = () => config;
+    // 0.1.7 settings seam: this instance ships its own Plugins-page card, so it
+    // registers `configure({ auto: false })` and refreshes from the live
+    // references on `loader/volatile-update` (volatile-only changes; an
+    // ordinary-field change remounts instead). Without a settings provider the
+    // callback never fires and the composition entry stands as the whole config.
     // dsh-settings is optional; inject waits for the service instead of racing
     // the boot order — a direct ctx.get here can silently miss it and the
-    // settings card never registers.
+    // settings policy never registers.
     ctx.inject(['settings'] as any, (settingsCtx) => {
-      const settings = (settingsCtx as unknown as { settings?: {
-        installSection?: (
-          owner: Context,
-          ns: string,
-          schema: unknown,
-          entry: AntigravityConfig,
-          hooks: { setSource: (source: () => AntigravityConfig) => void; onChange: () => void },
-        ) => void;
-      } }).settings;
-      settings?.installSection?.(ctx, 'antigravity-bridge', Config, config, {
-        setSource: (source) => { current = source; },
-        onChange: () => { (ctx.get('antigravity') as AntigravityService | undefined)?.updateConfig(current()); },
-      });
+      // The settings service is an undeclared inject in this plugin's compile
+      // env, so the typed Context has no `settings` property — cast once here.
+      const settings = (settingsCtx as unknown as {
+        settings: {
+          configure(presentation: { auto?: boolean }, owner?: unknown): () => void;
+        };
+      }).settings;
+      settingsCtx.effect(() => settings.configure({ auto: false }, ctx.fiber));
+    });
+    ctx.on('loader/volatile-update', () => {
+      (ctx.get('antigravity') as AntigravityService | undefined)?.updateConfig(current());
     });
 
     ctx.inject(['agents'] as any, () => {
@@ -3353,7 +3412,7 @@ Google Antigravity (AGY) is Google's multi-agent coding harness running locally 
     const tools = (ctx as any).tools;
     if (!tools?.register) return;
 
-    if (config.backend === 'localharness') {
+    if (current().backend === 'localharness') {
       tools.register({
         name: 'antigravity_delegate',
         description: 'Delegates a task to Antigravity (localharness backend) with optional model selection, session resuming, and multimodal attachments.',

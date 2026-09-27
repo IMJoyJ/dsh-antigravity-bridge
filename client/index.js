@@ -1,5 +1,5 @@
-// dsh-antigravity-bridge client half — registers a card in Settings → Plugins →
-// "Plugin configuration" that edits the `antigravity-bridge` settings namespace.
+// dsh-antigravity-bridge client half — registers a card on the sidebar Plugins
+// page that edits the `antigravity-bridge` settings namespace.
 //
 // Hand-written CJS bundle (no build chain; lives outside lib/ so tsdown's clean
 // does not wipe it): the shell's `window.__ModuleLoader__` loads this file and
@@ -35,7 +35,7 @@ window.__ModuleLoader__.load({
     }
 
     const NAMESPACE = "antigravity-bridge";
-    const inject = ["slots", "locale", "settingsScope"];
+    const inject = ["slots", "locale", "configForms"];
 
     const LOCALE = {
       en: {
@@ -147,18 +147,24 @@ window.__ModuleLoader__.load({
       ] });
     }
 
-    // Staged-form controller over the settings scope (same pattern as the
-    // fetch-proxy card): snapshot store over scope.getSnapshot, local staged
-    // edits flushed on save and reset on discard.
+    // Staged-form controller over the served namespace (same pattern as the
+    // vertex-bridge card): snapshot store over the config form scope, local
+    // staged edits flushed on save and reset on discard.
     class AgyBridgeController {
       constructor(scope) {
         this.scope = scope;
         this.staged = null;
         this.store = createSnapshotStore(this.projection());
-        scope.subscribe(() => {
+        this.unsub = scope.subscribe(() => {
           this.staged = null;
           this.publish();
         });
+      }
+      dispose() {
+        if (this.unsub) {
+          this.unsub();
+          this.unsub = null;
+        }
       }
       projection() {
         const snap = this.scope.getSnapshot();
@@ -227,17 +233,26 @@ window.__ModuleLoader__.load({
     }
 
     function apply(ctx) {
-      ctx.locale.register("antigravity-bridge", { en: LOCALE.en, zh: LOCALE.zh });
-
-      const scope = ctx.settingsScope.bind({ namespace: NAMESPACE });
-      const controller = new AgyBridgeController(scope);
-
-      ctx.slots.inject("settings.plugin.item", () => ctx.slots.register({
-        name: "settings.plugin.item",
-        key: "antigravity-bridge",
-        locale: "antigravity-bridge",
-        inject: () => controller.inject()
-      }, AntigravityBridgeCard));
+      ctx.effect(() => ctx.locale.register("antigravity-bridge", { en: LOCALE.en, zh: LOCALE.zh }), "dsh-antigravity-bridge: dictionaries");
+      const t = ctx.locale.bind("antigravity-bridge");
+      // The card lives exactly while the Host serves the namespace: leaving
+      // the row (or the namespace) unregisters the slot entry and disposes
+      // the controller, so a deployment without the bridge shows no trace.
+      ctx.effect(() => ctx.configForms.whileServed([NAMESPACE], () => {
+        const controller = new AgyBridgeController(ctx.configForms.get(NAMESPACE));
+        const offSlot = ctx.slots.inject("plugins.item", () => ctx.slots.register({
+          name: "plugins.item",
+          id: "antigravity-bridge",
+          order: 81,
+          label: () => t("agyTitle"),
+          locale: "antigravity-bridge",
+          inject: () => controller.inject()
+        }, AntigravityBridgeCard));
+        return () => {
+          offSlot();
+          controller.dispose();
+        };
+      }), "dsh-antigravity-bridge: page");
     }
 
     exports.apply = apply;

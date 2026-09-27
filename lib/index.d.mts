@@ -1,4 +1,4 @@
-import { Context, Service } from "@deepseek-ai/cordis";
+import { Context, Service, Volatile } from "@deepseek-ai/cordis";
 import Schema from "@deepseek-ai/schemastery";
 import { ChildProcess } from "node:child_process";
 import protobuf from "protobufjs";
@@ -744,10 +744,91 @@ interface AntigravityConfig {
   /** Message sent to the cascade for each tail-guard auto-continue (default "Continue"). */
   autoContinueMessage?: string;
 }
-declare const Config: Schema<AntigravityConfig>;
+declare const Config: Schema<Schemastery.ObjectS<NoInfer<{
+  backend: Schema<"hub" | "localharness", "hub" | "localharness", "volatile-defined">;
+  binaryPath: Schema<string, string, "volatile">;
+  protoDir: Schema<string, string, "volatile">;
+  defaultModel: Schema<string, string, "volatile-defined">;
+  appDataDir: Schema<string, string, "volatile">;
+  projectId: Schema<string, string, "volatile">;
+  hubAddress: Schema<string, string, "volatile">;
+  hubCsrfToken: Schema<string, string, "volatile">;
+  pollTimeoutMs: Schema<number, number, "volatile-defined">;
+  watchMaxMs: Schema<number, number, "volatile-defined">;
+  inlineCharBudget: Schema<number, number, "volatile-defined">;
+  sidebarVisible: Schema<boolean, boolean, "volatile-defined">;
+  approvalGraceMs: Schema<number, number, "volatile-defined">;
+  autoResume: Schema<NoInfer<Schemastery.ObjectS<NoInfer<{
+    enabled: Schema<boolean, boolean, "defined">;
+    maxRetries: Schema<number, number, "defined">;
+    message: Schema<string, string, "defined">;
+  }>>>, NoInfer<Schemastery.ObjectT<NoInfer<{
+    enabled: Schema<boolean, boolean, "defined">;
+    maxRetries: Schema<number, number, "defined">;
+    message: Schema<string, string, "defined">;
+  }>>>, "volatile-defined">;
+  autoContinueMax: Schema<number, number, "volatile-defined">;
+  autoContinueMessage: Schema<string, string, "volatile-defined">;
+  stallTimeoutMs: Schema<number, number, "volatile-defined">;
+}>>, Schemastery.ObjectT<NoInfer<{
+  backend: Schema<"hub" | "localharness", "hub" | "localharness", "volatile-defined">;
+  binaryPath: Schema<string, string, "volatile">;
+  protoDir: Schema<string, string, "volatile">;
+  defaultModel: Schema<string, string, "volatile-defined">;
+  appDataDir: Schema<string, string, "volatile">;
+  projectId: Schema<string, string, "volatile">;
+  hubAddress: Schema<string, string, "volatile">;
+  hubCsrfToken: Schema<string, string, "volatile">;
+  pollTimeoutMs: Schema<number, number, "volatile-defined">;
+  watchMaxMs: Schema<number, number, "volatile-defined">;
+  inlineCharBudget: Schema<number, number, "volatile-defined">;
+  sidebarVisible: Schema<boolean, boolean, "volatile-defined">;
+  approvalGraceMs: Schema<number, number, "volatile-defined">;
+  autoResume: Schema<NoInfer<Schemastery.ObjectS<NoInfer<{
+    enabled: Schema<boolean, boolean, "defined">;
+    maxRetries: Schema<number, number, "defined">;
+    message: Schema<string, string, "defined">;
+  }>>>, NoInfer<Schemastery.ObjectT<NoInfer<{
+    enabled: Schema<boolean, boolean, "defined">;
+    maxRetries: Schema<number, number, "defined">;
+    message: Schema<string, string, "defined">;
+  }>>>, "volatile-defined">;
+  autoContinueMax: Schema<number, number, "volatile-defined">;
+  autoContinueMessage: Schema<string, string, "volatile-defined">;
+  stallTimeoutMs: Schema<number, number, "volatile-defined">;
+}>>, "plain">;
+/** Live volatile references delivered by the Loader; snapshot into {@link AntigravityConfig} to read. */
+interface LiveAntigravityConfig {
+  backend: Volatile<'hub' | 'localharness'>;
+  binaryPath: Volatile<string | undefined>;
+  protoDir: Volatile<string | undefined>;
+  defaultModel: Volatile<string>;
+  appDataDir: Volatile<string | undefined>;
+  projectId: Volatile<string | undefined>;
+  hubAddress: Volatile<string | undefined>;
+  hubCsrfToken: Volatile<string | undefined>;
+  pollTimeoutMs: Volatile<number>;
+  watchMaxMs: Volatile<number>;
+  inlineCharBudget: Volatile<number>;
+  sidebarVisible: Volatile<boolean>;
+  approvalGraceMs: Volatile<number>;
+  autoResume: Volatile<AutoResumeConfig>;
+  autoContinueMax: Volatile<number>;
+  autoContinueMessage: Volatile<string>;
+  stallTimeoutMs: Volatile<number>;
+}
+/** Snapshot the live volatile references into plain values. The Loader commits Settings form edits into the running references and emits `loader/volatile-update`; `get()` reads the just-committed value. */
+declare function snapshotAntigravityConfig(live: LiveAntigravityConfig): AntigravityConfig;
 declare module '@deepseek-ai/cordis' {
   interface Context {
     antigravity: AntigravityService;
+  }
+  interface Events {
+    /**
+     * Volatile config values were committed into the running fiber without a
+     * remount; dispatched to the owning fiber only.
+     */
+    'loader/volatile-update'(paths: readonly (readonly string[])[]): void;
   }
 }
 interface RunOneShotOptions extends AgentInitConfig {
@@ -953,7 +1034,7 @@ declare class AntigravityService extends Service {
     silenced: boolean;
     infinite: boolean;
   };
-  /** Hot-swap live config (settings namespace onChange). All fields are read at use-time. */
+  /** Hot-swap live config (loader/volatile-update snapshot). All fields are read at use-time. */
   updateConfig(config: AntigravityConfig): void;
   /** Proactively push a settlement/approval notice to DSH session (steering / followup) with idempotency. */
   notifySettlementToDsh(run: HubRun, callerAgent?: any): void;
@@ -1088,10 +1169,62 @@ declare class AntigravityService extends Service {
 }
 declare class AntigravityBridgePlugin {
   static name: string;
-  static Config: Schema<AntigravityConfig>;
+  static Config: Schema<Schemastery.ObjectS<NoInfer<{
+    backend: Schema<"hub" | "localharness", "hub" | "localharness", "volatile-defined">;
+    binaryPath: Schema<string, string, "volatile">;
+    protoDir: Schema<string, string, "volatile">;
+    defaultModel: Schema<string, string, "volatile-defined">;
+    appDataDir: Schema<string, string, "volatile">;
+    projectId: Schema<string, string, "volatile">;
+    hubAddress: Schema<string, string, "volatile">;
+    hubCsrfToken: Schema<string, string, "volatile">;
+    pollTimeoutMs: Schema<number, number, "volatile-defined">;
+    watchMaxMs: Schema<number, number, "volatile-defined">;
+    inlineCharBudget: Schema<number, number, "volatile-defined">;
+    sidebarVisible: Schema<boolean, boolean, "volatile-defined">;
+    approvalGraceMs: Schema<number, number, "volatile-defined">;
+    autoResume: Schema<NoInfer<Schemastery.ObjectS<NoInfer<{
+      enabled: Schema<boolean, boolean, "defined">;
+      maxRetries: Schema<number, number, "defined">;
+      message: Schema<string, string, "defined">;
+    }>>>, NoInfer<Schemastery.ObjectT<NoInfer<{
+      enabled: Schema<boolean, boolean, "defined">;
+      maxRetries: Schema<number, number, "defined">;
+      message: Schema<string, string, "defined">;
+    }>>>, "volatile-defined">;
+    autoContinueMax: Schema<number, number, "volatile-defined">;
+    autoContinueMessage: Schema<string, string, "volatile-defined">;
+    stallTimeoutMs: Schema<number, number, "volatile-defined">;
+  }>>, Schemastery.ObjectT<NoInfer<{
+    backend: Schema<"hub" | "localharness", "hub" | "localharness", "volatile-defined">;
+    binaryPath: Schema<string, string, "volatile">;
+    protoDir: Schema<string, string, "volatile">;
+    defaultModel: Schema<string, string, "volatile-defined">;
+    appDataDir: Schema<string, string, "volatile">;
+    projectId: Schema<string, string, "volatile">;
+    hubAddress: Schema<string, string, "volatile">;
+    hubCsrfToken: Schema<string, string, "volatile">;
+    pollTimeoutMs: Schema<number, number, "volatile-defined">;
+    watchMaxMs: Schema<number, number, "volatile-defined">;
+    inlineCharBudget: Schema<number, number, "volatile-defined">;
+    sidebarVisible: Schema<boolean, boolean, "volatile-defined">;
+    approvalGraceMs: Schema<number, number, "volatile-defined">;
+    autoResume: Schema<NoInfer<Schemastery.ObjectS<NoInfer<{
+      enabled: Schema<boolean, boolean, "defined">;
+      maxRetries: Schema<number, number, "defined">;
+      message: Schema<string, string, "defined">;
+    }>>>, NoInfer<Schemastery.ObjectT<NoInfer<{
+      enabled: Schema<boolean, boolean, "defined">;
+      maxRetries: Schema<number, number, "defined">;
+      message: Schema<string, string, "defined">;
+    }>>>, "volatile-defined">;
+    autoContinueMax: Schema<number, number, "volatile-defined">;
+    autoContinueMessage: Schema<string, string, "volatile-defined">;
+    stallTimeoutMs: Schema<number, number, "volatile-defined">;
+  }>>, "plain">;
   static inject: string[];
-  constructor(ctx: Context, config: AntigravityConfig);
+  constructor(ctx: Context, config: LiveAntigravityConfig);
 }
 //#endregion
-export { ANTIGRAVITY_MODELS, AUTO_CONTINUE_QUIET_MS, ActiveBackgroundTask, AgentInitConfig, AgentStep, AntigravityAgent, AntigravityConfig, AntigravityEngine, AntigravityModelInfo, AntigravityService, AutoContinueReason, AutoResumeConfig, BACKOFF_SCHEDULE_MS, CASCADE_RUN_ACTIVE_CODES, CASCADE_RUN_ACTIVE_NAMES, CORTEX_ACTIVE_STATUS_CODES, CORTEX_ACTIVE_STATUS_NAMES, CORTEX_TERMINAL_STATUS_CODES, CORTEX_TERMINAL_STATUS_NAMES, CascadeDetailedResult, Config, ConversationSummary, ConversationTreeNode, DEFAULT_AUTO_CONTINUE_MAX, DEFAULT_AUTO_CONTINUE_MESSAGE, DEFAULT_MODEL_ID, DEFAULT_WATCH_MAX_MS, EngineConfig, ErrorClassification, HarnessSessionInfo, HubCallOptions, HubClient, HubInfo, HubRun, IDE_TIMER_SYSTEM_MESSAGE_REGEX, ListConversationsOptions, LoadedTranscript, MediaInput, OBSERVATIONAL_TOOL_NAMES, PendingToolApproval, PersistedBridgeState, PersistedQueuedMessage, PersistedRun, PollResult, PromptContent, PromptItem, ProtoMediaPart, PruneStaleTasksOptions, RunOneShotOptions, SETTLE_CONFIRMATION_INTERVAL_MS, SETTLE_STABLE_MS, SessionContinuationMode, SettleGuardAction, SettleGuardDecision, SettleGuardInput, SettlementNoticePayload, SettlementOutboxItem, StartCascadeOptions, StatusTransition, StructuredCascadeTasksResult, TaskSilenceEntry, TokenUsage, TrajectoryResponse, TrajectoryStep, TrajectoryStepDetail, TrajectoryStepMetadata, TranscriptSnapshot, TranscriptStep, TranscriptTailKind, TransientErrorSignature, buildConversationGraph, buildSettlementNotice, classifyError, clearHubCache, computeTranscriptHash, decideTailSettle, decodeProtobufTaskDetails, AntigravityBridgePlugin as default, discoverHub, extractErrorMessage, fileToMedia, formatAuthExpiredTerminalError, formatExhaustedRetryError, getAutoResumeBackoffMs, getConversationTree, getDefaultAppDataDir, getMaxRetriesForSignature, getStepEffectiveStatus, guessMimeType, isAuthTokenExpiredError, isCascadeRunStatusActive, isCortexStatusActive, isCortexStatusTerminal, isNetworkError, isStaleHubError, isTaskIdMatch, isTransientRetryableError, isWaitingSpeech, listConversations, loadTranscriptFile, normalizeModelName, normalizePromptParts, parseStructuredTrajectoryTasks, parseTranscript, pollTranscript, pruneStaleBackgroundTasks, readCascadeTranscript, readStructuredTasksFromSqlite, renderAsciiTree };
+export { ANTIGRAVITY_MODELS, AUTO_CONTINUE_QUIET_MS, ActiveBackgroundTask, AgentInitConfig, AgentStep, AntigravityAgent, AntigravityConfig, AntigravityEngine, AntigravityModelInfo, AntigravityService, AutoContinueReason, AutoResumeConfig, BACKOFF_SCHEDULE_MS, CASCADE_RUN_ACTIVE_CODES, CASCADE_RUN_ACTIVE_NAMES, CORTEX_ACTIVE_STATUS_CODES, CORTEX_ACTIVE_STATUS_NAMES, CORTEX_TERMINAL_STATUS_CODES, CORTEX_TERMINAL_STATUS_NAMES, CascadeDetailedResult, Config, ConversationSummary, ConversationTreeNode, DEFAULT_AUTO_CONTINUE_MAX, DEFAULT_AUTO_CONTINUE_MESSAGE, DEFAULT_MODEL_ID, DEFAULT_WATCH_MAX_MS, EngineConfig, ErrorClassification, HarnessSessionInfo, HubCallOptions, HubClient, HubInfo, HubRun, IDE_TIMER_SYSTEM_MESSAGE_REGEX, ListConversationsOptions, LiveAntigravityConfig, LoadedTranscript, MediaInput, OBSERVATIONAL_TOOL_NAMES, PendingToolApproval, PersistedBridgeState, PersistedQueuedMessage, PersistedRun, PollResult, PromptContent, PromptItem, ProtoMediaPart, PruneStaleTasksOptions, RunOneShotOptions, SETTLE_CONFIRMATION_INTERVAL_MS, SETTLE_STABLE_MS, SessionContinuationMode, SettleGuardAction, SettleGuardDecision, SettleGuardInput, SettlementNoticePayload, SettlementOutboxItem, StartCascadeOptions, StatusTransition, StructuredCascadeTasksResult, TaskSilenceEntry, TokenUsage, TrajectoryResponse, TrajectoryStep, TrajectoryStepDetail, TrajectoryStepMetadata, TranscriptSnapshot, TranscriptStep, TranscriptTailKind, TransientErrorSignature, buildConversationGraph, buildSettlementNotice, classifyError, clearHubCache, computeTranscriptHash, decideTailSettle, decodeProtobufTaskDetails, AntigravityBridgePlugin as default, discoverHub, extractErrorMessage, fileToMedia, formatAuthExpiredTerminalError, formatExhaustedRetryError, getAutoResumeBackoffMs, getConversationTree, getDefaultAppDataDir, getMaxRetriesForSignature, getStepEffectiveStatus, guessMimeType, isAuthTokenExpiredError, isCascadeRunStatusActive, isCortexStatusActive, isCortexStatusTerminal, isNetworkError, isStaleHubError, isTaskIdMatch, isTransientRetryableError, isWaitingSpeech, listConversations, loadTranscriptFile, normalizeModelName, normalizePromptParts, parseStructuredTrajectoryTasks, parseTranscript, pollTranscript, pruneStaleBackgroundTasks, readCascadeTranscript, readStructuredTasksFromSqlite, renderAsciiTree, snapshotAntigravityConfig };
 //# sourceMappingURL=index.d.mts.map
