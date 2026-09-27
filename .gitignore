@@ -6,6 +6,11 @@ node_modules/
 *.tmp-*
 *.log
 
+# experimental / superseded build outputs (never commit; lib/ is the tracked build)
+lib-next/
+lib-next-bundle/
+lib.bak-*/
+
 # OS & Editor
 .DS_Store
 Thumbs.db
