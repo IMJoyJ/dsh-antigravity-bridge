@@ -57,6 +57,27 @@ export interface ActiveBackgroundTask {
   isSchedule?: boolean;
 }
 
+/**
+ * 迟滞窗口 (ms)：后台任务的「迟滞性」观测窗口。
+ *
+ * The hub does NOT register a cascade's background tasks at StartCascade /
+ * SendUserCascadeMessage time. The executor has to run for a few seconds before
+ * GetCascadeTrajectory starts carrying `taskDetails` for it, so a probe issued
+ * right after launch legitimately reads `activeBackgroundTasks: []`.
+ *
+ * An empty task list inside this window therefore means "not observed yet", NOT
+ * "there is no background work". Reading it as "none" settles a lane that is
+ * still running and forces a later revert-from-done — the false-idle defect.
+ *
+ * Size rationale (latency-neutral by construction): the settle path already
+ * requires `settleStableMs` (15s) of transcript stillness before it even records
+ * a candidate, plus `SETTLE_CONFIRMATION_INTERVAL_MS` (10s) of two-phase
+ * confirmation. The last transcript movement can never predate the launch, so
+ * the earliest possible settle is launch + ~25s. A 20s window therefore sits
+ * strictly inside waiting that already happens and adds no settle latency.
+ */
+export const LAUNCH_OBSERVATION_GRACE_MS = 20_000;
+
 export interface TranscriptSnapshot {
   maxStepIndex: number;
   engaged: boolean;
@@ -689,6 +710,8 @@ export function parseTranscript(
 
 export type AutoContinueReason = 'tool-tail' | 'no-assistant-text';
 
+export type SettleGuardReason = AutoContinueReason | 'background-task' | 'background-task-unobserved';
+
 export type SettleGuardAction = 'settle' | 'settle-exhausted' | 'continue' | 'wait' | 'wait-background';
 
 export interface SettleGuardInput {
@@ -702,6 +725,15 @@ export interface SettleGuardInput {
   hasActiveChildren?: boolean;
   /** Turn-level active status from GetCascadeTrajectory (CascadeRunStatus RUNNING/BUSY/CANCELING). */
   isCascadeActive?: boolean;
+  /**
+   * How long ago the bridge recorded this cascade lifecycle (launch / re-arm)
+   * — i.e. `now - HubRun.startedAt`. Optional: omitted means "no launch
+   * information available" and disables the {@link LAUNCH_OBSERVATION_GRACE_MS}
+   * hysteresis, preserving the pre-fix behaviour for callers that cannot supply it.
+   */
+  sinceLifecycleStartMs?: number;
+  /** Override for the launch-hysteresis window (tests / tuning). Defaults to {@link LAUNCH_OBSERVATION_GRACE_MS}. */
+  launchObservationGraceMs?: number;
   /** How long the transcript has produced no new steps (ms). */
   tailQuietMs: number;
   /** Auto-continue nudges already spent on the current turn. */
@@ -716,7 +748,7 @@ export interface SettleGuardInput {
 
 export interface SettleGuardDecision {
   action: SettleGuardAction;
-  reason?: AutoContinueReason | 'background-task';
+  reason?: SettleGuardReason;
   activeTasks?: ActiveBackgroundTask[];
 }
 
@@ -729,6 +761,13 @@ export interface SettleGuardDecision {
  * - (0) `background-task`: active background tasks are still running in the
  *   session. Any background task completion sends a message to AGY session from
  *   the hub, waking it up. The turn is NOT complete; do not settle or continue.
+ * - (0.5) `background-task-unobserved`: launch hysteresis. The hub only
+ *   registers a cascade's background tasks after its executor has run for a few
+ *   seconds, so a task list read shortly after launch is empty *because it was
+ *   not populated yet*, not because there is no background work. Inside
+ *   {@link LAUNCH_OBSERVATION_GRACE_MS} an empty observation is UNKNOWN, so the
+ *   honest answer is "keep polling" instead of settling a lane that is still
+ *   running (which the done-residency watcher would later have to revert).
  * - (a) `tool-tail`: the LAST valid entry is a tool call or tool result with no
  *   assistant text after it. `isFinished` is then stale state left behind by an
  *   earlier final text or CHECKPOINT (executor DONE steps never reset it) — the
@@ -764,6 +803,24 @@ export function decideTailSettle(input: SettleGuardInput): SettleGuardDecision {
   // Turn-level cascade active status (CascadeRunStatus RUNNING/BUSY/CANCELING from GetCascadeTrajectory)
   if (input.isCascadeActive) {
     return { action: 'wait-background', reason: 'background-task' };
+  }
+
+  // (0.5) Launch hysteresis. The three liveness guards above all read the SAME
+  // hub observation, and that observation is empty until the executor has been
+  // running for a few seconds. So an empty list during the window after launch
+  // is UNKNOWN, not "none" — model it as "still polling" (the same action a
+  // live turn takes) instead of letting the settle path below conclude idleness
+  // from a list the hub had not filled in yet.
+  //
+  // Deliberately placed AFTER the liveness guards so a positively-observed live
+  // cascade still reports 'wait-background' (with its task list), and it never
+  // overrides an explicit caller's `sinceLifecycleStartMs === undefined`, which
+  // keeps every pre-existing caller on the old behaviour.
+  if (
+    input.sinceLifecycleStartMs !== undefined &&
+    input.sinceLifecycleStartMs < (input.launchObservationGraceMs ?? LAUNCH_OBSERVATION_GRACE_MS)
+  ) {
+    return { action: 'wait', reason: 'background-task-unobserved' };
   }
 
   // Not at a settlement point: errors / pending approvals / live turns are

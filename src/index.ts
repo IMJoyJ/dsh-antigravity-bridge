@@ -26,6 +26,7 @@ import {
   loadTranscriptFile,
   PendingToolApproval,
   decideTailSettle,
+  LAUNCH_OBSERVATION_GRACE_MS,
   pruneStaleBackgroundTasks,
   parseStructuredTrajectoryTasks,
   readStructuredTasksFromSqlite,
@@ -67,7 +68,15 @@ export const SETTLE_STABLE_MS = 15_000;
 export const SETTLE_CONFIRMATION_INTERVAL_MS = 10_000;
 /** Default absolute cap on background lifecycle watcher in ms (12h). */
 export const DEFAULT_WATCH_MAX_MS = 43_200_000;
-
+/**
+ * Max consecutive settlement/approval notices that may WAKE one agent without
+ * an intervening model-authored tool call against an existing lane. Bounds the
+ * self-excitation loop "cascade done → wake → model delegates again → done →
+ * wake". An idle caller is still woken past the cap (see
+ * `AntigravityService.deliverMessageToAgent`): the budget throttles, it never
+ * silently discards an undelivered notice.
+ */
+export const MAX_CONSECUTIVE_NOTICE_WAKES = 5;
 export interface AntigravityConfig {
   backend?: 'hub' | 'localharness';
   binaryPath?: string;
@@ -454,6 +463,13 @@ export class AntigravityService extends Service {
   private saveStateTimer?: NodeJS.Timeout;
   stateInitPromise?: Promise<void>;
   private globalTaskSilences = new Map<string, TaskSilenceEntry>();
+  /**
+   * Consecutive notice-driven wakes per caller agent id. Bounds the
+   * self-excitation loop "cascade done → wake the model → model launches another
+   * cascade → done → wake again". Refunded by {@link noteModelActivity} when the
+   * model itself drives an existing lane.
+   */
+  private noticeWakeCount = new Map<string, number>();
   private trajectoryTaskCache = new Map<
     string,
     {
@@ -1014,41 +1030,147 @@ export class AntigravityService extends Service {
     }
   }
 
+  /**
+   * Hand one settlement/approval notice to a DSH agent.
+   *
+   * Three properties this method guarantees, because a false "delivered" is
+   * unrecoverable silence:
+   *
+   * 1. **Evidence-based success.** `delivered` is returned true ONLY when a real
+   *    callable actually accepted the message. The previous version used
+   *    `agent.followup?.(msg)` / `agent.steer?.(msg)` and then unconditionally
+   *    `return true`: an optional call on an agent that has neither method
+   *    short-circuits silently, so the caller latched
+   *    `run.lastNotifiedTransition` (permanently suppressing that notice through
+   *    `notifySettlementToDsh`'s idempotency check) and never enqueued the
+   *    settlement outbox. That is the "notification never arrives, and is never
+   *    retried" failure.
+   * 2. **Caller-scoped targeting.** Candidates are the bound agent, the agent
+   *    resolved from `callerAgentId`, and only then — as a last resort — any
+   *    live agent. The previous version broadcast to the FIRST live agent from
+   *    the registry, which can be an unrelated session, and still reported it as
+   *    delivered to the caller.
+   * 3. **Wake budget.** `steer()`/`followup()` are wakeup-capable
+   *    (`Agent.send(..., wakeup: true)`), so an unbounded notice stream can
+   *    self-excite: cascade done → wake the model → the model launches another
+   *    cascade → done → wake again. Wakes are capped per agent; past the cap a
+   *    BUSY caller is served through the non-waking `inject()` seam (its running
+   *    turn still claims next-step inbox entries). An IDLE caller is still woken,
+   *    loudly, because dropping a settlement notice into an idle agent's inbox is
+   *    exactly the unrecoverable silence this method exists to prevent — the
+   *    budget throttles, it never silently discards.
+   */
   private deliverMessageToAgent(targetAgent: any, message: any): boolean {
-    if (targetAgent && !targetAgent.disposed) {
-      try {
-        if (targetAgent.status === 'idle') {
-          targetAgent.followup?.(message);
-        } else {
-          targetAgent.steer?.(message);
-        }
-        return true;
-      } catch {
-        // fallback to active agents
-      }
+    const candidates: any[] = [];
+    const pushCandidate = (agent: any) => {
+      if (agent && !candidates.includes(agent)) candidates.push(agent);
+    };
+    pushCandidate(targetAgent);
+    pushCandidate(this.findLiveAgent(this.resolveAgentId(targetAgent)));
+    try {
+      for (const ag of this.getAgentsService()?.list?.() || []) pushCandidate(ag);
+    } catch {
+      // no registry available — the bound/resolved candidates still apply
     }
 
+    for (const agent of candidates) {
+      if (!agent || agent.disposed) continue;
+      // `steer` is the single wakeup-capable seam: it targets the next step and
+      // wakes the driver, so it covers both the idle and the busy caller. An
+      // agent that exposes only `followup` (also wakeup-capable) is still served,
+      // but only after `steer` is proven unavailable.
+      if (this.wakeBudgetSpent(this.resolveAgentId(agent)) && agent.status !== 'idle') {
+        // Over budget and already running: queue without starting a driver. The
+        // live turn claims next-step entries, so this still lands this turn.
+        if (this.invokeAgentSeam(agent, 'inject', message)) {
+          this.finishDelivery(agent, false);
+          return true;
+        }
+      }
+      if (this.invokeAgentSeam(agent, 'steer', message)) {
+        this.finishDelivery(agent, true);
+        return true;
+      }
+      if (this.invokeAgentSeam(agent, 'followup', message)) {
+        this.finishDelivery(agent, true);
+        return true;
+      }
+    }
+    return false;
+  }
+
+  /**
+   * Invoke one agent delivery seam, proving the method exists first.
+   * @returns true only when the call actually ran without throwing.
+   */
+  private invokeAgentSeam(agent: any, seam: 'steer' | 'followup' | 'inject', message: any): boolean {
+    const fn = agent?.[seam];
+    if (typeof fn !== 'function') return false;
     try {
-      const agentsService = this.getAgentsService();
-      const liveAgents = agentsService?.list?.() || [];
-      for (const ag of liveAgents) {
-        if (ag && !ag.disposed) {
-          try {
-            if (ag.status === 'idle') {
-              ag.followup?.(message);
-            } else {
-              ag.steer?.(message);
-            }
-            return true;
-          } catch {
-            // ignore
-          }
+      fn.call(agent, message);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  /** Whether this agent has already been woken {@link MAX_CONSECUTIVE_NOTICE_WAKES} times in a row. */
+  private wakeBudgetSpent(agentId: string | undefined): boolean {
+    if (!agentId) return false;
+    return (this.noticeWakeCount.get(agentId) ?? 0) >= MAX_CONSECUTIVE_NOTICE_WAKES;
+  }
+
+  /**
+   * Account for one delivered notice and checkpoint the session it was queued
+   * into. Only a wakeup-capable seam spends budget; a non-waking injection does
+   * not, because it cannot start the self-excitation loop it exists to bound.
+   */
+  private finishDelivery(agent: any, woke: boolean): void {
+    const key = this.resolveAgentId(agent);
+    if (key) {
+      if (woke) {
+        const spent = (this.noticeWakeCount.get(key) ?? 0) + 1;
+        this.noticeWakeCount.set(key, spent);
+        if (spent > MAX_CONSECUTIVE_NOTICE_WAKES) {
+          console.warn(
+            `[antigravity][notify] wake budget exceeded for agent ${key} (${spent} consecutive notice wakes); `
+            + 'an IDLE caller is still being woken because dropping a settlement notice is unrecoverable. '
+            + 'A model-authored antigravity_check_run / antigravity_send_message against this lane refunds the budget.',
+          );
+        }
+      }
+    }
+    try {
+      const sessions = (this.ctx as any).sessions;
+      if (sessions?.flush && agent?.session) {
+        const flushed = sessions.flush(agent.session);
+        if (flushed && typeof flushed.catch === 'function') {
+          flushed.catch(() => {});
         }
       }
     } catch {
-      // ignore
+      // flush is a durability optimisation, never a delivery requirement
     }
-    return false;
+  }
+
+  /** Best-effort identity for an agent, used to scope fallback delivery. */
+  private resolveAgentId(agent: any): string | undefined {
+    const id = agent?.id ?? agent?.session?.header?.id ?? agent?.name;
+    return id === undefined || id === null ? undefined : String(id);
+  }
+
+  /**
+   * Refund `callerAgent`'s notice wake budget because the model itself is
+   * actively driving this lane.
+   *
+   * Called ONLY from `antigravity_check_run` and `antigravity_send_message`.
+   * `antigravity_delegate` deliberately does NOT refund: "notice woke the model
+   * → model launched another cascade → done → notice" is precisely the loop the
+   * budget bounds, and refunding on every delegate would defeat it.
+   */
+  noteModelActivity(callerAgent: any): void {
+    const key = this.resolveAgentId(callerAgent);
+    if (key) this.noticeWakeCount.delete(key);
   }
 
   /** Normalize a task id for dictionary matching. */
@@ -2456,6 +2578,15 @@ export class AntigravityService extends Service {
         //    polling; once the budget is spent, settle anyway and flag
         //    autoContinueExhausted so callers can verify the outcome.
         if (snap && !snap.error && !snap.pendingApproval && snap.isFinished) {
+          // D2 launch hysteresis. `run.startedAt` is the bridge's own record of
+          // when this lifecycle (launch, or re-arm on a new turn into the same
+          // cascade) was issued. The hub only publishes `taskDetails` for a
+          // cascade after its executor has been running for a few seconds, so an
+          // empty task list read inside LAUNCH_OBSERVATION_GRACE_MS is
+          // "unobserved", not "none". Feeding it to the settle gate as "none"
+          // settles a lane that is still running and forces a revert-from-done
+          // moments later — the false-idle defect.
+          const sinceLifecycleStartMs = Date.now() - (run.startedAt ?? Date.now());
           const decision = decideTailSettle({
             snap,
             tailQuietMs: quietMs,
@@ -2466,6 +2597,8 @@ export class AntigravityService extends Service {
             blockingBackgroundTasks: blockingTasks,
             hasActiveChildren: snap?.hasActiveChildren || structuredTasks.hasActiveChildren,
             isCascadeActive: structuredTasks.isCascadeActive,
+            sinceLifecycleStartMs,
+            launchObservationGraceMs: LAUNCH_OBSERVATION_GRACE_MS,
           });
 
           if (decision.action === 'wait-background') {
@@ -2491,11 +2624,19 @@ export class AntigravityService extends Service {
             continue;
           }
 
-          if (decision.action === 'continue' && decision.reason && decision.reason !== 'background-task') {
+          // Narrow the reason explicitly: only the two auto-continue reasons may
+          // drive a nudge. ('background-task'/'background-task-unobserved' are
+          // only ever paired with wait-background/wait, so they never reach here.)
+          const continueReason: AutoContinueReason | undefined =
+            decision.reason === 'tool-tail' || decision.reason === 'no-assistant-text'
+              ? decision.reason
+              : undefined;
+
+          if (decision.action === 'continue' && continueReason) {
             if (run.settleCandidateSnapshot) {
               run.settleCandidateSnapshot = undefined;
             }
-            const sent = await this.sendAutoContinue(cascadeId, run, snap, decision.reason);
+            const sent = await this.sendAutoContinue(cascadeId, run, snap, continueReason);
             if (sent) {
               // Fresh observation window: the watcher re-evaluates against the
               // model's response to the nudge, not the stale pre-nudge tail.
@@ -2576,7 +2717,11 @@ export class AntigravityService extends Service {
               freshHash === run.settleCandidateSnapshot.transcriptHash &&
               freshActiveTasks.length === 0 &&
               !freshTasks.hasActiveChildren &&
-              !freshTasks.isCascadeActive;
+              !freshTasks.isCascadeActive &&
+              // D2: round 2 must agree that the launch observation window has
+              // closed. `freshActiveTasks.length === 0` is only evidence of
+              // "no background work" once the hub has had time to publish any.
+              Date.now() - (run.startedAt ?? Date.now()) >= LAUNCH_OBSERVATION_GRACE_MS;
 
             if (!isConsistent) {
               console.log(
@@ -3106,6 +3251,24 @@ export class AntigravityService extends Service {
       }
     }
 
+    // D2 launch hysteresis, running/idle half. `existingRun.startedAt` is the
+    // bridge's own record of when it issued the launch. Inside
+    // LAUNCH_OBSERVATION_GRACE_MS the hub has not necessarily registered the
+    // cascade's background tasks yet, so "no active watcher, no running status,
+    // nothing in the transcript" is UNKNOWN rather than evidence of idleness.
+    // Taking the idle path there re-arms the run and sends into a lane that is
+    // still working — the message vanishes hub-side with no error, and any
+    // interrupt issued later lands on a cascade that never stopped.
+    if (!isRunning && !isConfirmedDead && existingRun?.startedAt !== undefined) {
+      if (Date.now() - existingRun.startedAt < LAUNCH_OBSERVATION_GRACE_MS) {
+        isRunning = true;
+        console.warn(
+          `[antigravity] Cascade ${conversationId} launched ${Math.round((Date.now() - existingRun.startedAt) / 1000)}s ago; `
+          + 'treating it as running (launch observation window) instead of concluding idleness from an empty task list.',
+        );
+      }
+    }
+
     if (isRunning) {
       if (mode === 'turn-end') {
         // Ensure active watcher exists so flushMessageQueue will be triggered upon turn completion!
@@ -3523,6 +3686,9 @@ Google Antigravity (AGY) is Google's multi-agent coding harness running locally 
         output: { schema: { type: 'object' }, render: renderText },
         execute: async (args: { run_id: string; wait?: boolean | number }, execContext?: any) => {
           const callerAgent = execContext?.agent;
+          // Model-authored polling of an existing lane: the model is demonstrably
+          // engaged, so refund its notice wake budget.
+          (ctx.get('antigravity') as AntigravityService | undefined)?.noteModelActivity(callerAgent);
           return await (ctx.get('antigravity') as AntigravityService).hubCheckRun(args.run_id, args.wait, callerAgent);
         },
       });
@@ -3556,6 +3722,8 @@ Google Antigravity (AGY) is Google's multi-agent coding harness running locally 
           execContext?: any,
         ) => {
           const callerAgent = execContext?.agent;
+          // Model-authored steering of an existing lane: refund the wake budget.
+          (ctx.get('antigravity') as AntigravityService | undefined)?.noteModelActivity(callerAgent);
           const res = await (ctx.get('antigravity') as AntigravityService).hubSendMessage(
             args.conversation_id,
             args.content,

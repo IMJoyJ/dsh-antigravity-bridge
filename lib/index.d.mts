@@ -349,6 +349,26 @@ interface ActiveBackgroundTask {
   durationSeconds?: number;
   isSchedule?: boolean;
 }
+/**
+ * 迟滞窗口 (ms)：后台任务的「迟滞性」观测窗口。
+ *
+ * The hub does NOT register a cascade's background tasks at StartCascade /
+ * SendUserCascadeMessage time. The executor has to run for a few seconds before
+ * GetCascadeTrajectory starts carrying `taskDetails` for it, so a probe issued
+ * right after launch legitimately reads `activeBackgroundTasks: []`.
+ *
+ * An empty task list inside this window therefore means "not observed yet", NOT
+ * "there is no background work". Reading it as "none" settles a lane that is
+ * still running and forces a later revert-from-done — the false-idle defect.
+ *
+ * Size rationale (latency-neutral by construction): the settle path already
+ * requires `settleStableMs` (15s) of transcript stillness before it even records
+ * a candidate, plus `SETTLE_CONFIRMATION_INTERVAL_MS` (10s) of two-phase
+ * confirmation. The last transcript movement can never predate the launch, so
+ * the earliest possible settle is launch + ~25s. A 20s window therefore sits
+ * strictly inside waiting that already happens and adds no settle latency.
+ */
+declare const LAUNCH_OBSERVATION_GRACE_MS = 20000;
 interface TranscriptSnapshot {
   maxStepIndex: number;
   engaged: boolean;
@@ -418,6 +438,7 @@ declare const IDE_TIMER_SYSTEM_MESSAGE_REGEX: RegExp;
  */
 declare function parseTranscript(lines: string[], baselineStepIndex?: number, cascadeId?: string): ParsedTranscript;
 type AutoContinueReason = 'tool-tail' | 'no-assistant-text';
+type SettleGuardReason = AutoContinueReason | 'background-task' | 'background-task-unobserved';
 type SettleGuardAction = 'settle' | 'settle-exhausted' | 'continue' | 'wait' | 'wait-background';
 interface SettleGuardInput {
   snap: Pick<TranscriptSnapshot, 'isFinished' | 'plannerContents' | 'tailKind' | 'engaged' | 'pendingApproval' | 'error' | 'activeBackgroundTasks' | 'hasActiveChildren'>;
@@ -427,6 +448,15 @@ interface SettleGuardInput {
   hasActiveChildren?: boolean;
   /** Turn-level active status from GetCascadeTrajectory (CascadeRunStatus RUNNING/BUSY/CANCELING). */
   isCascadeActive?: boolean;
+  /**
+   * How long ago the bridge recorded this cascade lifecycle (launch / re-arm)
+   * — i.e. `now - HubRun.startedAt`. Optional: omitted means "no launch
+   * information available" and disables the {@link LAUNCH_OBSERVATION_GRACE_MS}
+   * hysteresis, preserving the pre-fix behaviour for callers that cannot supply it.
+   */
+  sinceLifecycleStartMs?: number;
+  /** Override for the launch-hysteresis window (tests / tuning). Defaults to {@link LAUNCH_OBSERVATION_GRACE_MS}. */
+  launchObservationGraceMs?: number;
   /** How long the transcript has produced no new steps (ms). */
   tailQuietMs: number;
   /** Auto-continue nudges already spent on the current turn. */
@@ -440,7 +470,7 @@ interface SettleGuardInput {
 }
 interface SettleGuardDecision {
   action: SettleGuardAction;
-  reason?: AutoContinueReason | 'background-task';
+  reason?: SettleGuardReason;
   activeTasks?: ActiveBackgroundTask[];
 }
 /**
@@ -452,6 +482,13 @@ interface SettleGuardDecision {
  * - (0) `background-task`: active background tasks are still running in the
  *   session. Any background task completion sends a message to AGY session from
  *   the hub, waking it up. The turn is NOT complete; do not settle or continue.
+ * - (0.5) `background-task-unobserved`: launch hysteresis. The hub only
+ *   registers a cascade's background tasks after its executor has run for a few
+ *   seconds, so a task list read shortly after launch is empty *because it was
+ *   not populated yet*, not because there is no background work. Inside
+ *   {@link LAUNCH_OBSERVATION_GRACE_MS} an empty observation is UNKNOWN, so the
+ *   honest answer is "keep polling" instead of settling a lane that is still
+ *   running (which the done-residency watcher would later have to revert).
  * - (a) `tool-tail`: the LAST valid entry is a tool call or tool result with no
  *   assistant text after it. `isFinished` is then stale state left behind by an
  *   earlier final text or CHECKPOINT (executor DONE steps never reset it) — the
@@ -714,6 +751,15 @@ declare const SETTLE_STABLE_MS = 15000;
 declare const SETTLE_CONFIRMATION_INTERVAL_MS = 10000;
 /** Default absolute cap on background lifecycle watcher in ms (12h). */
 declare const DEFAULT_WATCH_MAX_MS = 43200000;
+/**
+ * Max consecutive settlement/approval notices that may WAKE one agent without
+ * an intervening model-authored tool call against an existing lane. Bounds the
+ * self-excitation loop "cascade done → wake → model delegates again → done →
+ * wake". An idle caller is still woken past the cap (see
+ * `AntigravityService.deliverMessageToAgent`): the budget throttles, it never
+ * silently discards an undelivered notice.
+ */
+declare const MAX_CONSECUTIVE_NOTICE_WAKES = 5;
 interface AntigravityConfig {
   backend?: 'hub' | 'localharness';
   binaryPath?: string;
@@ -994,6 +1040,13 @@ declare class AntigravityService extends Service {
   private saveStateTimer?;
   stateInitPromise?: Promise<void>;
   private globalTaskSilences;
+  /**
+   * Consecutive notice-driven wakes per caller agent id. Bounds the
+   * self-excitation loop "cascade done → wake the model → model launches another
+   * cascade → done → wake again". Refunded by {@link noteModelActivity} when the
+   * model itself drives an existing lane.
+   */
+  private noticeWakeCount;
   private trajectoryTaskCache;
   private disposed;
   constructor(ctx: Context, config: AntigravityConfig);
@@ -1009,7 +1062,62 @@ declare class AntigravityService extends Service {
   private retrySettlementOutbox;
   private enqueueSettlementOutbox;
   private removeFromSettlementOutbox;
+  /**
+   * Hand one settlement/approval notice to a DSH agent.
+   *
+   * Three properties this method guarantees, because a false "delivered" is
+   * unrecoverable silence:
+   *
+   * 1. **Evidence-based success.** `delivered` is returned true ONLY when a real
+   *    callable actually accepted the message. The previous version used
+   *    `agent.followup?.(msg)` / `agent.steer?.(msg)` and then unconditionally
+   *    `return true`: an optional call on an agent that has neither method
+   *    short-circuits silently, so the caller latched
+   *    `run.lastNotifiedTransition` (permanently suppressing that notice through
+   *    `notifySettlementToDsh`'s idempotency check) and never enqueued the
+   *    settlement outbox. That is the "notification never arrives, and is never
+   *    retried" failure.
+   * 2. **Caller-scoped targeting.** Candidates are the bound agent, the agent
+   *    resolved from `callerAgentId`, and only then — as a last resort — any
+   *    live agent. The previous version broadcast to the FIRST live agent from
+   *    the registry, which can be an unrelated session, and still reported it as
+   *    delivered to the caller.
+   * 3. **Wake budget.** `steer()`/`followup()` are wakeup-capable
+   *    (`Agent.send(..., wakeup: true)`), so an unbounded notice stream can
+   *    self-excite: cascade done → wake the model → the model launches another
+   *    cascade → done → wake again. Wakes are capped per agent; past the cap a
+   *    BUSY caller is served through the non-waking `inject()` seam (its running
+   *    turn still claims next-step inbox entries). An IDLE caller is still woken,
+   *    loudly, because dropping a settlement notice into an idle agent's inbox is
+   *    exactly the unrecoverable silence this method exists to prevent — the
+   *    budget throttles, it never silently discards.
+   */
   private deliverMessageToAgent;
+  /**
+   * Invoke one agent delivery seam, proving the method exists first.
+   * @returns true only when the call actually ran without throwing.
+   */
+  private invokeAgentSeam;
+  /** Whether this agent has already been woken {@link MAX_CONSECUTIVE_NOTICE_WAKES} times in a row. */
+  private wakeBudgetSpent;
+  /**
+   * Account for one delivered notice and checkpoint the session it was queued
+   * into. Only a wakeup-capable seam spends budget; a non-waking injection does
+   * not, because it cannot start the self-excitation loop it exists to bound.
+   */
+  private finishDelivery;
+  /** Best-effort identity for an agent, used to scope fallback delivery. */
+  private resolveAgentId;
+  /**
+   * Refund `callerAgent`'s notice wake budget because the model itself is
+   * actively driving this lane.
+   *
+   * Called ONLY from `antigravity_check_run` and `antigravity_send_message`.
+   * `antigravity_delegate` deliberately does NOT refund: "notice woke the model
+   * → model launched another cascade → done → notice" is precisely the loop the
+   * budget bounds, and refunding on every delegate would defeat it.
+   */
+  noteModelActivity(callerAgent: any): void;
   /** Normalize a task id for dictionary matching. */
   normalizeTaskId(taskId: string): string;
   /**
@@ -1226,5 +1334,5 @@ declare class AntigravityBridgePlugin {
   constructor(ctx: Context, config: LiveAntigravityConfig);
 }
 //#endregion
-export { ANTIGRAVITY_MODELS, AUTO_CONTINUE_QUIET_MS, ActiveBackgroundTask, AgentInitConfig, AgentStep, AntigravityAgent, AntigravityConfig, AntigravityEngine, AntigravityModelInfo, AntigravityService, AutoContinueReason, AutoResumeConfig, BACKOFF_SCHEDULE_MS, CASCADE_RUN_ACTIVE_CODES, CASCADE_RUN_ACTIVE_NAMES, CORTEX_ACTIVE_STATUS_CODES, CORTEX_ACTIVE_STATUS_NAMES, CORTEX_TERMINAL_STATUS_CODES, CORTEX_TERMINAL_STATUS_NAMES, CascadeDetailedResult, Config, ConversationSummary, ConversationTreeNode, DEFAULT_AUTO_CONTINUE_MAX, DEFAULT_AUTO_CONTINUE_MESSAGE, DEFAULT_MODEL_ID, DEFAULT_WATCH_MAX_MS, EngineConfig, ErrorClassification, HarnessSessionInfo, HubCallOptions, HubClient, HubInfo, HubRun, IDE_TIMER_SYSTEM_MESSAGE_REGEX, ListConversationsOptions, LiveAntigravityConfig, LoadedTranscript, MediaInput, OBSERVATIONAL_TOOL_NAMES, PendingToolApproval, PersistedBridgeState, PersistedQueuedMessage, PersistedRun, PollResult, PromptContent, PromptItem, ProtoMediaPart, PruneStaleTasksOptions, RunOneShotOptions, SETTLE_CONFIRMATION_INTERVAL_MS, SETTLE_STABLE_MS, SessionContinuationMode, SettleGuardAction, SettleGuardDecision, SettleGuardInput, SettlementNoticePayload, SettlementOutboxItem, StartCascadeOptions, StatusTransition, StructuredCascadeTasksResult, TaskSilenceEntry, TokenUsage, TrajectoryResponse, TrajectoryStep, TrajectoryStepDetail, TrajectoryStepMetadata, TranscriptSnapshot, TranscriptStep, TranscriptTailKind, TransientErrorSignature, buildConversationGraph, buildSettlementNotice, classifyError, clearHubCache, computeTranscriptHash, decideTailSettle, decodeProtobufTaskDetails, AntigravityBridgePlugin as default, discoverHub, extractErrorMessage, fileToMedia, formatAuthExpiredTerminalError, formatExhaustedRetryError, getAutoResumeBackoffMs, getConversationTree, getDefaultAppDataDir, getMaxRetriesForSignature, getStepEffectiveStatus, guessMimeType, isAuthTokenExpiredError, isCascadeRunStatusActive, isCortexStatusActive, isCortexStatusTerminal, isNetworkError, isStaleHubError, isTaskIdMatch, isTransientRetryableError, isWaitingSpeech, listConversations, loadTranscriptFile, normalizeModelName, normalizePromptParts, parseStructuredTrajectoryTasks, parseTranscript, pollTranscript, pruneStaleBackgroundTasks, readCascadeTranscript, readStructuredTasksFromSqlite, renderAsciiTree, snapshotAntigravityConfig };
+export { ANTIGRAVITY_MODELS, AUTO_CONTINUE_QUIET_MS, ActiveBackgroundTask, AgentInitConfig, AgentStep, AntigravityAgent, AntigravityConfig, AntigravityEngine, AntigravityModelInfo, AntigravityService, AutoContinueReason, AutoResumeConfig, BACKOFF_SCHEDULE_MS, CASCADE_RUN_ACTIVE_CODES, CASCADE_RUN_ACTIVE_NAMES, CORTEX_ACTIVE_STATUS_CODES, CORTEX_ACTIVE_STATUS_NAMES, CORTEX_TERMINAL_STATUS_CODES, CORTEX_TERMINAL_STATUS_NAMES, CascadeDetailedResult, Config, ConversationSummary, ConversationTreeNode, DEFAULT_AUTO_CONTINUE_MAX, DEFAULT_AUTO_CONTINUE_MESSAGE, DEFAULT_MODEL_ID, DEFAULT_WATCH_MAX_MS, EngineConfig, ErrorClassification, HarnessSessionInfo, HubCallOptions, HubClient, HubInfo, HubRun, IDE_TIMER_SYSTEM_MESSAGE_REGEX, LAUNCH_OBSERVATION_GRACE_MS, ListConversationsOptions, LiveAntigravityConfig, LoadedTranscript, MAX_CONSECUTIVE_NOTICE_WAKES, MediaInput, OBSERVATIONAL_TOOL_NAMES, PendingToolApproval, PersistedBridgeState, PersistedQueuedMessage, PersistedRun, PollResult, PromptContent, PromptItem, ProtoMediaPart, PruneStaleTasksOptions, RunOneShotOptions, SETTLE_CONFIRMATION_INTERVAL_MS, SETTLE_STABLE_MS, SessionContinuationMode, SettleGuardAction, SettleGuardDecision, SettleGuardInput, SettleGuardReason, SettlementNoticePayload, SettlementOutboxItem, StartCascadeOptions, StatusTransition, StructuredCascadeTasksResult, TaskSilenceEntry, TokenUsage, TrajectoryResponse, TrajectoryStep, TrajectoryStepDetail, TrajectoryStepMetadata, TranscriptSnapshot, TranscriptStep, TranscriptTailKind, TransientErrorSignature, buildConversationGraph, buildSettlementNotice, classifyError, clearHubCache, computeTranscriptHash, decideTailSettle, decodeProtobufTaskDetails, AntigravityBridgePlugin as default, discoverHub, extractErrorMessage, fileToMedia, formatAuthExpiredTerminalError, formatExhaustedRetryError, getAutoResumeBackoffMs, getConversationTree, getDefaultAppDataDir, getMaxRetriesForSignature, getStepEffectiveStatus, guessMimeType, isAuthTokenExpiredError, isCascadeRunStatusActive, isCortexStatusActive, isCortexStatusTerminal, isNetworkError, isStaleHubError, isTaskIdMatch, isTransientRetryableError, isWaitingSpeech, listConversations, loadTranscriptFile, normalizeModelName, normalizePromptParts, parseStructuredTrajectoryTasks, parseTranscript, pollTranscript, pruneStaleBackgroundTasks, readCascadeTranscript, readStructuredTasksFromSqlite, renderAsciiTree, snapshotAntigravityConfig };
 //# sourceMappingURL=index.d.mts.map

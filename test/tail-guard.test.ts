@@ -7,6 +7,7 @@ import {
   pruneStaleBackgroundTasks,
   isTaskIdMatch,
   OBSERVATIONAL_TOOL_NAMES,
+  LAUNCH_OBSERVATION_GRACE_MS,
   type TranscriptSnapshot,
   type TranscriptStep,
   type ActiveBackgroundTask,
@@ -1843,6 +1844,107 @@ describe('AntigravityService Background Task Watcher Lifecycle', () => {
       const run = runOf(svc, 'cid-two-phase-cascade-active');
       expect(run.status).not.toBe('done');
       expect(notifySpy).not.toHaveBeenCalled();
+    });
+  });
+
+  // -------------------------------------------------------------------------
+  // D2 — launch hysteresis: an empty task list right after launch is
+  //     "unobserved", not "none" (false idle → revert-from-done)
+  // -------------------------------------------------------------------------
+  describe('D2 launch observation hysteresis', () => {
+    const settledLooking = (over: Partial<TranscriptSnapshot> = {}) => snap({
+      maxStepIndex: 50,
+      isFinished: true,
+      engaged: true,
+      tailKind: 'assistant-text',
+      plannerContents: ['All done, the report is in src/.'], // closing reply, tool-tail absent
+      activeBackgroundTasks: [], // hub has not published any task yet
+      ...over,
+    });
+
+    const baseInput = (over: Record<string, unknown> = {}) => ({
+      snap: settledLooking(),
+      tailQuietMs: 60_000,
+      autoContinueCount: 0,
+      maxAutoContinue: DEFAULT_AUTO_CONTINUE_MAX,
+      settleStableMs: 15_000,
+      autoContinueQuietMs: 10_000,
+      ...over,
+    });
+
+    it('refuses to settle from an empty task list inside the observation window', () => {
+      const decision = decideTailSettle(baseInput({
+        sinceLifecycleStartMs: LAUNCH_OBSERVATION_GRACE_MS - 1,
+      }) as any);
+      expect(decision.action).toBe('wait');
+      expect(decision.reason).toBe('background-task-unobserved');
+    });
+
+    it('settles normally once the observation window has closed', () => {
+      const decision = decideTailSettle(baseInput({
+        sinceLifecycleStartMs: LAUNCH_OBSERVATION_GRACE_MS,
+      }) as any);
+      expect(decision.action).toBe('settle');
+    });
+
+    it('leaves pre-existing callers (no launch info) on the old behaviour', () => {
+      expect(decideTailSettle(baseInput() as any).action).toBe('settle');
+    });
+
+    it('still reports a positively-observed live cascade as wait-background inside the window', () => {
+      const withTask = decideTailSettle(baseInput({
+        sinceLifecycleStartMs: 1_000,
+        blockingBackgroundTasks: [{ taskId: 'task-1', startStepIndex: 3 }],
+      }) as any);
+      expect(withTask.action).toBe('wait-background');
+
+      const cascadeActive = decideTailSettle(baseInput({
+        sinceLifecycleStartMs: 1_000,
+        isCascadeActive: true,
+      }) as any);
+      expect(cascadeActive.action).toBe('wait-background');
+
+      const withChildren = decideTailSettle(baseInput({
+        sinceLifecycleStartMs: 1_000,
+        hasActiveChildren: true,
+      }) as any);
+      expect(withChildren.action).toBe('wait-background');
+    });
+
+    it('does not suppress the tool-tail auto-continue diagnosis inside the window', () => {
+      // The hysteresis must not swallow the "paused mid-work" signal; it only
+      // refuses the *settle* conclusion.
+      const decision = decideTailSettle(baseInput({
+        sinceLifecycleStartMs: LAUNCH_OBSERVATION_GRACE_MS,
+        snap: settledLooking({ tailKind: 'tool-result' }),
+      }) as any);
+      expect(decision.action).toBe('continue');
+      expect(decision.reason).toBe('tool-tail');
+    });
+
+    it('watcher: a freshly launched cascade with an empty task list does not settle', async () => {
+      const { svc } = makeService();
+      const notifySpy = vi.spyOn(svc, 'notifySettlementToDsh');
+
+      mockRead.mockResolvedValue(settledLooking());
+      vi.spyOn(svc, 'getStructuredCascadeTasks').mockResolvedValue({
+        activeTasks: [],
+        allTasks: [],
+        hasActiveChildren: false,
+        isCascadeActive: false,
+      });
+
+      svc.ensureActiveWatcher('cid-launch-hysteresis', undefined, -1);
+      // run.startedAt is "now" (fake timers): inside the observation window.
+      await vi.advanceTimersByTimeAsync(15_000);
+
+      expect(runOf(svc, 'cid-launch-hysteresis').status).not.toBe('done');
+      expect(notifySpy).not.toHaveBeenCalled();
+
+      // Past the window the same (unchanging, still task-less) observation settles.
+      await vi.advanceTimersByTimeAsync(30_000);
+      expect(runOf(svc, 'cid-launch-hysteresis').status).toBe('done');
+      expect(notifySpy).toHaveBeenCalledTimes(1);
     });
   });
 });

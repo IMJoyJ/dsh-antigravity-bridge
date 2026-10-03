@@ -3,7 +3,7 @@ import { Context } from '@deepseek-ai/cordis';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import os from 'node:os';
-import { AntigravityService } from '../src/index.js';
+import { AntigravityService, MAX_CONSECUTIVE_NOTICE_WAKES } from '../src/index.js';
 import type { AntigravityConfig } from '../src/index.js';
 
 describe('State persistence and settlement outbox', () => {
@@ -174,6 +174,136 @@ describe('State persistence and settlement outbox', () => {
     (svc as any).disposed = true;
     clearInterval((svc as any).outboxTimer);
     clearTimeout((svc as any).saveStateTimer);
+  });
+
+  // -------------------------------------------------------------------------
+  // D1 — delivery must be evidence-based, never optimistic
+  // -------------------------------------------------------------------------
+  describe('D1 settlement-notice delivery honesty', () => {
+    const newSvc = (dir: string) => {
+      const ctx = new Context();
+      const svc = new AntigravityService(ctx, { appDataDir: dir });
+      (svc as any).getHubClient = async () => ({ sendMessage: vi.fn(async () => {}) });
+      (svc as any).ensureActiveWatcher = vi.fn();
+      return { ctx, svc };
+    };
+
+    it('reports NOT delivered when the target agent exposes no injection seam at all', async () => {
+      const { ctx, svc } = newSvc(tmpDir);
+      await (svc as any).stateInitPromise;
+
+      // An agent object with neither steer/followup/inject: the old code ran
+      // `agent.steer?.(msg)`, silently no-op'd, and still returned true, which
+      // latched lastNotifiedTransition and permanently dropped the notice.
+      const seamlessAgent = { id: 'agent-seamless', status: 'idle' };
+      (ctx as any).agents = { list: () => [seamlessAgent] };
+
+      const runId = 'cid-seamless';
+      const run: any = {
+        cascadeId: runId,
+        status: 'done',
+        startedAt: Date.now(),
+        turnSeq: 1,
+        priorContents: [],
+        content: 'done text',
+        callerAgent: seamlessAgent,
+        callerAgentId: 'agent-seamless',
+      };
+      (svc as any).runs.set(runId, run);
+
+      (svc as any).notifySettlementToDsh(run);
+
+      expect(run.lastNotifiedTransition).toBeUndefined();
+      expect((svc as any).settlementOutbox.some((i: any) => i.cascadeId === runId)).toBe(true);
+
+      (svc as any).disposed = true;
+      clearInterval((svc as any).outboxTimer);
+      clearTimeout((svc as any).saveStateTimer);
+    });
+
+    it('falls back to followup only when steer is proven unavailable', async () => {
+      const { ctx, svc } = newSvc(tmpDir);
+      await (svc as any).stateInitPromise;
+
+      const followupOnly = { id: 'agent-followup-only', status: 'idle', followup: vi.fn() };
+      (ctx as any).agents = { list: () => [followupOnly] };
+      const delivered = (svc as any).deliverMessageToAgent(followupOnly, { id: 'm1' });
+
+      expect(delivered).toBe(true);
+      expect(followupOnly.followup).toHaveBeenCalledTimes(1);
+
+      (svc as any).disposed = true;
+      clearInterval((svc as any).outboxTimer);
+      clearTimeout((svc as any).saveStateTimer);
+    });
+
+    it('prefers the bound caller agent over an unrelated live agent in the registry', async () => {
+      const { ctx, svc } = newSvc(tmpDir);
+      await (svc as any).stateInitPromise;
+
+      const stranger = { id: 'agent-stranger', status: 'idle', steer: vi.fn(), followup: vi.fn() };
+      const caller = { id: 'agent-caller', status: 'idle', steer: vi.fn(), followup: vi.fn() };
+      // Registry order puts the stranger FIRST — the old code broadcast to it.
+      (ctx as any).agents = { list: () => [stranger, caller] };
+
+      const delivered = (svc as any).deliverMessageToAgent(caller, { id: 'm1' });
+
+      expect(delivered).toBe(true);
+      expect(caller.steer).toHaveBeenCalledTimes(1);
+      expect(stranger.steer).not.toHaveBeenCalled();
+      expect(stranger.followup).not.toHaveBeenCalled();
+
+      (svc as any).disposed = true;
+      clearInterval((svc as any).outboxTimer);
+      clearTimeout((svc as any).saveStateTimer);
+    });
+
+    it('bounds self-excitation: a BUSY caller past the wake budget is queued without a wake', async () => {
+      const { ctx, svc } = newSvc(tmpDir);
+      await (svc as any).stateInitPromise;
+
+      const busy = { id: 'agent-busy', status: 'running', steer: vi.fn(), followup: vi.fn(), inject: vi.fn() };
+      (ctx as any).agents = { list: () => [busy] };
+
+      for (let i = 0; i < MAX_CONSECUTIVE_NOTICE_WAKES; i++) {
+        expect((svc as any).deliverMessageToAgent(busy, { id: `m${i}` })).toBe(true);
+      }
+      expect(busy.steer).toHaveBeenCalledTimes(MAX_CONSECUTIVE_NOTICE_WAKES);
+
+      // Budget spent: the next notice must not start a driver...
+      expect((svc as any).deliverMessageToAgent(busy, { id: 'over-budget' })).toBe(true);
+      expect(busy.steer).toHaveBeenCalledTimes(MAX_CONSECUTIVE_NOTICE_WAKES);
+      expect(busy.inject).toHaveBeenCalledTimes(1);
+
+      // ...but a model-authored tool call against the lane refunds the budget.
+      (svc as any).noteModelActivity(busy);
+      expect((svc as any).deliverMessageToAgent(busy, { id: 'after-refund' })).toBe(true);
+      expect(busy.steer).toHaveBeenCalledTimes(MAX_CONSECUTIVE_NOTICE_WAKES + 1);
+
+      (svc as any).disposed = true;
+      clearInterval((svc as any).outboxTimer);
+      clearTimeout((svc as any).saveStateTimer);
+    });
+
+    it('never silently drops a notice for an IDLE caller past the wake budget', async () => {
+      const { ctx, svc } = newSvc(tmpDir);
+      await (svc as any).stateInitPromise;
+
+      const idle = { id: 'agent-idle-budget', status: 'idle', steer: vi.fn(), followup: vi.fn(), inject: vi.fn() };
+      (ctx as any).agents = { list: () => [idle] };
+
+      for (let i = 0; i <= MAX_CONSECUTIVE_NOTICE_WAKES; i++) {
+        expect((svc as any).deliverMessageToAgent(idle, { id: `m${i}` })).toBe(true);
+      }
+      // An idle agent's non-waking inbox entry would never be claimed, so the
+      // budget is overridden rather than losing the settlement notice.
+      expect(idle.inject).not.toHaveBeenCalled();
+      expect(idle.steer).toHaveBeenCalledTimes(MAX_CONSECUTIVE_NOTICE_WAKES + 1);
+
+      (svc as any).disposed = true;
+      clearInterval((svc as any).outboxTimer);
+      clearTimeout((svc as any).saveStateTimer);
+    });
   });
 
   it('ensures active watcher on turn-end queue to prevent orphan queue', async () => {
@@ -353,7 +483,11 @@ describe('State persistence and settlement outbox', () => {
 
     (svc as any).notifySettlementToDsh(run2);
     expect(run2.callerAgent).toBe(mockAgentBob);
-    expect(mockAgentBob.followup).toHaveBeenCalled();
+    // D1: delivery is unified on the single wakeup-capable `steer` seam
+    // (next-step target + wakeup=true), which covers idle and busy callers with
+    // one code path. `followup` is only a proven-method fallback.
+    expect(mockAgentBob.steer).toHaveBeenCalled();
+    expect(mockAgentBob.followup).not.toHaveBeenCalled();
 
     (svc as any).disposed = true;
     clearInterval((svc as any).outboxTimer);
