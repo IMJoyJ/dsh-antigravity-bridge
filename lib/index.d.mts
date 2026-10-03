@@ -677,7 +677,7 @@ declare class HubClient {
  * - 403 / PERMISSION_DENIED (permission issues)
  * - Persistent OAuth failure ("OAuth 凭据已失效，请重新登录 Antigravity", invalid_grant, revoked refresh token)
  */
-type TransientErrorSignature = 'model_output_empty' | 'stream_interrupted' | 'auth_token_expired' | 'network_error';
+type TransientErrorSignature = 'model_output_empty' | 'stream_interrupted' | 'auth_token_expired' | 'network_error' | 'model_format_error';
 interface ErrorClassification {
   /** Whether this error is a transient error eligible for auto-resume. */
   retryable: boolean;
@@ -687,7 +687,15 @@ interface ErrorClassification {
   reason?: string;
   /** Normalized raw error message text. */
   rawError: string;
+  /** Whether the retry is handled internally by the engine/IDE (bridge should not inject '继续'). */
+  engineInternal?: boolean;
+  /** Remaining retries reported by the engine/model, if applicable. */
+  retriesRemaining?: number;
 }
+/** Pattern recognizing model format and malformed function call errors. */
+declare const MODEL_FORMAT_ERROR_PATTERN: RegExp;
+/** Common network, transport, server unavailable, and connection error pattern. */
+declare const NETWORK_ERROR_PATTERN: RegExp;
 /** Default exponential backoff delay schedule for auto-resume: 2s, 5s, 10s. */
 declare const BACKOFF_SCHEDULE_MS: readonly [2000, 5000, 10000];
 /**
@@ -718,6 +726,10 @@ declare function formatExhaustedRetryError(retries: number, originalError: strin
  */
 declare function isNetworkError(rawError: string): boolean;
 /**
+ * Extracts remaining retries count from error messages containing "Retries remaining: N" or similar phrases.
+ */
+declare function parseRetriesRemaining(rawError: string): number | undefined;
+/**
  * Extracts the error string from various error containers (Error object, step, snapshot, string, HTTP response object).
  */
 declare function extractErrorMessage(input: unknown): string;
@@ -729,6 +741,10 @@ declare function classifyError(error: unknown): ErrorClassification;
  * Fast boolean check if an error is a transient retryable cascade error.
  */
 declare function isTransientRetryableError(error: unknown): boolean;
+/**
+ * Check if the error is handled internally by the IDE engine (e.g. model format retry).
+ */
+declare function isInternalEngineRetryError(error: unknown): boolean;
 //#endregion
 //#region src/index.d.ts
 interface AutoResumeConfig {
@@ -1334,5 +1350,5 @@ declare class AntigravityBridgePlugin {
   constructor(ctx: Context, config: LiveAntigravityConfig);
 }
 //#endregion
-export { ANTIGRAVITY_MODELS, AUTO_CONTINUE_QUIET_MS, ActiveBackgroundTask, AgentInitConfig, AgentStep, AntigravityAgent, AntigravityConfig, AntigravityEngine, AntigravityModelInfo, AntigravityService, AutoContinueReason, AutoResumeConfig, BACKOFF_SCHEDULE_MS, CASCADE_RUN_ACTIVE_CODES, CASCADE_RUN_ACTIVE_NAMES, CORTEX_ACTIVE_STATUS_CODES, CORTEX_ACTIVE_STATUS_NAMES, CORTEX_TERMINAL_STATUS_CODES, CORTEX_TERMINAL_STATUS_NAMES, CascadeDetailedResult, Config, ConversationSummary, ConversationTreeNode, DEFAULT_AUTO_CONTINUE_MAX, DEFAULT_AUTO_CONTINUE_MESSAGE, DEFAULT_MODEL_ID, DEFAULT_WATCH_MAX_MS, EngineConfig, ErrorClassification, HarnessSessionInfo, HubCallOptions, HubClient, HubInfo, HubRun, IDE_TIMER_SYSTEM_MESSAGE_REGEX, LAUNCH_OBSERVATION_GRACE_MS, ListConversationsOptions, LiveAntigravityConfig, LoadedTranscript, MAX_CONSECUTIVE_NOTICE_WAKES, MediaInput, OBSERVATIONAL_TOOL_NAMES, PendingToolApproval, PersistedBridgeState, PersistedQueuedMessage, PersistedRun, PollResult, PromptContent, PromptItem, ProtoMediaPart, PruneStaleTasksOptions, RunOneShotOptions, SETTLE_CONFIRMATION_INTERVAL_MS, SETTLE_STABLE_MS, SessionContinuationMode, SettleGuardAction, SettleGuardDecision, SettleGuardInput, SettleGuardReason, SettlementNoticePayload, SettlementOutboxItem, StartCascadeOptions, StatusTransition, StructuredCascadeTasksResult, TaskSilenceEntry, TokenUsage, TrajectoryResponse, TrajectoryStep, TrajectoryStepDetail, TrajectoryStepMetadata, TranscriptSnapshot, TranscriptStep, TranscriptTailKind, TransientErrorSignature, buildConversationGraph, buildSettlementNotice, classifyError, clearHubCache, computeTranscriptHash, decideTailSettle, decodeProtobufTaskDetails, AntigravityBridgePlugin as default, discoverHub, extractErrorMessage, fileToMedia, formatAuthExpiredTerminalError, formatExhaustedRetryError, getAutoResumeBackoffMs, getConversationTree, getDefaultAppDataDir, getMaxRetriesForSignature, getStepEffectiveStatus, guessMimeType, isAuthTokenExpiredError, isCascadeRunStatusActive, isCortexStatusActive, isCortexStatusTerminal, isNetworkError, isStaleHubError, isTaskIdMatch, isTransientRetryableError, isWaitingSpeech, listConversations, loadTranscriptFile, normalizeModelName, normalizePromptParts, parseStructuredTrajectoryTasks, parseTranscript, pollTranscript, pruneStaleBackgroundTasks, readCascadeTranscript, readStructuredTasksFromSqlite, renderAsciiTree, snapshotAntigravityConfig };
+export { ANTIGRAVITY_MODELS, AUTO_CONTINUE_QUIET_MS, ActiveBackgroundTask, AgentInitConfig, AgentStep, AntigravityAgent, AntigravityConfig, AntigravityEngine, AntigravityModelInfo, AntigravityService, AutoContinueReason, AutoResumeConfig, BACKOFF_SCHEDULE_MS, CASCADE_RUN_ACTIVE_CODES, CASCADE_RUN_ACTIVE_NAMES, CORTEX_ACTIVE_STATUS_CODES, CORTEX_ACTIVE_STATUS_NAMES, CORTEX_TERMINAL_STATUS_CODES, CORTEX_TERMINAL_STATUS_NAMES, CascadeDetailedResult, Config, ConversationSummary, ConversationTreeNode, DEFAULT_AUTO_CONTINUE_MAX, DEFAULT_AUTO_CONTINUE_MESSAGE, DEFAULT_MODEL_ID, DEFAULT_WATCH_MAX_MS, EngineConfig, ErrorClassification, HarnessSessionInfo, HubCallOptions, HubClient, HubInfo, HubRun, IDE_TIMER_SYSTEM_MESSAGE_REGEX, LAUNCH_OBSERVATION_GRACE_MS, ListConversationsOptions, LiveAntigravityConfig, LoadedTranscript, MAX_CONSECUTIVE_NOTICE_WAKES, MODEL_FORMAT_ERROR_PATTERN, MediaInput, NETWORK_ERROR_PATTERN, OBSERVATIONAL_TOOL_NAMES, PendingToolApproval, PersistedBridgeState, PersistedQueuedMessage, PersistedRun, PollResult, PromptContent, PromptItem, ProtoMediaPart, PruneStaleTasksOptions, RunOneShotOptions, SETTLE_CONFIRMATION_INTERVAL_MS, SETTLE_STABLE_MS, SessionContinuationMode, SettleGuardAction, SettleGuardDecision, SettleGuardInput, SettleGuardReason, SettlementNoticePayload, SettlementOutboxItem, StartCascadeOptions, StatusTransition, StructuredCascadeTasksResult, TaskSilenceEntry, TokenUsage, TrajectoryResponse, TrajectoryStep, TrajectoryStepDetail, TrajectoryStepMetadata, TranscriptSnapshot, TranscriptStep, TranscriptTailKind, TransientErrorSignature, buildConversationGraph, buildSettlementNotice, classifyError, clearHubCache, computeTranscriptHash, decideTailSettle, decodeProtobufTaskDetails, AntigravityBridgePlugin as default, discoverHub, extractErrorMessage, fileToMedia, formatAuthExpiredTerminalError, formatExhaustedRetryError, getAutoResumeBackoffMs, getConversationTree, getDefaultAppDataDir, getMaxRetriesForSignature, getStepEffectiveStatus, guessMimeType, isAuthTokenExpiredError, isCascadeRunStatusActive, isCortexStatusActive, isCortexStatusTerminal, isInternalEngineRetryError, isNetworkError, isStaleHubError, isTaskIdMatch, isTransientRetryableError, isWaitingSpeech, listConversations, loadTranscriptFile, normalizeModelName, normalizePromptParts, parseRetriesRemaining, parseStructuredTrajectoryTasks, parseTranscript, pollTranscript, pruneStaleBackgroundTasks, readCascadeTranscript, readStructuredTasksFromSqlite, renderAsciiTree, snapshotAntigravityConfig };
 //# sourceMappingURL=index.d.mts.map

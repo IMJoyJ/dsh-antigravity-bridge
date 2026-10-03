@@ -2035,10 +2035,11 @@ export class AntigravityService extends Service {
     const hasActiveChildren = Boolean(snap?.hasActiveChildren || structuredTasks.hasActiveChildren);
 
     if (snap?.error) {
-      const isTransient = this.config.autoResume?.enabled !== false && isTransientRetryableError(snap.error);
+      const classification = classifyError(snap.error);
+      const isTransient = this.config.autoResume?.enabled !== false && classification.retryable;
       const retries = existingRun?.autoResumeRetries ?? 0;
       const maxRetries = this.config.autoResume?.maxRetries ?? 3;
-      if (isTransient && retries < maxRetries && existingRun?.status !== 'error') {
+      if (isTransient && (classification.engineInternal || retries < maxRetries)) {
         status = 'running';
       } else {
         status = 'error';
@@ -2080,7 +2081,7 @@ export class AntigravityService extends Service {
       priorContents: existingRun?.priorContents ?? [],
       lastActiveAt: snap?.lastActiveAt ?? existingRun?.lastActiveAt,
       content: snap?.plannerContents.join('\n\n') ?? existingRun?.content,
-      error: existingRun?.error ?? snap?.error,
+      error: status === 'error' ? (existingRun?.error ?? snap?.error) : undefined,
       pendingTool: snap?.pendingApproval ?? existingRun?.pendingTool,
       approvalNotified: existingRun?.approvalNotified,
       resumedNotified: existingRun?.resumedNotified,
@@ -2138,8 +2139,20 @@ export class AntigravityService extends Service {
     const classification = classifyError(errorText);
     const isTransient = classification.retryable;
     const signature = classification.signature;
+    const isEngineInternal = Boolean(classification.engineInternal);
     const maxRetries = getMaxRetriesForSignature(signature, configMaxRetries);
     const currentRetries = run.autoResumeRetries ?? 0;
+
+    if (enabled && isTransient && isEngineInternal) {
+      // The IDE/engine is actively retrying internally (e.g. model format error with retries remaining).
+      // Bridge must NOT inject '继续' (which disrupts the engine's retry prompt),
+      // must NOT latch terminal error, and must NOT stop the watcher.
+      run.status = 'running';
+      run.error = undefined;
+      this.runs.set(cascadeId, run);
+      await new Promise((r) => setTimeout(r, 1000));
+      return { resumed: true };
+    }
 
     if (enabled && isTransient && currentRetries < maxRetries) {
       const nextRetry = currentRetries + 1;
@@ -2198,6 +2211,8 @@ export class AntigravityService extends Service {
     run.status = 'error';
     if (enabled && isTransient && currentRetries >= maxRetries) {
       run.error = formatExhaustedRetryError(maxRetries, errorText, signature);
+    } else if (classification.reason === 'model_format_retries_exhausted') {
+      run.error = formatExhaustedRetryError(0, errorText, 'model_format_error');
     } else if (classification.reason === 'terminal_auth_permanent_failure') {
       run.error = formatAuthExpiredTerminalError(errorText);
     } else {
@@ -2741,6 +2756,7 @@ export class AntigravityService extends Service {
             if (exhausted) run.autoContinueExhausted = true;
             if (snap.plannerContents.length > 0) {
               run.status = 'done';
+              run.error = undefined;
               run.settledStepIndex = snap.maxStepIndex;
               run.settledContentHash = crypto
                 .createHash('sha256')
@@ -3060,7 +3076,7 @@ export class AntigravityService extends Service {
         isTransientRetryableError(snap.error);
 
       if (snap && (terminalDone || (snap.error && !isAutoResumeCandidate) || pendingConfirmed)) {
-        const status = snap.error ? 'error' : pendingConfirmed ? 'awaiting-approval' : 'done';
+        const status = (snap.error && !isAutoResumeCandidate) ? 'error' : pendingConfirmed ? 'awaiting-approval' : 'done';
         const run = this.runs.get(conversationId) ?? {
           cascadeId: conversationId,
           status: 'running' as const,
@@ -3074,7 +3090,7 @@ export class AntigravityService extends Service {
         run.content = snap.plannerContents.join('\n\n');
         run.lastActiveAt = snap.lastActiveAt;
         run.pendingTool = snap.pendingApproval;
-        run.error = snap.error;
+        run.error = status === 'error' ? snap.error : undefined;
         if (status === 'done') {
           const residualTasks = activeTasks.filter((t) => {
             const silence = this.isTaskSilenced(conversationId, t.taskId);

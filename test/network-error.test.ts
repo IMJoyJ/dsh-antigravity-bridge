@@ -237,4 +237,188 @@ describe('Network Error and In-flight Stall Handling', () => {
     const run = runOf(svc, 'cid-send-fail');
     expect(run.status).toBe('error');
   });
+
+  describe('Defect D3: Model Format Error and In-flight Retry Lifecycle', () => {
+    it('should not latch error on transient model format error (Retries remaining: 3), keep watcher running without injecting message, and deliver done when cascade finishes', async () => {
+      const { svc, sendMessage } = makeService({
+        autoResume: { enabled: true, maxRetries: 3 },
+      });
+
+      const caller = {
+        id: 'agent-caller-d3',
+        status: 'idle',
+        steer: vi.fn(() => true),
+        followup: vi.fn(),
+        inject: vi.fn(),
+      };
+      (svc as any).ctx.agents = { list: () => [caller] };
+
+      const formatErrorMsg =
+        'Your previous response contained an improperly formatted function call: Malformed function call: Failed to parse function call: Function call is empty - no input to parse. Please retry with a properly formatted function call\nRetries remaining: 3';
+
+      let currentPhase = 'error';
+      mockRead.mockImplementation(async () => {
+        if (currentPhase === 'error') {
+          return snap({
+            maxStepIndex: 377,
+            isFinished: false,
+            error: formatErrorMsg,
+          });
+        }
+        return snap({
+          maxStepIndex: 400,
+          isFinished: true,
+          plannerContents: ['# W14 · BatchC012 升级验收交付报告\n\n验收全绿通过，提交 Hash 71b71ba'],
+          tailKind: 'checkpoint',
+        });
+      });
+
+      svc.ensureActiveWatcher('cid-d3-test', caller, -1);
+
+      // Advance timers by 4s during the transient error phase
+      await vi.advanceTimersByTimeAsync(4000);
+
+      // Assert: Bridge did NOT send a '继续' nudge (IDE handles retry internally)
+      expect(sendMessage).not.toHaveBeenCalled();
+
+      // Assert: Run status is NOT latched to error
+      const run = runOf(svc, 'cid-d3-test');
+      expect(run.status).toBe('running');
+      expect(run.error).toBeUndefined();
+
+      // Assert: Watcher is still active in watchers map
+      const watchers = (svc as any).watchers;
+      expect(watchers.has('cid-d3-test')).toBe(true);
+
+      // Assert: check_run returns status running with no error
+      const checkMid = (await svc.hubCheckRun('cid-d3-test', false, caller)) as any;
+      expect(checkMid.status).toBe('running');
+      expect(checkMid.error).toBeNull();
+
+      // Now IDE recovers and completes the cascade
+      currentPhase = 'done';
+
+      // Drive watcher to settlement
+      await driveUntilSettled(svc, 'cid-d3-test');
+
+      // Assert: Succeeded and transitioned to done
+      const settledRun = runOf(svc, 'cid-d3-test');
+      expect(settledRun.status).toBe('done');
+      expect(settledRun.error).toBeUndefined();
+
+      // Assert: Caller received the settlement notice with done status
+      expect(caller.steer).toHaveBeenCalledTimes(1);
+      const noticeArg = caller.steer.mock.calls[0][0];
+      expect(noticeArg.source.kind).toBe('subagent-settled');
+      expect(noticeArg.source.senderSessionId).toBe('cid-d3-test');
+
+      // Assert: check_run reflects status done with delivery report content
+      const checkFinal = (await svc.hubCheckRun('cid-d3-test', false, caller)) as any;
+      expect(checkFinal.status).toBe('done');
+      expect(checkFinal.error).toBeNull();
+      expect(checkFinal.content).toContain('W14 · BatchC012 升级验收交付报告');
+    });
+
+    it('should escalate to terminal error when Retries remaining is 0, terminate watcher, and not relay further', async () => {
+      const { svc, sendMessage } = makeService();
+
+      const caller = {
+        id: 'agent-caller-exhausted',
+        status: 'idle',
+        steer: vi.fn(() => true),
+        followup: vi.fn(),
+        inject: vi.fn(),
+      };
+      (svc as any).ctx.agents = { list: () => [caller] };
+
+      const exhaustedErrorMsg =
+        'Your previous response contained an improperly formatted function call: Malformed function call: Failed to parse function call: Function call is empty - no input to parse. Please retry with a properly formatted function call\nRetries remaining: 0';
+
+      mockRead.mockImplementation(async () => {
+        return snap({
+          maxStepIndex: 377,
+          isFinished: false,
+          error: exhaustedErrorMsg,
+        });
+      });
+
+      svc.ensureActiveWatcher('cid-d3-exhausted', caller, -1);
+
+      await driveUntilSettled(svc, 'cid-d3-exhausted', 20);
+
+      // Watcher must have broken out and deleted itself
+      expect((svc as any).watchers.has('cid-d3-exhausted')).toBe(false);
+
+      const run = runOf(svc, 'cid-d3-exhausted');
+      expect(run.status).toBe('error');
+      expect(run.error).toContain('模型输出格式错误重试耗尽');
+
+      // Settled notice pushed with error status
+      expect(caller.steer).toHaveBeenCalledTimes(1);
+
+      // check_run returns error
+      const checkRes = (await svc.hubCheckRun('cid-d3-exhausted', false, caller)) as any;
+      expect(checkRes.status).toBe('error');
+      expect(checkRes.error).toContain('模型输出格式错误重试耗尽');
+    });
+
+    it('should handle error -> recovery -> awaiting-approval without dropping notice or bypassing b40b3ec delivery honesty', async () => {
+      const { svc, sendMessage } = makeService();
+
+      const caller = {
+        id: 'agent-approval-caller',
+        status: 'idle',
+        steer: vi.fn(() => true),
+        followup: vi.fn(),
+        inject: vi.fn(),
+      };
+      (svc as any).ctx.agents = { list: () => [caller] };
+
+      (svc as any).getHubClient = async () => ({
+        sendMessage,
+        isCascadeAwaitingApproval: async () => true,
+      });
+
+      let phase = 'error';
+      mockRead.mockImplementation(async () => {
+        if (phase === 'error') {
+          return snap({
+            maxStepIndex: 377,
+            isFinished: false,
+            error: 'Malformed function call\nRetries remaining: 3',
+          });
+        }
+        return snap({
+          maxStepIndex: 380,
+          isFinished: false,
+          pendingApproval: {
+            name: 'run_command',
+            action: 'Execute build command',
+            summary: 'Run msbuild on project',
+            requestedAt: '2026-10-03T02:25:00Z',
+          },
+        });
+      });
+
+      svc.ensureActiveWatcher('cid-d3-approval', caller, -1);
+
+      // 2s in error phase: stays running
+      await vi.advanceTimersByTimeAsync(2000);
+      expect(runOf(svc, 'cid-d3-approval').status).toBe('running');
+      expect(caller.steer).not.toHaveBeenCalled();
+
+      // Recovers into awaiting-approval
+      phase = 'approval';
+      await driveUntilSettled(svc, 'cid-d3-approval', 20);
+
+      const run = runOf(svc, 'cid-d3-approval');
+      expect(run.status).toBe('awaiting-approval');
+      expect(caller.steer).toHaveBeenCalledTimes(1);
+
+      const checkRes = (await svc.hubCheckRun('cid-d3-approval', false, caller)) as any;
+      expect(checkRes.status).toBe('awaiting-approval');
+      expect(checkRes.pendingTool?.name).toBe('run_command');
+      expect(checkRes.pendingTool?.summary).toBe('Run msbuild on project');
+    });
+  });
 });

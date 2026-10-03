@@ -9,6 +9,8 @@ import {
   formatExhaustedRetryError,
   formatAuthExpiredTerminalError,
   BACKOFF_SCHEDULE_MS,
+  parseRetriesRemaining,
+  isInternalEngineRetryError,
 } from '../src/hub/classifier.js';
 import { Config } from '../src/index.js';
 
@@ -365,6 +367,98 @@ describe('Error Signature Classifier', () => {
       expect(autoResume?.enabled).toBe(false);
       expect(autoResume?.maxRetries).toBe(5);
       expect(autoResume?.message).toBe('自定义继续指令');
+    });
+  });
+
+  describe('Model Format Errors and Retries Remaining (Defect D3)', () => {
+    const realD3Error =
+      'Your previous response contained an improperly formatted function call: Malformed function call: Failed to parse function call: Function call is empty - no input to parse. Please retry with a properly formatted function call\nRetries remaining: 3';
+
+    it('should classify model format error with Retries remaining: 3 as retryable and engineInternal', () => {
+      const res = classifyError(realD3Error);
+      expect(res.retryable).toBe(true);
+      expect(res.signature).toBe('model_format_error');
+      expect(res.engineInternal).toBe(true);
+      expect(res.retriesRemaining).toBe(3);
+      expect(isTransientRetryableError(realD3Error)).toBe(true);
+      expect(isInternalEngineRetryError(realD3Error)).toBe(true);
+    });
+
+    it('should parse retries remaining correctly', () => {
+      expect(parseRetriesRemaining(realD3Error)).toBe(3);
+      expect(parseRetriesRemaining('Retries remaining: 1')).toBe(1);
+      expect(parseRetriesRemaining('Retries remaining: 0')).toBe(0);
+      expect(parseRetriesRemaining('No retries here')).toBeUndefined();
+    });
+
+    it('should classify model format error with Retries remaining: 0 as terminal non-retryable', () => {
+      const exhaustedError =
+        'Your previous response contained an improperly formatted function call: Malformed function call: Failed to parse function call: Function call is empty - no input to parse. Please retry with a properly formatted function call\nRetries remaining: 0';
+      const res = classifyError(exhaustedError);
+      expect(res.retryable).toBe(false);
+      expect(res.reason).toBe('model_format_retries_exhausted');
+      expect(res.retriesRemaining).toBe(0);
+      expect(isTransientRetryableError(exhaustedError)).toBe(false);
+      expect(isInternalEngineRetryError(exhaustedError)).toBe(false);
+      expect(formatExhaustedRetryError(0, exhaustedError, 'model_format_error')).toContain(
+        '模型输出格式错误重试耗尽'
+      );
+    });
+
+    it('should classify generic model format error without retries remaining as retryable and engineInternal', () => {
+      const genericFormatError =
+        'Error: Malformed function call: Failed to parse function call: Function call is empty - no input to parse.';
+      const res = classifyError(genericFormatError);
+      expect(res.retryable).toBe(true);
+      expect(res.signature).toBe('model_format_error');
+      expect(res.engineInternal).toBe(true);
+      expect(isTransientRetryableError(genericFormatError)).toBe(true);
+    });
+  });
+
+  describe('503 / 502 / EOF / Connection Refused Network Errors', () => {
+    it('should classify HTTP 503 / UNAVAILABLE / 502 / 429 as transient network_error', () => {
+      const samples = [
+        'HTTP 503 Service Unavailable',
+        'status 503: UNAVAILABLE: upstream service is temporarily overloaded',
+        '502 Bad Gateway',
+        '429 Too Many Requests: Rate limit exceeded',
+        'gRPC error: RESOURCE_EXHAUSTED',
+      ];
+      for (const sample of samples) {
+        const res = classifyError(sample);
+        expect(res.retryable).toBe(true);
+        expect(res.signature).toBe('network_error');
+        expect(isTransientRetryableError(sample)).toBe(true);
+      }
+    });
+
+    it('should classify OAuth EOF / stream EOF as transient network_error', () => {
+      const samples = [
+        'error reading from server: unexpected EOF',
+        'OAuth request failed: stream error: EOF',
+        'connection closed: EOF',
+      ];
+      for (const sample of samples) {
+        const res = classifyError(sample);
+        expect(res.retryable).toBe(true);
+        expect(res.signature).toBe('network_error');
+        expect(isTransientRetryableError(sample)).toBe(true);
+      }
+    });
+
+    it('should classify Chinese connection errors as transient network_error', () => {
+      const samples = [
+        '连接拒绝: 目标主机积极拒绝，无法连接',
+        '网络异常: 请求超时，请稍后重试',
+        '远程主机强迫关闭了一个现有的连接 (连接重置)',
+      ];
+      for (const sample of samples) {
+        const res = classifyError(sample);
+        expect(res.retryable).toBe(true);
+        expect(res.signature).toBe('network_error');
+        expect(isTransientRetryableError(sample)).toBe(true);
+      }
     });
   });
 });

@@ -2,7 +2,7 @@ import { describe, it, expect } from 'vitest';
 import { DatabaseSync } from 'node:sqlite';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
-import { mkdtempSync, rmSync, existsSync } from 'node:fs';
+import { mkdtempSync, rmSync, existsSync, readFileSync } from 'node:fs';
 import {
   CORTEX_ACTIVE_STATUS_CODES,
   CORTEX_TERMINAL_STATUS_CODES,
@@ -14,6 +14,7 @@ import {
   readStructuredTasksFromSqlite,
   isCascadeRunStatusActive,
 } from '../src/hub/trajectory.js';
+import { parseTranscript } from '../src/hub/transcript.js';
 
 describe('Structured Trajectory & SQLite Task Tracking (Phase 2)', () => {
   describe('CortexStepStatus Mapping', () => {
@@ -296,6 +297,80 @@ describe('Structured Trajectory & SQLite Task Tracking (Phase 2)', () => {
         status: 1, // IDLE
       };
       expect(parseStructuredTrajectoryTasks(respIdle, 'cid-idle').isCascadeActive).toBe(false);
+    });
+  });
+
+  describe('parseTranscript Error Recovery & D3 Regression', () => {
+    it('should parse past in-flight model format error and capture final completion report', () => {
+      const simulatedSteps = [
+        JSON.stringify({ step_index: 0, source: 'USER', type: 'USER_INPUT', status: 'DONE', created_at: '2026-10-03T02:00:00Z' }),
+        JSON.stringify({ step_index: 376, source: 'MODEL', type: 'PLANNER_RESPONSE', status: 'DONE', created_at: '2026-10-03T02:23:50Z', thinking: 'Searching within tests...' }),
+        JSON.stringify({
+          step_index: 377,
+          source: 'SYSTEM',
+          type: 'ERROR_MESSAGE',
+          status: 'DONE',
+          created_at: '2026-10-03T02:24:01Z',
+          content: 'Error: Your previous response contained an improperly formatted function call: Malformed function call: Failed to parse function call: Function call is empty - no input to parse.\nPlease retry with a properly formatted function call\nRetries remaining: 3',
+        }),
+        JSON.stringify({
+          step_index: 378,
+          source: 'MODEL',
+          type: 'PLANNER_RESPONSE',
+          status: 'DONE',
+          created_at: '2026-10-03T02:24:01Z',
+          tool_calls: [{ name: 'run_command', args: { CommandLine: 'git grep LifePoints' } }],
+        }),
+        JSON.stringify({ step_index: 379, source: 'MODEL', type: 'GENERIC', status: 'DONE', created_at: '2026-10-03T02:24:05Z', content: 'grep results...' }),
+        JSON.stringify({
+          step_index: 400,
+          source: 'MODEL',
+          type: 'PLANNER_RESPONSE',
+          status: 'DONE',
+          created_at: '2026-10-03T02:33:35Z',
+          content: '# W14 · BatchC012 升级验收交付报告\n\n验收全绿通过，提交 Hash 71b71ba',
+        }),
+      ];
+
+      const res = parseTranscript(simulatedSteps);
+      expect(res.isFinished).toBe(true);
+      expect(res.error).toBeUndefined();
+      expect(res.plannerContents.length).toBeGreaterThan(0);
+      expect(res.plannerContents[res.plannerContents.length - 1]).toContain('W14 · BatchC012 升级验收交付报告');
+    });
+
+    it('should report error when error is the latest step in transcript', () => {
+      const simulatedSteps = [
+        JSON.stringify({ step_index: 0, source: 'USER', type: 'USER_INPUT', status: 'DONE' }),
+        JSON.stringify({
+          step_index: 377,
+          source: 'SYSTEM',
+          type: 'ERROR_MESSAGE',
+          status: 'DONE',
+          content: 'Error: Malformed function call\nRetries remaining: 3',
+        }),
+      ];
+
+      const res = parseTranscript(simulatedSteps);
+      expect(res.isFinished).toBe(false);
+      expect(res.error).toContain('Retries remaining: 3');
+    });
+
+    it('verifies real transcript from cascade 07886313 finishes with done and captures W14 report when file exists', () => {
+      const realPath = 'C:/Users/JoyJ/.gemini/antigravity/brain/07886313-e976-4a25-90ea-80aed0a579dd/.system_generated/logs/transcript.jsonl';
+      if (!existsSync(realPath)) {
+        return; // Skip if run in CI or environment without local session logs
+      }
+      const rawText = readFileSync(realPath, 'utf-8');
+      const lines = rawText.split('\n').filter((l) => l.trim());
+      const res = parseTranscript(lines);
+
+      expect(res.isFinished).toBe(true);
+      expect(res.error).toBeUndefined();
+      expect(res.plannerContents.length).toBeGreaterThan(0);
+      const lastContent = res.plannerContents[res.plannerContents.length - 1];
+      expect(lastContent).toContain('W14 · BatchC012 升级验收交付报告');
+      expect(lastContent).toContain('71b71ba');
     });
   });
 });

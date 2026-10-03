@@ -1,5 +1,6 @@
 import { stat, readFile } from 'node:fs/promises';
 import { join } from 'node:path';
+import { isTransientRetryableError } from './classifier.js';
 
 export * from './trajectory.js';
 
@@ -608,7 +609,9 @@ export function parseTranscript(
         httpSummary ??
         (typeof step.content === 'string' && step.content ? step.content : undefined) ??
         `unknown agent error (raw: ${JSON.stringify(step).slice(0, 300)})`;
-      return result;
+      pendingTools = [];
+      result.isFinished = false;
+      continue;
     }
 
     if (step.source === 'MODEL') {
@@ -621,8 +624,13 @@ export function parseTranscript(
           step.content ||
           (step as any).error ||
           `Planner error at step ${step.step_index}`;
-        return result;
+        pendingTools = [];
+        result.isFinished = false;
+        continue;
       }
+
+      // Subsequent successful model response indicates recovery from any earlier error
+      result.error = undefined;
 
       if (step.content && step.status === 'DONE') {
         result.plannerContents.push(step.content);
@@ -1047,13 +1055,15 @@ export async function pollTranscript(
       });
       latestParsed.activeBackgroundTasks = activeTasks;
       if (latestParsed.error) {
-        return {
-          done: true,
-          status: 'error',
-          content: latestParsed.plannerContents.join('\n\n'),
-          error: latestParsed.error,
-          lastActiveAt: latestParsed.lastActiveAt,
-        };
+        if (!isTransientRetryableError(latestParsed.error)) {
+          return {
+            done: true,
+            status: 'error',
+            content: latestParsed.plannerContents.join('\n\n'),
+            error: latestParsed.error,
+            lastActiveAt: latestParsed.lastActiveAt,
+          };
+        }
       }
       if (latestParsed.pendingApproval) {
         return {

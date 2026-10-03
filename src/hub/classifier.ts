@@ -16,7 +16,8 @@ export type TransientErrorSignature =
   | 'model_output_empty'
   | 'stream_interrupted'
   | 'auth_token_expired'
-  | 'network_error';
+  | 'network_error'
+  | 'model_format_error';
 
 export interface ErrorClassification {
   /** Whether this error is a transient error eligible for auto-resume. */
@@ -27,6 +28,10 @@ export interface ErrorClassification {
   reason?: string;
   /** Normalized raw error message text. */
   rawError: string;
+  /** Whether the retry is handled internally by the engine/IDE (bridge should not inject '继续'). */
+  engineInternal?: boolean;
+  /** Remaining retries reported by the engine/model, if applicable. */
+  retriesRemaining?: number;
 }
 
 /** Explicit terminal patterns that must NEVER be retried. */
@@ -45,6 +50,14 @@ const TERMINAL_PATTERNS: Array<{ reason: string; pattern: RegExp }> = [
   },
 ];
 
+/** Pattern recognizing model format and malformed function call errors. */
+export const MODEL_FORMAT_ERROR_PATTERN =
+  /(?:improperly formatted function call|Malformed function call|Failed to parse function call|Function call is empty|Please retry with a properly formatted function call)/i;
+
+/** Common network, transport, server unavailable, and connection error pattern. */
+export const NETWORK_ERROR_PATTERN =
+  /(?:network\s*(?:error|timeout)|fetch failed|ECONNRESET|ECONNREFUSED|ETIMEDOUT|EPIPE|ENOTFOUND|socket hang up|connection (?:reset|closed|aborted|refused)|connect(?:ion)? refused|stream (?:disconnected|closed|error)|event stream (?:closed|error|disconnected)|SSE (?:error|disconnect|closed)|UND_ERR_\w+|\b(?:502|503|504|429)\b|UNAVAILABLE|RESOURCE_EXHAUSTED|Service Unavailable|Bad Gateway|Gateway Timeout|Too Many Requests|Rate limit|\bEOF\b|unexpected EOF|连接拒绝|拒绝连接|连接重置|网络异常|网络超时)/i;
+
 /** Recognized transient retryable error signatures. */
 const TRANSIENT_PATTERNS: Array<{ signature: TransientErrorSignature; pattern: RegExp }> = [
   {
@@ -57,7 +70,7 @@ const TRANSIENT_PATTERNS: Array<{ signature: TransientErrorSignature; pattern: R
   },
   {
     signature: 'network_error',
-    pattern: /(?:network\s*(?:error|timeout)|fetch failed|ECONNRESET|ECONNREFUSED|ETIMEDOUT|EPIPE|ENOTFOUND|socket hang up|connection (?:reset|closed|aborted)|stream (?:disconnected|closed|error)|event stream (?:closed|error|disconnected)|SSE (?:error|disconnect|closed)|UND_ERR_\w+)/i,
+    pattern: NETWORK_ERROR_PATTERN,
   },
 ];
 
@@ -152,6 +165,9 @@ export function formatExhaustedRetryError(
   if (signature === 'network_error') {
     return `网络异常 (network error)，已自动重试 ${retries} 次仍失败: ${originalError}`;
   }
+  if (signature === 'model_format_error') {
+    return `模型输出格式错误重试耗尽 (model format error): ${originalError}`;
+  }
   return `已自动重试 ${retries} 次仍失败: ${originalError}`;
 }
 
@@ -164,7 +180,18 @@ export function isNetworkError(rawError: string): boolean {
       return false;
     }
   }
-  return /(?:network\s*(?:error|timeout)|fetch failed|ECONNRESET|ECONNREFUSED|ETIMEDOUT|EPIPE|ENOTFOUND|socket hang up|connection (?:reset|closed|aborted)|stream (?:disconnected|closed|error)|event stream (?:closed|error|disconnected)|SSE (?:error|disconnect|closed)|UND_ERR_\w+)/i.test(rawError);
+  return NETWORK_ERROR_PATTERN.test(rawError);
+}
+
+/**
+ * Extracts remaining retries count from error messages containing "Retries remaining: N" or similar phrases.
+ */
+export function parseRetriesRemaining(rawError: string): number | undefined {
+  const match = rawError.match(/retries\s+remaining[:\s]+(\d+)/i);
+  if (match) {
+    return parseInt(match[1], 10);
+  }
+  return undefined;
 }
 
 /**
@@ -236,6 +263,35 @@ export function classifyError(error: unknown): ErrorClassification {
     }
   }
 
+  // 1.5. Model format error and retries remaining check
+  const retriesRemaining = parseRetriesRemaining(rawError);
+  const isModelFormat = MODEL_FORMAT_ERROR_PATTERN.test(rawError);
+  if (retriesRemaining !== undefined) {
+    if (retriesRemaining === 0) {
+      return {
+        retryable: false,
+        rawError,
+        reason: 'model_format_retries_exhausted',
+        retriesRemaining: 0,
+      };
+    }
+    return {
+      retryable: true,
+      signature: 'model_format_error',
+      rawError,
+      engineInternal: true,
+      retriesRemaining,
+    };
+  }
+  if (isModelFormat) {
+    return {
+      retryable: true,
+      signature: 'model_format_error',
+      rawError,
+      engineInternal: true,
+    };
+  }
+
   // 2. Auth token expired (HTTP 401 invalid_token / UNAUTHENTICATED) -> transient retryable
   if (isAuthTokenExpiredError(rawError)) {
     return {
@@ -245,7 +301,7 @@ export function classifyError(error: unknown): ErrorClassification {
     };
   }
 
-  // 3. Known transient retryable patterns (model_output_empty, stream_interrupted)
+  // 3. Known transient retryable patterns (model_output_empty, stream_interrupted, network_error)
   for (const item of TRANSIENT_PATTERNS) {
     if (item.pattern.test(rawError)) {
       return {
@@ -269,4 +325,11 @@ export function classifyError(error: unknown): ErrorClassification {
  */
 export function isTransientRetryableError(error: unknown): boolean {
   return classifyError(error).retryable;
+}
+
+/**
+ * Check if the error is handled internally by the IDE engine (e.g. model format retry).
+ */
+export function isInternalEngineRetryError(error: unknown): boolean {
+  return Boolean(classifyError(error).engineInternal);
 }
