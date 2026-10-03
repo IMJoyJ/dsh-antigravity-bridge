@@ -256,6 +256,12 @@ interface StructuredCascadeTasksResult {
   allTasks: ActiveBackgroundTask[];
   hasActiveChildren: boolean;
   isCascadeActive?: boolean;
+  /** Whether the cascade has been explicitly canceled or interrupted. */
+  isCanceled?: boolean;
+  /** Whether any step in the trajectory has status CANCELED (6) or INTERRUPTED (12). */
+  hasCanceledStep?: boolean;
+  /** Parent conversation ID if this cascade is a child subagent. */
+  parentConversationId?: string;
 }
 /**
  * CascadeRunStatus mappings (from protobuf exa.cortex_pb.CascadeRunStatus):
@@ -383,6 +389,10 @@ interface TranscriptSnapshot {
   activeBackgroundTasks?: ActiveBackgroundTask[];
   /** 残余盲区①：whether subagent child sessions are currently active. */
   hasActiveChildren?: boolean;
+  /** First created_at timestamp in transcript (anchors cascade start time). */
+  firstCreatedAt?: string;
+  /** Whether any step in the transcript carries explicit cancellation status. */
+  hasCanceledStep?: boolean;
 }
 interface ParsedTranscript {
   maxStepIndex: number;
@@ -408,6 +418,10 @@ interface ParsedTranscript {
   activeBackgroundTasks: ActiveBackgroundTask[];
   /** 残余盲区①：whether subagent child sessions are currently active. */
   hasActiveChildren?: boolean;
+  /** First created_at timestamp in transcript (anchors cascade start time). */
+  firstCreatedAt?: string;
+  /** Whether any step in the transcript carries explicit cancellation status. */
+  hasCanceledStep?: boolean;
 }
 /**
  * Pure observational tools that do not constitute substantive foreground work.
@@ -441,13 +455,15 @@ type AutoContinueReason = 'tool-tail' | 'no-assistant-text';
 type SettleGuardReason = AutoContinueReason | 'background-task' | 'background-task-unobserved';
 type SettleGuardAction = 'settle' | 'settle-exhausted' | 'continue' | 'wait' | 'wait-background';
 interface SettleGuardInput {
-  snap: Pick<TranscriptSnapshot, 'isFinished' | 'plannerContents' | 'tailKind' | 'engaged' | 'pendingApproval' | 'error' | 'activeBackgroundTasks' | 'hasActiveChildren'>;
+  snap: Pick<TranscriptSnapshot, 'isFinished' | 'plannerContents' | 'tailKind' | 'engaged' | 'pendingApproval' | 'error' | 'activeBackgroundTasks' | 'hasActiveChildren' | 'hasCanceledStep'>;
   /** Optional active background tasks that block settlement (non-infinite-silenced). If omitted, defaults to snap.activeBackgroundTasks. */
   blockingBackgroundTasks?: ActiveBackgroundTask[];
   /** 残余盲区①：Optional flag indicating active subagent child sessions. If omitted, defaults to snap.hasActiveChildren. */
   hasActiveChildren?: boolean;
   /** Turn-level active status from GetCascadeTrajectory (CascadeRunStatus RUNNING/BUSY/CANCELING). */
   isCascadeActive?: boolean;
+  /** Whether the cascade has been explicitly stopped or canceled by user. */
+  isCanceled?: boolean;
   /**
    * How long ago the bridge recorded this cascade lifecycle (launch / re-arm)
    * — i.e. `now - HubRun.startedAt`. Optional: omitted means "no launch

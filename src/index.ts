@@ -1,5 +1,5 @@
 import { Context, Service, type Volatile } from '@deepseek-ai/cordis';
-import { promises as fsp } from 'node:fs';
+import { promises as fsp, existsSync, readdirSync, readFileSync } from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import Schema from '@deepseek-ai/schemastery';
@@ -1692,11 +1692,75 @@ export class AntigravityService extends Service {
       return cached.result;
     }
 
+    const enrichResult = (res: StructuredCascadeTasksResult): StructuredCascadeTasksResult => {
+      if (!brainDir) return res;
+      try {
+        // A. If this cascade spawned subagents, inspect .system_generated/subagents/
+        const subagentsDir = path.join(brainDir, cascadeId, '.system_generated', 'subagents');
+        if (existsSync(subagentsDir)) {
+          const files = readdirSync(subagentsDir);
+          let hasLiveChild = false;
+          for (const f of files) {
+            if (f.endsWith('.json')) {
+              try {
+                const subContent = readFileSync(path.join(subagentsDir, f), 'utf8');
+                const parsedSub = JSON.parse(subContent);
+                if (parsedSub.state === 'SUBAGENT_STATE_ALIVE') {
+                  hasLiveChild = true;
+                  break;
+                }
+              } catch {}
+            }
+          }
+          if (hasLiveChild) {
+            res.hasActiveChildren = true;
+          }
+        }
+
+        // B. If this cascade is a child subagent, check if parent recorded it as killed
+        const parentId = res.parentConversationId;
+        if (parentId) {
+          const parentSubagentFile = path.join(brainDir, parentId, '.system_generated', 'subagents', `${cascadeId}.json`);
+          if (existsSync(parentSubagentFile)) {
+            try {
+              const subJson = JSON.parse(readFileSync(parentSubagentFile, 'utf8'));
+              if (subJson.state === 'SUBAGENT_STATE_KILLED') {
+                res.isCanceled = true;
+              }
+            } catch {}
+          }
+        }
+
+        // C. Check if any step output in .system_generated/steps/ recorded "context canceled"
+        const stepsDir = path.join(brainDir, cascadeId, '.system_generated', 'steps');
+        if (existsSync(stepsDir)) {
+          const stepDirs = readdirSync(stepsDir);
+          for (const sDir of stepDirs) {
+            const outPath = path.join(stepsDir, sDir, 'output.txt');
+            if (existsSync(outPath)) {
+              try {
+                const outTxt = readFileSync(outPath, 'utf8');
+                if (/context canceled|canceled by user/i.test(outTxt)) {
+                  res.hasCanceledStep = true;
+                  res.isCanceled = true;
+                  break;
+                }
+              } catch {}
+            }
+          }
+        }
+      } catch {
+        // Best-effort filesystem enrichment
+      }
+      return res;
+    };
+
     // 1. Try HubClient.getCascadeTasks / getCascadeTrajectory
     try {
       const client = await this.getHubClient();
       if (client && typeof (client as any).getCascadeTasks === 'function') {
-        const result = await (client as any).getCascadeTasks(cascadeId);
+        const raw = await (client as any).getCascadeTasks(cascadeId);
+        const result = enrichResult(raw);
         this.trajectoryTaskCache.set(cascadeId, {
           lastFetchedAt: now,
           lastMaxStepIndex: currentMaxStep,
@@ -1705,7 +1769,8 @@ export class AntigravityService extends Service {
         return result;
       } else if (client && typeof (client as any).getCascadeTrajectory === 'function') {
         const resp = await (client as any).getCascadeTrajectory(cascadeId);
-        const result = parseStructuredTrajectoryTasks(resp, cascadeId);
+        const raw = parseStructuredTrajectoryTasks(resp, cascadeId);
+        const result = enrichResult(raw);
         this.trajectoryTaskCache.set(cascadeId, {
           lastFetchedAt: now,
           lastMaxStepIndex: currentMaxStep,
@@ -1719,8 +1784,9 @@ export class AntigravityService extends Service {
 
     // 2. Try SQLite conversation fallback
     try {
-      const sqliteResult = readStructuredTasksFromSqlite(cascadeId);
-      if (sqliteResult) {
+      const sqliteRaw = readStructuredTasksFromSqlite(cascadeId);
+      if (sqliteRaw) {
+        const sqliteResult = enrichResult(sqliteRaw);
         this.trajectoryTaskCache.set(cascadeId, {
           lastFetchedAt: now,
           lastMaxStepIndex: currentMaxStep,
@@ -1734,10 +1800,10 @@ export class AntigravityService extends Service {
 
     // 3. Fallback to existing cached result if present
     if (cached) {
-      return cached.result;
+      return enrichResult(cached.result);
     }
 
-    return { activeTasks: [], allTasks: [], hasActiveChildren: false };
+    return enrichResult({ activeTasks: [], allTasks: [], hasActiveChildren: false });
   }
 
   /**
@@ -2034,6 +2100,27 @@ export class AntigravityService extends Service {
     });
     const hasActiveChildren = Boolean(snap?.hasActiveChildren || structuredTasks.hasActiveChildren);
 
+    let startedAt = existingRun?.startedAt;
+    if (!startedAt) {
+      if (snap?.firstCreatedAt) {
+        const parsed = Date.parse(snap.firstCreatedAt);
+        if (!Number.isNaN(parsed)) startedAt = parsed;
+      }
+      startedAt = startedAt ?? Date.now();
+    }
+
+    const isExplicitlyStopped = Boolean(
+      structuredTasks.isCanceled ||
+      structuredTasks.hasCanceledStep ||
+      snap?.hasCanceledStep
+    ) && !structuredTasks.isCascadeActive;
+
+    const isNaturallyIdle =
+      structuredTasks.isCascadeActive === false &&
+      blockingTasks.length === 0 &&
+      !hasActiveChildren &&
+      !snap?.pendingApproval;
+
     if (snap?.error) {
       const classification = classifyError(snap.error);
       const isTransient = this.config.autoResume?.enabled !== false && classification.retryable;
@@ -2050,6 +2137,9 @@ export class AntigravityService extends Service {
       status = isReal ? 'awaiting-approval' : 'running';
     } else if (blockingTasks.length > 0 || hasActiveChildren) {
       status = 'waiting-background';
+    } else if (isExplicitlyStopped) {
+      // D4: Explicitly stopped or canceled by user in IDE / coordinator
+      status = 'done';
     } else if (snap?.isFinished && snap.plannerContents.length > 0) {
       // Strict done: a bare isFinished (e.g. setup CHECKPOINT with zero planner
       // output) must not classify as done — that poisoned the registry before.
@@ -2059,13 +2149,24 @@ export class AntigravityService extends Service {
       // executor steps land). Report running so the single watcher poller can
       // auto-continue instead of settling the cascade prematurely.
       if (snap.tailKind === 'tool-call' || snap.tailKind === 'tool-result') {
-        status = 'running';
+        const sinceStart = Date.now() - startedAt;
+        if (isNaturallyIdle && sinceStart >= LAUNCH_OBSERVATION_GRACE_MS) {
+          status = 'done';
+        } else {
+          status = 'running';
+        }
       } else {
         // Zero-regex settle: isWaitingSpeech is no longer evaluated here!
         status = 'done';
       }
     } else if (!snap && existingRun?.status === 'done') {
       status = 'done'; // transcript unreadable: keep the last known terminal state
+    } else if (existingRun?.status === 'done' && isNaturallyIdle) {
+      // D4: Preserve done status if cascade is naturally idle
+      status = 'done';
+    } else if (isNaturallyIdle && (Date.now() - startedAt) >= LAUNCH_OBSERVATION_GRACE_MS && (!snap || snap.tailKind !== 'tool-call')) {
+      // D4: Idle outside grace window without running tools
+      status = 'done';
     } else if (snap?.engaged) {
       status = 'running';
     }
@@ -2073,7 +2174,7 @@ export class AntigravityService extends Service {
     const updatedRun: HubRun = {
       cascadeId: conversationId,
       status,
-      startedAt: existingRun?.startedAt ?? Date.now(),
+      startedAt,
       baselineStepIndex,
       callerAgent: existingRun?.callerAgent,
       callerAgentId: existingRun?.callerAgentId,
@@ -2328,27 +2429,69 @@ export class AntigravityService extends Service {
           );
 
           if (stepGrew || activeGrew) {
-            console.log(
-              `[antigravity] Cascade ${cascadeId} fake done detected: step grew from ${run.settledStepIndex} to ${stepNow} (active: ${run.lastActiveAt} -> ${lastActiveNow}). Reverting status to running.`
+            // D4: Only revert to running if the cascade has genuine active work.
+            // Inert steps (like cancellation notices, subagent killed updates, or interrupt notifications)
+            // must NOT trigger a false revert to running.
+            const structuredTasks = await this.getStructuredCascadeTasks(
+              cascadeId,
+              brainDir,
+              stepNow,
+              true /* forceRefresh */,
             );
-            const oldSettledStep = run.settledStepIndex;
-            run.status = 'running';
-            run.lastNotifiedTransition = undefined;
-            run.settledStepIndex = undefined;
-            run.settledContentHash = undefined;
-            stallSince = Date.now();
-            idleCycles = 0;
-            lastStepSeen = stepNow;
-            lastActiveSeen = lastActiveNow;
-            this.runs.set(cascadeId, run);
-            this.saveStateDebounced();
-            this.notifyRevertedFromDoneToDsh(run, {
-              oldSettledStep,
-              currentStep: stepNow,
-              oldActiveAt: run.lastActiveAt,
-              currentActiveAt: lastActiveNow,
+            const activeTasks = snap?.activeBackgroundTasks ?? structuredTasks.activeTasks;
+            const blockingTasks = activeTasks.filter((t) => {
+              const silence = this.isTaskSilenced(cascadeId, t.taskId);
+              return !silence.infinite;
             });
-            // Continue below into normal running loop
+            const hasActiveWork =
+              Boolean(structuredTasks.isCascadeActive) ||
+              blockingTasks.length > 0 ||
+              Boolean(snap?.hasActiveChildren || structuredTasks.hasActiveChildren) ||
+              Boolean(snap?.pendingApproval) ||
+              (Boolean(snap?.engaged) && (!snap?.isFinished || snap?.tailKind === 'tool-call' || snap?.tailKind === 'tool-result'));
+
+            const isCanceledOrStopped = Boolean(
+              structuredTasks.isCanceled ||
+              structuredTasks.hasCanceledStep ||
+              snap?.hasCanceledStep
+            );
+
+            if (hasActiveWork && !isCanceledOrStopped) {
+              console.log(
+                `[antigravity] Cascade ${cascadeId} fake done detected: step grew from ${run.settledStepIndex} to ${stepNow} (active: ${run.lastActiveAt} -> ${lastActiveNow}). Reverting status to running.`
+              );
+              const oldSettledStep = run.settledStepIndex;
+              run.status = 'running';
+              run.lastNotifiedTransition = undefined;
+              run.settledStepIndex = undefined;
+              run.settledContentHash = undefined;
+              stallSince = Date.now();
+              idleCycles = 0;
+              lastStepSeen = stepNow;
+              lastActiveSeen = lastActiveNow;
+              this.runs.set(cascadeId, run);
+              this.saveStateDebounced();
+              this.notifyRevertedFromDoneToDsh(run, {
+                oldSettledStep,
+                currentStep: stepNow,
+                oldActiveAt: run.lastActiveAt,
+                currentActiveAt: lastActiveNow,
+              });
+              // Continue below into normal running loop
+            } else {
+              // Not genuinely active: update settled indices and remain in done state
+              run.settledStepIndex = Math.max(run.settledStepIndex ?? -1, stepNow);
+              if (lastActiveNow) run.lastActiveAt = lastActiveNow;
+              if (snap && snap.plannerContents.length > 0) {
+                run.content = snap.plannerContents.join('\n\n');
+              }
+              lastStepSeen = stepNow;
+              lastActiveSeen = lastActiveNow;
+              this.runs.set(cascadeId, run);
+              this.saveStateDebounced();
+              await new Promise((r) => setTimeout(r, 2000));
+              continue;
+            }
           } else {
             // Cascade is settled as done and resident; no new activity yet.
             await new Promise((r) => setTimeout(r, 2000));
@@ -2441,6 +2584,43 @@ export class AntigravityService extends Service {
         const hasActiveTasks =
           activeTasks.length > 0 ||
           Boolean(snap?.hasActiveChildren || structuredTasks.hasActiveChildren || structuredTasks.isCascadeActive);
+
+        // D4: Explicit cancellation / stop check. If cascade was explicitly canceled/stopped by user,
+        // settle immediately without waiting for the 120s stall timeout.
+        const isExplicitlyStopped = Boolean(
+          structuredTasks.isCanceled ||
+          structuredTasks.hasCanceledStep ||
+          snap?.hasCanceledStep
+        ) && !structuredTasks.isCascadeActive;
+
+        if (isExplicitlyStopped) {
+          console.log(
+            `[antigravity] Cascade ${cascadeId} explicitly stopped or canceled by user. Settling as done.`
+          );
+          run.status = 'done';
+          run.error = undefined;
+          run.settledStepIndex = snap?.maxStepIndex ?? run.settledStepIndex;
+          if (snap?.plannerContents && snap.plannerContents.length > 0) {
+            run.content = snap.plannerContents.join('\n\n');
+          }
+          run.residualBackgroundTasks = residualTasks.length > 0 ? residualTasks.map((t) => t.taskId) : undefined;
+          this.runs.set(cascadeId, run);
+          this.saveStateDebounced();
+          await this.landReport(run);
+          this.notifySettlementToDsh(run);
+          this.settleWaiters(cascadeId, {
+            status: 'done',
+            content: AntigravityService.fullReportText(run),
+            lastActiveAt: run.lastActiveAt,
+            autoContinueCount: run.autoContinueCount,
+            autoContinueExhausted: run.autoContinueExhausted,
+            activeBackgroundTasks: snap?.activeBackgroundTasks,
+            residualBackgroundTasks: run.residualBackgroundTasks,
+          });
+          await new Promise((r) => setTimeout(r, 2000));
+          continue;
+        }
+
         if (
           run.status === 'running' &&
           !snap?.pendingApproval &&
@@ -2612,6 +2792,7 @@ export class AntigravityService extends Service {
             blockingBackgroundTasks: blockingTasks,
             hasActiveChildren: snap?.hasActiveChildren || structuredTasks.hasActiveChildren,
             isCascadeActive: structuredTasks.isCascadeActive,
+            isCanceled: Boolean(structuredTasks.isCanceled || structuredTasks.hasCanceledStep),
             sinceLifecycleStartMs,
             launchObservationGraceMs: LAUNCH_OBSERVATION_GRACE_MS,
           });
@@ -3135,7 +3316,15 @@ export class AntigravityService extends Service {
     const appDataDir = this.config.appDataDir || getDefaultAppDataDir();
     const brainDir = `${appDataDir}/brain`;
     const existingRun = this.runs.get(runId);
-    const startedAt = existingRun?.startedAt ?? Date.now();
+    let startedAt = existingRun?.startedAt;
+    if (!startedAt) {
+      const snapProbe = await readCascadeTranscript(brainDir, runId, -1);
+      if (snapProbe?.firstCreatedAt) {
+        const parsed = Date.parse(snapProbe.firstCreatedAt);
+        if (!Number.isNaN(parsed)) startedAt = parsed;
+      }
+      startedAt = startedAt ?? Date.now();
+    }
     const baselineStepIndex = existingRun?.baselineStepIndex ?? -1;
     if (callerAgent && existingRun) {
       existingRun.callerAgent = callerAgent;
@@ -3164,7 +3353,8 @@ export class AntigravityService extends Service {
           const stalledNoText = probe.isFinished && probe.plannerContents.length === 0;
           const stalledToolTail = probe.isFinished && probe.plannerContents.length > 0 && toolTail;
           const hasActiveTasks = Boolean(probe.activeBackgroundTasks && probe.activeBackgroundTasks.length > 0);
-          if (!probe.isFinished || stalledNoText || stalledToolTail || hasActiveTasks) {
+          const isExplicitStop = Boolean(probe.hasCanceledStep);
+          if (!isExplicitStop && (!probe.isFinished || stalledNoText || stalledToolTail || hasActiveTasks)) {
             this.ensureActiveWatcher(runId, callerAgent || existingRun?.callerAgent, baselineStepIndex);
           }
         }
@@ -3179,7 +3369,7 @@ export class AntigravityService extends Service {
         status: detailed.status,
         pendingTool: detailed.pendingTool ?? null,
         lastActiveAt: detailed.lastActiveAt ?? null,
-        elapsedMs: Date.now() - startedAt,
+        elapsedMs: Date.now() - (run?.startedAt ?? startedAt),
         content: shaped.content || null,
         contentTruncated: shaped.truncated,
         totalChars: shaped.totalChars || null,
@@ -3201,7 +3391,7 @@ export class AntigravityService extends Service {
       status: detailed.status,
       pendingTool: detailed.pendingTool ?? null,
       lastActiveAt: detailed.lastActiveAt ?? null,
-      elapsedMs: Date.now() - startedAt,
+      elapsedMs: Date.now() - (run?.startedAt ?? startedAt),
       content: shaped.content || null,
       contentTruncated: shaped.truncated,
       totalChars: shaped.totalChars || null,

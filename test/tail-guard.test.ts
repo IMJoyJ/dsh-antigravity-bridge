@@ -1947,4 +1947,160 @@ describe('AntigravityService Background Task Watcher Lifecycle', () => {
       expect(notifySpy).toHaveBeenCalledTimes(1);
     });
   });
+
+  describe('Defect D4: Manual Stop & Cancellation Handling', () => {
+    it('settles cleanly as done when hub reports manual stop or step canceled, check_run does not return running', async () => {
+      const { svc } = makeService();
+      const notifySpy = vi.spyOn(svc, 'notifySettlementToDsh');
+
+      // Cascade was aborted mid-turn during a tool call (isFinished: false, tailKind: tool-call)
+      // but hub / trajectory reports canceled step and idle cascade
+      const canceledSnap = snap({
+        maxStepIndex: 2,
+        isFinished: false,
+        engaged: true,
+        tailKind: 'tool-call',
+        hasCanceledStep: true,
+        firstCreatedAt: '2026-10-03T10:00:00.000Z',
+      });
+      mockRead.mockResolvedValue(canceledSnap);
+
+      vi.spyOn(svc, 'getStructuredCascadeTasks').mockResolvedValue({
+        activeTasks: [],
+        allTasks: [],
+        hasActiveChildren: false,
+        isCascadeActive: false,
+        isCanceled: true,
+        hasCanceledStep: true,
+      });
+
+      // 1. Instant check_run should return status: 'done', not 'running'
+      const checkRes = (await svc.hubCheckRun('cid-d4-canceled', false)) as any;
+      expect(checkRes.status).toBe('done');
+      // elapsedMs must not be ~22ms: Date.now() - 2026-10-03T10:00:00.000Z
+      expect(checkRes.elapsedMs).toBeGreaterThan(1000);
+
+      // 2. Watcher running for an active cascade: when user cancels it, settles immediately to 'done' and notifies DSH
+      svc.ensureActiveWatcher('cid-d4-watcher-cancel', undefined, -1);
+      await vi.advanceTimersByTimeAsync(2000);
+
+      const run = runOf(svc, 'cid-d4-watcher-cancel');
+      expect(run.status).toBe('done');
+      expect(notifySpy).toHaveBeenCalled();
+    });
+
+    it('does not falsely revert to running when new cancellation steps arrive on a settled cascade', async () => {
+      const { svc } = makeService();
+      const revertSpy = vi.spyOn(svc, 'notifyRevertedFromDoneToDsh');
+      const notifySpy = vi.spyOn(svc, 'notifySettlementToDsh');
+
+      // 1. Initial done state (e.g. parent cascade settled at step 49)
+      let currentSnap = snap({
+        maxStepIndex: 49,
+        isFinished: true,
+        engaged: true,
+        tailKind: 'assistant-text',
+        plannerContents: ['Waiting for subagents.'],
+      });
+      mockRead.mockImplementation(async () => currentSnap);
+
+      vi.spyOn(svc, 'getStructuredCascadeTasks').mockImplementation(async () => ({
+        activeTasks: [],
+        allTasks: [],
+        hasActiveChildren: false,
+        isCascadeActive: false,
+        isCanceled: false,
+        hasCanceledStep: false,
+      }));
+
+      svc.ensureActiveWatcher('cid-d4-revert-guard', undefined, -1);
+      // Wait past confirmation window to settle
+      await vi.advanceTimersByTimeAsync(25_000);
+
+      const run = runOf(svc, 'cid-d4-revert-guard');
+      expect(run.status).toBe('done');
+      expect(run.settledStepIndex).toBe(49);
+      expect(notifySpy).toHaveBeenCalledTimes(1);
+
+      // 2. User stops subagents in IDE, generating cancellation / system messages (step 49 -> 58)
+      currentSnap = snap({
+        maxStepIndex: 58,
+        isFinished: true,
+        engaged: true,
+        tailKind: 'other',
+        hasCanceledStep: true,
+        plannerContents: ['Waiting for subagents.'],
+      });
+
+      vi.spyOn(svc, 'getStructuredCascadeTasks').mockImplementation(async () => ({
+        activeTasks: [],
+        allTasks: [],
+        hasActiveChildren: false,
+        isCascadeActive: false,
+        isCanceled: true,
+        hasCanceledStep: true,
+      }));
+
+      // Advance watcher: watcher sees step 58 > 49, but cascade is stopped / idle
+      await vi.advanceTimersByTimeAsync(3000);
+
+      // Must NOT revert to running!
+      expect(run.status).toBe('done');
+      expect(run.settledStepIndex).toBe(58);
+      expect(revertSpy).not.toHaveBeenCalled();
+    });
+
+    it('preserves D2 launch hysteresis: empty task list inside 20s window without cancel mark still waits', () => {
+      // decideTailSettle unit test ensuring D2 is not swallowed by D4
+      const decision = decideTailSettle({
+        snap: snap({
+          isFinished: true,
+          engaged: true,
+          tailKind: 'assistant-text',
+          plannerContents: ['All setup done.'],
+          hasCanceledStep: false,
+        }),
+        tailQuietMs: 1000,
+        autoContinueCount: 0,
+        maxAutoContinue: 5,
+        settleStableMs: 15_000,
+        autoContinueQuietMs: 2000,
+        blockingBackgroundTasks: [],
+        hasActiveChildren: false,
+        isCascadeActive: false,
+        isCanceled: false,
+        sinceLifecycleStartMs: 5_000, // inside 20s grace window
+        launchObservationGraceMs: 20_000,
+      });
+
+      expect(decision.action).toBe('wait');
+      expect(decision.reason).toBe('background-task-unobserved');
+    });
+
+    it('settles immediately inside 20s window if cascade is explicitly canceled by user', () => {
+      // D4 override: when explicitly canceled by user, no need to wait 20s
+      const decision = decideTailSettle({
+        snap: snap({
+          isFinished: true,
+          engaged: true,
+          tailKind: 'assistant-text',
+          plannerContents: ['Aborted.'],
+          hasCanceledStep: true,
+        }),
+        tailQuietMs: 1000,
+        autoContinueCount: 0,
+        maxAutoContinue: 5,
+        settleStableMs: 15_000,
+        autoContinueQuietMs: 2000,
+        blockingBackgroundTasks: [],
+        hasActiveChildren: false,
+        isCascadeActive: false,
+        isCanceled: true,
+        sinceLifecycleStartMs: 5_000, // inside 20s grace window
+        launchObservationGraceMs: 20_000,
+      });
+
+      expect(decision.action).toBe('settle');
+    });
+  });
 });

@@ -99,6 +99,12 @@ export interface StructuredCascadeTasksResult {
   allTasks: ActiveBackgroundTask[];
   hasActiveChildren: boolean;
   isCascadeActive?: boolean;
+  /** Whether the cascade has been explicitly canceled or interrupted. */
+  isCanceled?: boolean;
+  /** Whether any step in the trajectory has status CANCELED (6) or INTERRUPTED (12). */
+  hasCanceledStep?: boolean;
+  /** Parent conversation ID if this cascade is a child subagent. */
+  parentConversationId?: string;
 }
 
 /**
@@ -214,9 +220,21 @@ export function parseStructuredTrajectoryTasks(
   );
 
   const tasksMap = new Map<string, ActiveBackgroundTask & { isActive: boolean }>();
+  let hasCanceledStep = false;
 
   for (const step of steps) {
     const statusInfo = getStepEffectiveStatus(step);
+
+    if (
+      statusInfo.status === 'CANCELED' ||
+      statusInfo.status === 'CORTEX_STEP_STATUS_CANCELED' ||
+      statusInfo.status === 6 ||
+      statusInfo.status === 'INTERRUPTED' ||
+      statusInfo.status === 'CORTEX_STEP_STATUS_INTERRUPTED' ||
+      statusInfo.status === 12
+    ) {
+      hasCanceledStep = true;
+    }
 
     // 残余盲区①：subagent 子会话。如果 INVOKE_SUBAGENT 步骤或 subtrajectory 处于活跃状态，视为阻塞 settle
     const isSubagentStep =
@@ -291,8 +309,26 @@ export function parseStructuredTrajectoryTasks(
 
   const cascadeStatus = resp?.status ?? (resp as any)?.trajectoryStatus;
   const isCascadeActive = isCascadeRunStatusActive(cascadeStatus);
+  const isCanceled =
+    hasCanceledStep ||
+    cascadeStatus === 'CANCELING' ||
+    cascadeStatus === 'CASCADE_RUN_STATUS_CANCELING' ||
+    cascadeStatus === 3;
+  const parentConversationId =
+    resp?.trajectory?.metadata?.parentConversationId ||
+    (resp?.trajectory?.metadata as any)?.parent_conversation_id ||
+    (resp as any)?.metadata?.parentConversationId ||
+    (resp as any)?.metadata?.parent_conversation_id;
 
-  return { activeTasks, allTasks, hasActiveChildren, isCascadeActive };
+  return {
+    activeTasks,
+    allTasks,
+    hasActiveChildren,
+    isCascadeActive,
+    isCanceled,
+    hasCanceledStep,
+    parentConversationId,
+  };
 }
 
 /**
@@ -430,7 +466,22 @@ export function readStructuredTasksFromSqlite(
         }
       }
 
-      return { activeTasks, allTasks, hasActiveChildren, isCascadeActive: false };
+      let hasCanceledStep = false;
+      try {
+        const canceledRow = db.prepare('SELECT idx FROM steps WHERE status = 6 OR status = 12 LIMIT 1').get();
+        if (canceledRow) {
+          hasCanceledStep = true;
+        }
+      } catch {}
+
+      return {
+        activeTasks,
+        allTasks,
+        hasActiveChildren,
+        isCascadeActive: false,
+        isCanceled: hasCanceledStep,
+        hasCanceledStep,
+      };
     } finally {
       db.close();
     }

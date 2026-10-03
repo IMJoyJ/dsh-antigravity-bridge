@@ -93,6 +93,10 @@ export interface TranscriptSnapshot {
   activeBackgroundTasks?: ActiveBackgroundTask[];
   /** 残余盲区①：whether subagent child sessions are currently active. */
   hasActiveChildren?: boolean;
+  /** First created_at timestamp in transcript (anchors cascade start time). */
+  firstCreatedAt?: string;
+  /** Whether any step in the transcript carries explicit cancellation status. */
+  hasCanceledStep?: boolean;
 }
 
 interface ParsedTranscript {
@@ -119,6 +123,10 @@ interface ParsedTranscript {
   activeBackgroundTasks: ActiveBackgroundTask[];
   /** 残余盲区①：whether subagent child sessions are currently active. */
   hasActiveChildren?: boolean;
+  /** First created_at timestamp in transcript (anchors cascade start time). */
+  firstCreatedAt?: string;
+  /** Whether any step in the transcript carries explicit cancellation status. */
+  hasCanceledStep?: boolean;
 }
 
 function classifyTranscriptStep(step: TranscriptStep): TranscriptTailKind {
@@ -286,6 +294,8 @@ export function parseTranscript(
   const parsedSteps: TranscriptStep[] = [];
   let fileMaxStepIndex = -1;
   let latestGlobalUserInputIndex = -1;
+  let firstCreatedAt: string | undefined;
+  let hasCanceledStep = false;
 
   for (const line of lines) {
     let step: TranscriptStep;
@@ -293,6 +303,16 @@ export function parseTranscript(
       step = JSON.parse(line);
       parsedSteps.push(step);
       if (typeof step.step_index === 'number') {
+        if (!firstCreatedAt && typeof step.created_at === 'string') {
+          firstCreatedAt = step.created_at;
+        }
+        if (
+          step.status === 'CANCELED' ||
+          step.status === 'CANCELLED' ||
+          (typeof step.content === 'string' && /context canceled|explicitly canceled by the user/i.test(step.content))
+        ) {
+          hasCanceledStep = true;
+        }
         fileMaxStepIndex = Math.max(fileMaxStepIndex, step.step_index);
         if (step.type === 'USER_INPUT' && step.status === 'DONE') {
           latestGlobalUserInputIndex = Math.max(latestGlobalUserInputIndex, step.step_index);
@@ -543,6 +563,8 @@ export function parseTranscript(
     isFinished: false,
     tailKind: 'none',
     activeBackgroundTasks,
+    firstCreatedAt,
+    hasCanceledStep,
   };
 
   // If a baseline is provided, only inspect steps generated AFTER the baseline step index
@@ -725,7 +747,7 @@ export type SettleGuardAction = 'settle' | 'settle-exhausted' | 'continue' | 'wa
 export interface SettleGuardInput {
   snap: Pick<
     TranscriptSnapshot,
-    'isFinished' | 'plannerContents' | 'tailKind' | 'engaged' | 'pendingApproval' | 'error' | 'activeBackgroundTasks' | 'hasActiveChildren'
+    'isFinished' | 'plannerContents' | 'tailKind' | 'engaged' | 'pendingApproval' | 'error' | 'activeBackgroundTasks' | 'hasActiveChildren' | 'hasCanceledStep'
   >;
   /** Optional active background tasks that block settlement (non-infinite-silenced). If omitted, defaults to snap.activeBackgroundTasks. */
   blockingBackgroundTasks?: ActiveBackgroundTask[];
@@ -733,6 +755,8 @@ export interface SettleGuardInput {
   hasActiveChildren?: boolean;
   /** Turn-level active status from GetCascadeTrajectory (CascadeRunStatus RUNNING/BUSY/CANCELING). */
   isCascadeActive?: boolean;
+  /** Whether the cascade has been explicitly stopped or canceled by user. */
+  isCanceled?: boolean;
   /**
    * How long ago the bridge recorded this cascade lifecycle (launch / re-arm)
    * — i.e. `now - HubRun.startedAt`. Optional: omitted means "no launch
@@ -811,6 +835,14 @@ export function decideTailSettle(input: SettleGuardInput): SettleGuardDecision {
   // Turn-level cascade active status (CascadeRunStatus RUNNING/BUSY/CANCELING from GetCascadeTrajectory)
   if (input.isCascadeActive) {
     return { action: 'wait-background', reason: 'background-task' };
+  }
+
+  // D4: Explicit cancellation guard. If the cascade was explicitly stopped/canceled by user
+  // and is not actively running on the hub, it must settle cleanly as done regardless of whether
+  // a closing assistant text was produced.
+  const isCanceled = Boolean(input.isCanceled || snap.hasCanceledStep);
+  if (isCanceled && !input.isCascadeActive && (!blockingTasks || blockingTasks.length === 0) && !activeChildren) {
+    return { action: 'settle' };
   }
 
   // (0.5) Launch hysteresis. The three liveness guards above all read the SAME
@@ -1008,6 +1040,8 @@ export async function readCascadeTranscript(
     error: parsed.error,
     tailKind: parsed.tailKind,
     activeBackgroundTasks: activeTasks,
+    firstCreatedAt: parsed.firstCreatedAt,
+    hasCanceledStep: parsed.hasCanceledStep,
   };
 }
 
