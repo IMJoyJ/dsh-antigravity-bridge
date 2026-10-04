@@ -105,6 +105,8 @@ export interface StructuredCascadeTasksResult {
   hasCanceledStep?: boolean;
   /** Parent conversation ID if this cascade is a child subagent. */
   parentConversationId?: string;
+  /** Indicates whether this result comes from an authoritative query (Hub or SQLite) */
+  authoritative?: boolean;
 }
 
 /**
@@ -275,6 +277,7 @@ export function parseStructuredTrajectoryTasks(
 
     const desc = td.description || td.summary || td.toolSummary || td.tool_summary;
     const description = desc ? String(desc).trim() : undefined;
+    const logUri = td.logUri || td.log_uri;
     const startedAt =
       step.metadata?.createdAt ||
       step.metadata?.created_at ||
@@ -285,6 +288,7 @@ export function parseStructuredTrajectoryTasks(
     tasksMap.set(taskId, {
       taskId,
       description,
+      logUri,
       startedAt,
       startStepIndex: stepIndex,
       isActive: statusInfo.isActive,
@@ -300,6 +304,7 @@ export function parseStructuredTrajectoryTasks(
       description: item.description,
       startedAt: item.startedAt,
       startStepIndex: item.startStepIndex,
+      logUri: item.logUri,
     };
     allTasks.push(task);
     if (item.isActive) {
@@ -328,6 +333,7 @@ export function parseStructuredTrajectoryTasks(
     isCanceled,
     hasCanceledStep,
     parentConversationId,
+    authoritative: true,
   };
 }
 
@@ -445,6 +451,7 @@ export function readStructuredTasksFromSqlite(
           tasksMap.set(taskId, {
             taskId,
             description: td.description,
+            logUri: td.logUri || td.log_uri,
             startStepIndex: row.idx,
             isActive: statusActive,
           });
@@ -459,6 +466,7 @@ export function readStructuredTasksFromSqlite(
           taskId: item.taskId,
           description: item.description,
           startStepIndex: item.startStepIndex,
+          logUri: item.logUri,
         };
         allTasks.push(task);
         if (item.isActive) {
@@ -481,6 +489,7 @@ export function readStructuredTasksFromSqlite(
         isCascadeActive: false,
         isCanceled: hasCanceledStep,
         hasCanceledStep,
+        authoritative: true,
       };
     } finally {
       db.close();

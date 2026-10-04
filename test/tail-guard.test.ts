@@ -6,6 +6,8 @@ import {
   isWaitingSpeech,
   pruneStaleBackgroundTasks,
   isTaskIdMatch,
+  assessBackgroundTaskProgress,
+  DEFAULT_BACKGROUND_TASK_STALL_THRESHOLD_MS,
   OBSERVATIONAL_TOOL_NAMES,
   LAUNCH_OBSERVATION_GRACE_MS,
   type TranscriptSnapshot,
@@ -2101,6 +2103,215 @@ describe('AntigravityService Background Task Watcher Lifecycle', () => {
       });
 
       expect(decision.action).toBe('settle');
+    });
+
+    describe('Defect D5: State view vs IDE reality sync & stalled task awareness', () => {
+      it('assessBackgroundTaskProgress: distinguishes recent tasks from tasks silent >= stall threshold', () => {
+        const now = Date.now();
+        const freshTask: ActiveBackgroundTask = {
+          taskId: 'task-recent',
+          startedAt: new Date(now - 5 * 60 * 1000).toISOString(), // 5 min ago
+          startStepIndex: 1,
+        };
+        const freshProgress = assessBackgroundTaskProgress(freshTask, { nowMs: now });
+        expect(freshProgress.isStalled).toBe(false);
+        expect(freshProgress.stalledDurationMs).toBe(5 * 60 * 1000);
+
+        const stalledTask: ActiveBackgroundTask = {
+          taskId: 'task-hung',
+          startedAt: new Date(now - 25 * 60 * 1000).toISOString(), // 25 min ago
+          startStepIndex: 2,
+        };
+        const stalledProgress = assessBackgroundTaskProgress(stalledTask, { nowMs: now });
+        expect(stalledProgress.isStalled).toBe(true);
+        expect(stalledProgress.stalledDurationMs).toBe(25 * 60 * 1000);
+
+        // Custom stall threshold
+        const customProgress = assessBackgroundTaskProgress(freshTask, {
+          nowMs: now,
+          stallThresholdMs: 3 * 60 * 1000,
+        });
+        expect(customProgress.isStalled).toBe(true);
+      });
+
+      it('long-running task protection: stalled task is marked as suspected stalled but NEVER prematurely killed or settled', async () => {
+        const { svc } = makeService({
+          backgroundTaskStallThresholdMs: 15 * 60 * 1000,
+        });
+        const deliverSpy = vi.spyOn(svc, 'deliverMessageToAgent' as any).mockReturnValue(true);
+
+        const now = Date.now();
+        const stalledTask: ActiveBackgroundTask = {
+          taskId: 'task-long-run',
+          description: 'run 5 rounds mutation experiments',
+          startedAt: new Date(now - 25 * 60 * 1000).toISOString(), // 25m ago
+          startStepIndex: 10,
+        };
+
+        mockRead.mockResolvedValue(
+          snap({
+            maxStepIndex: 10,
+            isFinished: true,
+            engaged: true,
+            plannerContents: ['Mutation experiments are running in background.'],
+            tailKind: 'assistant-text',
+            activeBackgroundTasks: [stalledTask],
+          }),
+        );
+
+        vi.spyOn(svc, 'getStructuredCascadeTasks').mockResolvedValue({
+          activeTasks: [stalledTask],
+          allTasks: [stalledTask],
+          hasActiveChildren: false,
+          isCascadeActive: false,
+          authoritative: true,
+        });
+
+        const callerAgent = { id: 'coordinator' };
+        const watch = (
+          svc as unknown as {
+            runCascadeWatcher: (id: string, baseline: number, caller?: any) => Promise<void>;
+          }
+        ).runCascadeWatcher.bind(svc);
+
+        watch('cid-d5-long-task', -1, callerAgent);
+
+        // Advance 5 seconds: watcher starts and detects active task
+        await vi.advanceTimersByTimeAsync(5000);
+        const run = runOf(svc, 'cid-d5-long-task');
+
+        // Assert: Cascade stays in waiting-background, NOT killed, NOT errored, NOT settled to done!
+        expect(run.status).toBe('waiting-background');
+        expect(run.hasStalledBackgroundTasks).toBe(true);
+
+        // Advance to 5 minutes so periodic waiting-background notification triggers
+        await vi.advanceTimersByTimeAsync(300_000);
+        expect(deliverSpy).toHaveBeenCalled();
+        const notificationMsg = deliverSpy.mock.calls[0][1] as any;
+        const noticeText = notificationMsg.content[0].text;
+        const summary = notificationMsg.source.summary;
+
+        // Assert notification clearly states suspected stalled and silent duration instead of lying
+        expect(noticeText).toContain('后台任务疑似停滞');
+        expect(noticeText).toContain('`waiting-background` (疑似停滞)');
+        expect(noticeText).toContain('已无日志输出');
+        expect(noticeText).toContain('疑似停滞');
+        expect(noticeText).toContain('task-long-run');
+        expect(summary).toContain('后台任务疑似停滞');
+
+        // Crucial assertion: Cascade is STILL alive in waiting-background after notification!
+        expect(run.status).toBe('waiting-background');
+      });
+
+      it('reproduction & fix: when background task disappears from authoritative source, cascade settles cleanly as done', async () => {
+        const { svc } = makeService();
+        const notifySpy = vi.spyOn(svc, 'notifySettlementToDsh');
+
+        // Initial state: transcript has a lingering task-299 that crashed without writing SYSTEM_MESSAGE
+        const task299: ActiveBackgroundTask = {
+          taskId: 'task-299',
+          description: 'pwsh mutation script',
+          startedAt: new Date(Date.now() - 30 * 60 * 1000).toISOString(),
+          startStepIndex: 298,
+        };
+
+        let currentSnap = snap({
+          maxStepIndex: 299,
+          isFinished: true,
+          engaged: true,
+          plannerContents: ['Started mutation script in background.'],
+          tailKind: 'assistant-text',
+          activeBackgroundTasks: [task299], // Lingering task in transcript
+        });
+        mockRead.mockImplementation(async () => currentSnap);
+
+        // The hub / SQLite authoritative query knows the task is gone (activeTasks: [])
+        vi.spyOn(svc, 'getStructuredCascadeTasks').mockResolvedValue({
+          activeTasks: [],
+          allTasks: [{ ...task299, isActive: false }],
+          hasActiveChildren: false,
+          isCascadeActive: false,
+          authoritative: true,
+        });
+
+        const callerAgent = { id: 'coordinator' };
+        const watch = (
+          svc as unknown as {
+            runCascadeWatcher: (id: string, baseline: number, caller?: any) => Promise<void>;
+          }
+        ).runCascadeWatcher.bind(svc);
+
+        // Initialize run as previously waiting-background
+        const run: HubRun = {
+          cascadeId: 'cid-d5-reproduce',
+          status: 'waiting-background',
+          startedAt: Date.now() - 60_000, // outside 20s grace window
+          waitingBackgroundStartedAt: Date.now() - 40 * 60 * 1000,
+          turnSeq: 1,
+          priorContents: [],
+          callerAgent,
+        };
+        (svc as any).runs.set('cid-d5-reproduce', run);
+
+        watch('cid-d5-reproduce', -1, callerAgent);
+
+        // Advance through settlement and confirmation window (15s stable + 10s round 2)
+        await vi.advanceTimersByTimeAsync(25_000);
+
+        // Assert: cascade recognized authoritative task completion, exited waiting-background, and settled to done!
+        expect(run.status).toBe('done');
+        expect(run.settledStepIndex).toBe(299);
+        expect(notifySpy).toHaveBeenCalledTimes(1);
+      });
+
+      it('classifySnapshot respects authoritative active tasks disappearance outside grace window', async () => {
+        const { svc } = makeService();
+        const classify = svc.classifySnapshot.bind(svc);
+
+        const lingeringTask: ActiveBackgroundTask = {
+          taskId: 'task-299',
+          description: 'mutation script',
+          startedAt: new Date(Date.now() - 35 * 60 * 1000).toISOString(),
+          startStepIndex: 10,
+        };
+
+        // Transcript still has lingering task
+        mockRead.mockResolvedValue(
+          snap({
+            maxStepIndex: 15,
+            isFinished: true,
+            engaged: true,
+            plannerContents: ['Task finished.'],
+            tailKind: 'assistant-text',
+            activeBackgroundTasks: [lingeringTask],
+          }),
+        );
+
+        // Authoritative source reports activeTasks empty
+        vi.spyOn(svc, 'getStructuredCascadeTasks').mockResolvedValue({
+          activeTasks: [],
+          allTasks: [],
+          hasActiveChildren: false,
+          isCascadeActive: false,
+          authoritative: true,
+        });
+
+        // Existing run started 10 minutes ago (well outside 20s grace window)
+        const existing: HubRun = {
+          cascadeId: 'cid-d5-classify',
+          status: 'waiting-background',
+          startedAt: Date.now() - 600_000,
+          turnSeq: 1,
+          priorContents: [],
+        };
+        (svc as any).runs.set('cid-d5-classify', existing);
+
+        const result = await classify('D:/brain', 'cid-d5-classify', -1);
+
+        // Assert: classifySnapshot uses authoritative empty active tasks and settles to done
+        expect(result.status).toBe('done');
+        expect(result.activeBackgroundTasks).toEqual([]);
+      });
     });
   });
 });

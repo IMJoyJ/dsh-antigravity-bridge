@@ -1,4 +1,6 @@
 import { stat, readFile } from 'node:fs/promises';
+import { existsSync, statSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
 import { join } from 'node:path';
 import { isTransientRetryableError } from './classifier.js';
 
@@ -56,7 +58,18 @@ export interface ActiveBackgroundTask {
   startStepIndex: number;
   durationSeconds?: number;
   isSchedule?: boolean;
+  logUri?: string;
+  lastProgressAt?: string;
+  isStalled?: boolean;
+  stalledDurationMs?: number;
 }
+
+/**
+ * 默认后台任务静默上限 (ms)：15分钟。
+ * 任务超过该时长无任何日志写入或进展，在通知和状态中上报为「疑似停滞 (Suspected Stalled)」，
+ * 但绝不粗暴误杀合法长时任务。
+ */
+export const DEFAULT_BACKGROUND_TASK_STALL_THRESHOLD_MS = 15 * 60 * 1000;
 
 /**
  * 迟滞窗口 (ms)：后台任务的「迟滞性」观测窗口。
@@ -244,6 +257,7 @@ interface TrackedBackgroundTask {
   isSchedule?: boolean;
   durationSeconds?: number;
   finished: boolean;
+  logUri?: string;
 }
 
 export function isTaskIdMatch(a: string, b: string): boolean {
@@ -432,6 +446,8 @@ export function parseTranscript(
           durationSeconds !== undefined ||
           Boolean(description && /timer|schedule|cron/i.test(description));
 
+        const logUri = structDetails.logUri || structDetails.log_uri;
+
         tasksMap.set(taskId, {
           taskId,
           cascadeId: cascadePrefix || cascadeId,
@@ -442,6 +458,7 @@ export function parseTranscript(
           isSchedule,
           durationSeconds,
           finished: false,
+          logUri,
         });
         lastTimerCondition = null;
         lastToolWasSchedule = false;
@@ -552,6 +569,7 @@ export function parseTranscript(
       startStepIndex: t.startStepIndex,
       durationSeconds: t.durationSeconds,
       isSchedule: t.isSchedule,
+      logUri: t.logUri,
     }));
 
   const result: ParsedTranscript = {
@@ -980,6 +998,74 @@ export function pruneStaleBackgroundTasks(
   }
 
   return { activeTasks, prunedTasks };
+}
+
+export interface BackgroundTaskProgress {
+  isStalled: boolean;
+  stalledDurationMs: number;
+  lastProgressAt?: string;
+  logMtimeMs?: number;
+}
+
+/**
+ * 评估后台任务进展与停滞状态：
+ * 探测任务专属日志文件（task-XXX.log）修改时间（最精确活动心跳）、启动时间与会话最后活跃时间。
+ * 当且仅当静默时长 >= stallThresholdMs 时标记为 isStalled（疑似停滞），
+ * 但绝不以此为依据强制判死，保障合法长时无输出任务的执行权。
+ */
+export function assessBackgroundTaskProgress(
+  task: ActiveBackgroundTask,
+  options?: {
+    brainDir?: string;
+    cascadeId?: string;
+    nowMs?: number;
+    stallThresholdMs?: number;
+    transcriptLastActiveAt?: string;
+  },
+): BackgroundTaskProgress {
+  const nowMs = options?.nowMs ?? Date.now();
+  const stallThresholdMs = options?.stallThresholdMs ?? DEFAULT_BACKGROUND_TASK_STALL_THRESHOLD_MS;
+  let logMtimeMs: number | undefined;
+
+  if (options?.brainDir && options?.cascadeId) {
+    try {
+      let logPath: string | undefined;
+      if (task.logUri && task.logUri.startsWith('file:///')) {
+        try {
+          logPath = fileURLToPath(new URL(task.logUri));
+        } catch {}
+      }
+      if (!logPath) {
+        logPath = join(options.brainDir, options.cascadeId, '.system_generated', 'tasks', `${task.taskId}.log`);
+      }
+      if (existsSync(logPath)) {
+        const s = statSync(logPath);
+        logMtimeMs = s.mtimeMs;
+      }
+    } catch {
+      // Best-effort inspection
+    }
+  }
+
+  const taskStartMs = task.startedAt ? Date.parse(task.startedAt) : NaN;
+  const candidates: number[] = [];
+  if (typeof logMtimeMs === 'number' && !Number.isNaN(logMtimeMs)) {
+    candidates.push(logMtimeMs);
+  }
+  if (!Number.isNaN(taskStartMs)) {
+    candidates.push(taskStartMs);
+  }
+
+  const effectiveProgressMs = candidates.length > 0 ? Math.max(...candidates) : nowMs;
+  const silentDurationMs = Math.max(0, nowMs - effectiveProgressMs);
+  const isStalled = silentDurationMs >= stallThresholdMs;
+
+  return {
+    isStalled,
+    stalledDurationMs: silentDurationMs,
+    lastProgressAt: new Date(effectiveProgressMs).toISOString(),
+    logMtimeMs,
+  };
 }
 
 /**

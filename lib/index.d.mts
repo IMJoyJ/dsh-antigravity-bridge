@@ -262,6 +262,8 @@ interface StructuredCascadeTasksResult {
   hasCanceledStep?: boolean;
   /** Parent conversation ID if this cascade is a child subagent. */
   parentConversationId?: string;
+  /** Indicates whether this result comes from an authoritative query (Hub or SQLite) */
+  authoritative?: boolean;
 }
 /**
  * CascadeRunStatus mappings (from protobuf exa.cortex_pb.CascadeRunStatus):
@@ -354,7 +356,17 @@ interface ActiveBackgroundTask {
   startStepIndex: number;
   durationSeconds?: number;
   isSchedule?: boolean;
+  logUri?: string;
+  lastProgressAt?: string;
+  isStalled?: boolean;
+  stalledDurationMs?: number;
 }
+/**
+ * 默认后台任务静默上限 (ms)：15分钟。
+ * 任务超过该时长无任何日志写入或进展，在通知和状态中上报为「疑似停滞 (Suspected Stalled)」，
+ * 但绝不粗暴误杀合法长时任务。
+ */
+declare const DEFAULT_BACKGROUND_TASK_STALL_THRESHOLD_MS: number;
 /**
  * 迟滞窗口 (ms)：后台任务的「迟滞性」观测窗口。
  *
@@ -539,6 +551,25 @@ declare function pruneStaleBackgroundTasks(tasks: ActiveBackgroundTask[] | undef
   activeTasks: ActiveBackgroundTask[];
   prunedTasks: ActiveBackgroundTask[];
 };
+interface BackgroundTaskProgress {
+  isStalled: boolean;
+  stalledDurationMs: number;
+  lastProgressAt?: string;
+  logMtimeMs?: number;
+}
+/**
+ * 评估后台任务进展与停滞状态：
+ * 探测任务专属日志文件（task-XXX.log）修改时间（最精确活动心跳）、启动时间与会话最后活跃时间。
+ * 当且仅当静默时长 >= stallThresholdMs 时标记为 isStalled（疑似停滞），
+ * 但绝不以此为依据强制判死，保障合法长时无输出任务的执行权。
+ */
+declare function assessBackgroundTaskProgress(task: ActiveBackgroundTask, options?: {
+  brainDir?: string;
+  cascadeId?: string;
+  nowMs?: number;
+  stallThresholdMs?: number;
+  transcriptLastActiveAt?: string;
+}): BackgroundTaskProgress;
 /**
  * Loads the cascade transcript from disk, preferring the full fidelity transcript
  * (`transcript_full.jsonl`) over the compact/truncated view (`transcript.jsonl`).
@@ -821,6 +852,8 @@ interface AntigravityConfig {
   autoContinueMax?: number;
   /** Message sent to the cascade for each tail-guard auto-continue (default "Continue"). */
   autoContinueMessage?: string;
+  /** Inactivity threshold (ms) of zero log/transcript output before a background task is flagged as suspected-stalled in waiting-background notifications (default 15m, 900,000ms). */
+  backgroundTaskStallThresholdMs?: number;
 }
 declare const Config: Schema<Schemastery.ObjectS<NoInfer<{
   backend: Schema<"hub" | "localharness", "hub" | "localharness", "volatile-defined">;
@@ -848,6 +881,7 @@ declare const Config: Schema<Schemastery.ObjectS<NoInfer<{
   autoContinueMax: Schema<number, number, "volatile-defined">;
   autoContinueMessage: Schema<string, string, "volatile-defined">;
   stallTimeoutMs: Schema<number, number, "volatile-defined">;
+  backgroundTaskStallThresholdMs: Schema<number, number, "volatile-defined">;
 }>>, Schemastery.ObjectT<NoInfer<{
   backend: Schema<"hub" | "localharness", "hub" | "localharness", "volatile-defined">;
   binaryPath: Schema<string, string, "volatile">;
@@ -874,6 +908,7 @@ declare const Config: Schema<Schemastery.ObjectS<NoInfer<{
   autoContinueMax: Schema<number, number, "volatile-defined">;
   autoContinueMessage: Schema<string, string, "volatile-defined">;
   stallTimeoutMs: Schema<number, number, "volatile-defined">;
+  backgroundTaskStallThresholdMs: Schema<number, number, "volatile-defined">;
 }>>, "plain">;
 /** Live volatile references delivered by the Loader; snapshot into {@link AntigravityConfig} to read. */
 interface LiveAntigravityConfig {
@@ -894,6 +929,7 @@ interface LiveAntigravityConfig {
   autoContinueMax: Volatile<number>;
   autoContinueMessage: Volatile<string>;
   stallTimeoutMs: Volatile<number>;
+  backgroundTaskStallThresholdMs: Volatile<number>;
 }
 /** Snapshot the live volatile references into plain values. The Loader commits Settings form edits into the running references and emits `loader/volatile-update`; `get()` reads the just-committed value. */
 declare function snapshotAntigravityConfig(live: LiveAntigravityConfig): AntigravityConfig;
@@ -963,6 +999,8 @@ interface HubRun {
     transcriptHash: string;
     firstSeenAt: number;
   };
+  /** Whether one or more active background tasks are suspected to be stalled (exceeded stall threshold with zero log/transcript output). */
+  hasStalledBackgroundTasks?: boolean;
 }
 declare function computeTranscriptHash(snap: TranscriptSnapshot | undefined): string;
 interface TaskSilenceEntry {
@@ -1022,6 +1060,7 @@ interface PersistedRun {
     transcriptHash: string;
     firstSeenAt: number;
   };
+  hasStalledBackgroundTasks?: boolean;
 }
 interface PersistedQueuedMessage {
   content: string;
@@ -1051,6 +1090,8 @@ interface CascadeDetailedResult {
   activeBackgroundTasks?: ActiveBackgroundTask[];
   /** Residual background tasks running (infinitely silenced) when settled. */
   residualBackgroundTasks?: string[];
+  /** Whether one or more active background tasks are suspected to be stalled. */
+  hasStalledBackgroundTasks?: boolean;
 }
 interface SettlementNoticePayload {
   summary: string;
@@ -1335,6 +1376,7 @@ declare class AntigravityBridgePlugin {
     autoContinueMax: Schema<number, number, "volatile-defined">;
     autoContinueMessage: Schema<string, string, "volatile-defined">;
     stallTimeoutMs: Schema<number, number, "volatile-defined">;
+    backgroundTaskStallThresholdMs: Schema<number, number, "volatile-defined">;
   }>>, Schemastery.ObjectT<NoInfer<{
     backend: Schema<"hub" | "localharness", "hub" | "localharness", "volatile-defined">;
     binaryPath: Schema<string, string, "volatile">;
@@ -1361,10 +1403,11 @@ declare class AntigravityBridgePlugin {
     autoContinueMax: Schema<number, number, "volatile-defined">;
     autoContinueMessage: Schema<string, string, "volatile-defined">;
     stallTimeoutMs: Schema<number, number, "volatile-defined">;
+    backgroundTaskStallThresholdMs: Schema<number, number, "volatile-defined">;
   }>>, "plain">;
   static inject: string[];
   constructor(ctx: Context, config: LiveAntigravityConfig);
 }
 //#endregion
-export { ANTIGRAVITY_MODELS, AUTO_CONTINUE_QUIET_MS, ActiveBackgroundTask, AgentInitConfig, AgentStep, AntigravityAgent, AntigravityConfig, AntigravityEngine, AntigravityModelInfo, AntigravityService, AutoContinueReason, AutoResumeConfig, BACKOFF_SCHEDULE_MS, CASCADE_RUN_ACTIVE_CODES, CASCADE_RUN_ACTIVE_NAMES, CORTEX_ACTIVE_STATUS_CODES, CORTEX_ACTIVE_STATUS_NAMES, CORTEX_TERMINAL_STATUS_CODES, CORTEX_TERMINAL_STATUS_NAMES, CascadeDetailedResult, Config, ConversationSummary, ConversationTreeNode, DEFAULT_AUTO_CONTINUE_MAX, DEFAULT_AUTO_CONTINUE_MESSAGE, DEFAULT_MODEL_ID, DEFAULT_WATCH_MAX_MS, EngineConfig, ErrorClassification, HarnessSessionInfo, HubCallOptions, HubClient, HubInfo, HubRun, IDE_TIMER_SYSTEM_MESSAGE_REGEX, LAUNCH_OBSERVATION_GRACE_MS, ListConversationsOptions, LiveAntigravityConfig, LoadedTranscript, MAX_CONSECUTIVE_NOTICE_WAKES, MODEL_FORMAT_ERROR_PATTERN, MediaInput, NETWORK_ERROR_PATTERN, OBSERVATIONAL_TOOL_NAMES, PendingToolApproval, PersistedBridgeState, PersistedQueuedMessage, PersistedRun, PollResult, PromptContent, PromptItem, ProtoMediaPart, PruneStaleTasksOptions, RunOneShotOptions, SETTLE_CONFIRMATION_INTERVAL_MS, SETTLE_STABLE_MS, SessionContinuationMode, SettleGuardAction, SettleGuardDecision, SettleGuardInput, SettleGuardReason, SettlementNoticePayload, SettlementOutboxItem, StartCascadeOptions, StatusTransition, StructuredCascadeTasksResult, TaskSilenceEntry, TokenUsage, TrajectoryResponse, TrajectoryStep, TrajectoryStepDetail, TrajectoryStepMetadata, TranscriptSnapshot, TranscriptStep, TranscriptTailKind, TransientErrorSignature, buildConversationGraph, buildSettlementNotice, classifyError, clearHubCache, computeTranscriptHash, decideTailSettle, decodeProtobufTaskDetails, AntigravityBridgePlugin as default, discoverHub, extractErrorMessage, fileToMedia, formatAuthExpiredTerminalError, formatExhaustedRetryError, getAutoResumeBackoffMs, getConversationTree, getDefaultAppDataDir, getMaxRetriesForSignature, getStepEffectiveStatus, guessMimeType, isAuthTokenExpiredError, isCascadeRunStatusActive, isCortexStatusActive, isCortexStatusTerminal, isInternalEngineRetryError, isNetworkError, isStaleHubError, isTaskIdMatch, isTransientRetryableError, isWaitingSpeech, listConversations, loadTranscriptFile, normalizeModelName, normalizePromptParts, parseRetriesRemaining, parseStructuredTrajectoryTasks, parseTranscript, pollTranscript, pruneStaleBackgroundTasks, readCascadeTranscript, readStructuredTasksFromSqlite, renderAsciiTree, snapshotAntigravityConfig };
+export { ANTIGRAVITY_MODELS, AUTO_CONTINUE_QUIET_MS, ActiveBackgroundTask, AgentInitConfig, AgentStep, AntigravityAgent, AntigravityConfig, AntigravityEngine, AntigravityModelInfo, AntigravityService, AutoContinueReason, AutoResumeConfig, BACKOFF_SCHEDULE_MS, BackgroundTaskProgress, CASCADE_RUN_ACTIVE_CODES, CASCADE_RUN_ACTIVE_NAMES, CORTEX_ACTIVE_STATUS_CODES, CORTEX_ACTIVE_STATUS_NAMES, CORTEX_TERMINAL_STATUS_CODES, CORTEX_TERMINAL_STATUS_NAMES, CascadeDetailedResult, Config, ConversationSummary, ConversationTreeNode, DEFAULT_AUTO_CONTINUE_MAX, DEFAULT_AUTO_CONTINUE_MESSAGE, DEFAULT_BACKGROUND_TASK_STALL_THRESHOLD_MS, DEFAULT_MODEL_ID, DEFAULT_WATCH_MAX_MS, EngineConfig, ErrorClassification, HarnessSessionInfo, HubCallOptions, HubClient, HubInfo, HubRun, IDE_TIMER_SYSTEM_MESSAGE_REGEX, LAUNCH_OBSERVATION_GRACE_MS, ListConversationsOptions, LiveAntigravityConfig, LoadedTranscript, MAX_CONSECUTIVE_NOTICE_WAKES, MODEL_FORMAT_ERROR_PATTERN, MediaInput, NETWORK_ERROR_PATTERN, OBSERVATIONAL_TOOL_NAMES, PendingToolApproval, PersistedBridgeState, PersistedQueuedMessage, PersistedRun, PollResult, PromptContent, PromptItem, ProtoMediaPart, PruneStaleTasksOptions, RunOneShotOptions, SETTLE_CONFIRMATION_INTERVAL_MS, SETTLE_STABLE_MS, SessionContinuationMode, SettleGuardAction, SettleGuardDecision, SettleGuardInput, SettleGuardReason, SettlementNoticePayload, SettlementOutboxItem, StartCascadeOptions, StatusTransition, StructuredCascadeTasksResult, TaskSilenceEntry, TokenUsage, TrajectoryResponse, TrajectoryStep, TrajectoryStepDetail, TrajectoryStepMetadata, TranscriptSnapshot, TranscriptStep, TranscriptTailKind, TransientErrorSignature, assessBackgroundTaskProgress, buildConversationGraph, buildSettlementNotice, classifyError, clearHubCache, computeTranscriptHash, decideTailSettle, decodeProtobufTaskDetails, AntigravityBridgePlugin as default, discoverHub, extractErrorMessage, fileToMedia, formatAuthExpiredTerminalError, formatExhaustedRetryError, getAutoResumeBackoffMs, getConversationTree, getDefaultAppDataDir, getMaxRetriesForSignature, getStepEffectiveStatus, guessMimeType, isAuthTokenExpiredError, isCascadeRunStatusActive, isCortexStatusActive, isCortexStatusTerminal, isInternalEngineRetryError, isNetworkError, isStaleHubError, isTaskIdMatch, isTransientRetryableError, isWaitingSpeech, listConversations, loadTranscriptFile, normalizeModelName, normalizePromptParts, parseRetriesRemaining, parseStructuredTrajectoryTasks, parseTranscript, pollTranscript, pruneStaleBackgroundTasks, readCascadeTranscript, readStructuredTasksFromSqlite, renderAsciiTree, snapshotAntigravityConfig };
 //# sourceMappingURL=index.d.mts.map

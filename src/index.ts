@@ -27,7 +27,9 @@ import {
   PendingToolApproval,
   decideTailSettle,
   LAUNCH_OBSERVATION_GRACE_MS,
+  DEFAULT_BACKGROUND_TASK_STALL_THRESHOLD_MS,
   pruneStaleBackgroundTasks,
+  assessBackgroundTaskProgress,
   parseStructuredTrajectoryTasks,
   readStructuredTasksFromSqlite,
   type TranscriptSnapshot,
@@ -106,6 +108,8 @@ export interface AntigravityConfig {
   autoContinueMax?: number;
   /** Message sent to the cascade for each tail-guard auto-continue (default "Continue"). */
   autoContinueMessage?: string;
+  /** Inactivity threshold (ms) of zero log/transcript output before a background task is flagged as suspected-stalled in waiting-background notifications (default 15m, 900,000ms). */
+  backgroundTaskStallThresholdMs?: number;
 }
 
 // NOTE: intentionally unannotated (sibling-vertex-bridge style). Direct-call
@@ -140,6 +144,7 @@ export const Config = Schema.object({
   autoContinueMax: Schema.number().default(DEFAULT_AUTO_CONTINUE_MAX).description('Max consecutive auto-"Continue" nudges per turn when the transcript tail shows unfinished work (tool tail / no assistant text); 0 disables nudging (default 5)').volatile(),
   autoContinueMessage: Schema.string().default(DEFAULT_AUTO_CONTINUE_MESSAGE).description('Message sent to the cascade for each tail-guard auto-continue (default "Continue")').volatile(),
   stallTimeoutMs: Schema.number().default(120_000).description('Inactivity timeout in ms for mid-turn running cascade before triggering stall recovery (default 120000, 2m)').volatile(),
+  backgroundTaskStallThresholdMs: Schema.number().default(DEFAULT_BACKGROUND_TASK_STALL_THRESHOLD_MS).description('Threshold in ms of zero log output before a background task is reported as suspected-stalled in waiting notifications (default 15m)').volatile(),
 });
 
 /** Live volatile references delivered by the Loader; snapshot into {@link AntigravityConfig} to read. */
@@ -161,6 +166,7 @@ export interface LiveAntigravityConfig {
   autoContinueMax: Volatile<number>;
   autoContinueMessage: Volatile<string>;
   stallTimeoutMs: Volatile<number>;
+  backgroundTaskStallThresholdMs: Volatile<number>;
 }
 
 /** Snapshot the live volatile references into plain values. The Loader commits Settings form edits into the running references and emits `loader/volatile-update`; `get()` reads the just-committed value. */
@@ -183,6 +189,7 @@ export function snapshotAntigravityConfig(live: LiveAntigravityConfig): Antigrav
     autoContinueMax: live.autoContinueMax.get(),
     autoContinueMessage: live.autoContinueMessage.get(),
     stallTimeoutMs: live.stallTimeoutMs.get(),
+    backgroundTaskStallThresholdMs: live.backgroundTaskStallThresholdMs.get(),
   };
 }
 
@@ -254,6 +261,8 @@ export interface HubRun {
     transcriptHash: string;
     firstSeenAt: number;
   };
+  /** Whether one or more active background tasks are suspected to be stalled (exceeded stall threshold with zero log/transcript output). */
+  hasStalledBackgroundTasks?: boolean;
 }
 
 export function computeTranscriptHash(snap: TranscriptSnapshot | undefined): string {
@@ -328,6 +337,7 @@ export interface PersistedRun {
     transcriptHash: string;
     firstSeenAt: number;
   };
+  hasStalledBackgroundTasks?: boolean;
 }
 
 export interface PersistedQueuedMessage {
@@ -360,6 +370,8 @@ export interface CascadeDetailedResult {
   activeBackgroundTasks?: ActiveBackgroundTask[];
   /** Residual background tasks running (infinitely silenced) when settled. */
   residualBackgroundTasks?: string[];
+  /** Whether one or more active background tasks are suspected to be stalled. */
+  hasStalledBackgroundTasks?: boolean;
 }
 
 export interface SettlementNoticePayload {
@@ -1529,15 +1541,32 @@ export class AntigravityService extends Service {
       const elapsedSec = Math.max(1, Math.round(elapsedEpisodeMs / 1000));
       const elapsedMin = (elapsedSec / 60).toFixed(1);
 
+      const hasStalledTasks = unsilencedTasks.some((t) => t.isStalled);
       const silencedCount = activeTasks.length - unsilencedTasks.length;
       const silencedNote = silencedCount > 0 ? `\n- (${silencedCount} 个已静默后台任务未列出)` : '';
       const taskLines =
         unsilencedTasks.length > 0
-          ? unsilencedTasks.map((t) => `- \`${t.taskId}\`: ${t.description || '执行中'}`).join('\n') + silencedNote
+          ? unsilencedTasks
+              .map((t) => {
+                const desc = t.description || '执行中';
+                if (t.isStalled) {
+                  const silentMin = ((t.stalledDurationMs ?? 0) / 60_000).toFixed(1);
+                  return `- \`${t.taskId}\`: ${desc} — ⚠️ **疑似停滞** (已无日志输出 ${silentMin} 分钟)`;
+                }
+                return `- \`${t.taskId}\`: ${desc}`;
+              })
+              .join('\n') + silencedNote
           : '- (未知后台任务)';
 
-      const summary = `⏳ [Antigravity] ${run.cascadeId.slice(0, 8)} 后台任务运行中 (已等待 ${elapsedMin} 分钟)`;
-      const noticeText = `### ⏳ Antigravity Cascade 正在等待后台任务\n- **Cascade ID**: \`${run.cascadeId}\`\n- **Status**: \`waiting-background\`\n- **已等待时长**: ${elapsedMin} 分钟 (${elapsedSec}秒)\n- **运行中后台任务 (${activeTasks.length})**:\n${taskLines}\n\n> ⚠️ 后台任务仍在执行中，未到达真正完成状态。后台任务完成后 hub 将自动唤醒会话并继续/结算。`;
+      const summary = hasStalledTasks
+        ? `⚠️ [Antigravity] ${run.cascadeId.slice(0, 8)} 后台任务疑似停滞 (已无输出 ${elapsedMin} 分钟)`
+        : `⏳ [Antigravity] ${run.cascadeId.slice(0, 8)} 后台任务运行中 (已等待 ${elapsedMin} 分钟)`;
+
+      const warningAdvice = hasStalledTasks
+        ? `> ⚠️ **警告**：检测到后台任务长期无任何输出写入，疑似卡死或进程已异常退出！\n> - 若任务确已终止，可通过 \`antigravity_cancel\` 或 IDE 手工停止/取消该任务以触发正常结算；\n> - 若为合法长时间无输出任务，可通过 \`antigravity_silence_task\` 进行静默，避免阻塞结算。`
+        : `> ⚠️ 后台任务仍在执行中，未到达真正完成状态。后台任务完成后 hub 将自动唤醒会话并继续/结算。`;
+
+      const noticeText = `### ${hasStalledTasks ? '⚠️' : '⏳'} Antigravity Cascade ${hasStalledTasks ? '后台任务疑似停滞' : '正在等待后台任务'}\n- **Cascade ID**: \`${run.cascadeId}\`\n- **Status**: \`waiting-background\`${hasStalledTasks ? ' (疑似停滞)' : ''}\n- **已等待时长**: ${elapsedMin} 分钟 (${elapsedSec}秒)\n- **运行中后台任务 (${activeTasks.length})**:\n${taskLines}\n\n${warningAdvice}`;
 
       const message = {
         id: crypto.randomUUID(),
@@ -1760,6 +1789,7 @@ export class AntigravityService extends Service {
       const client = await this.getHubClient();
       if (client && typeof (client as any).getCascadeTasks === 'function') {
         const raw = await (client as any).getCascadeTasks(cascadeId);
+        raw.authoritative = true;
         const result = enrichResult(raw);
         this.trajectoryTaskCache.set(cascadeId, {
           lastFetchedAt: now,
@@ -1770,6 +1800,7 @@ export class AntigravityService extends Service {
       } else if (client && typeof (client as any).getCascadeTrajectory === 'function') {
         const resp = await (client as any).getCascadeTrajectory(cascadeId);
         const raw = parseStructuredTrajectoryTasks(resp, cascadeId);
+        raw.authoritative = true;
         const result = enrichResult(raw);
         this.trajectoryTaskCache.set(cascadeId, {
           lastFetchedAt: now,
@@ -1786,6 +1817,7 @@ export class AntigravityService extends Service {
     try {
       const sqliteRaw = readStructuredTasksFromSqlite(cascadeId);
       if (sqliteRaw) {
+        sqliteRaw.authoritative = true;
         const sqliteResult = enrichResult(sqliteRaw);
         this.trajectoryTaskCache.set(cascadeId, {
           lastFetchedAt: now,
@@ -1803,7 +1835,7 @@ export class AntigravityService extends Service {
       return enrichResult(cached.result);
     }
 
-    return enrichResult({ activeTasks: [], allTasks: [], hasActiveChildren: false });
+    return enrichResult({ activeTasks: [], allTasks: [], hasActiveChildren: false, authoritative: false });
   }
 
   /**
@@ -2077,19 +2109,72 @@ export class AntigravityService extends Service {
     const snap = await readCascadeTranscript(brainDir, conversationId, baselineStepIndex);
     const existingRun = this.runs.get(conversationId);
     let status: HubRun['status'] = existingRun?.status ?? 'running';
+    let startedAt = existingRun?.startedAt;
+    if (!startedAt) {
+      if (snap?.firstCreatedAt) {
+        const parsed = Date.parse(snap.firstCreatedAt);
+        if (!Number.isNaN(parsed)) startedAt = parsed;
+      }
+      startedAt = startedAt ?? Date.now();
+    }
+
+    const sinceLifecycleStartMs = Date.now() - startedAt;
+    const outsideGraceWindow = sinceLifecycleStartMs >= LAUNCH_OBSERVATION_GRACE_MS;
+
     const structuredTasks = await this.getStructuredCascadeTasks(
       conversationId,
       brainDir,
       snap?.maxStepIndex ?? -1,
     );
-    if (structuredTasks.activeTasks.length > 0 || structuredTasks.allTasks.length > 0 || structuredTasks.hasActiveChildren) {
+
+    if (structuredTasks.authoritative && outsideGraceWindow) {
+      if (snap) {
+        snap.activeBackgroundTasks = structuredTasks.activeTasks;
+        snap.hasActiveChildren = structuredTasks.hasActiveChildren;
+      }
+    } else if (structuredTasks.activeTasks.length > 0 || structuredTasks.allTasks.length > 0 || structuredTasks.hasActiveChildren) {
       if (snap) {
         snap.activeBackgroundTasks = structuredTasks.activeTasks;
         snap.hasActiveChildren = structuredTasks.hasActiveChildren;
       }
     }
 
-    const activeTasks = snap?.activeBackgroundTasks ?? structuredTasks.activeTasks;
+    const rawActiveTasks = (structuredTasks.authoritative && outsideGraceWindow)
+      ? structuredTasks.activeTasks
+      : (snap?.activeBackgroundTasks ?? structuredTasks.activeTasks);
+
+    const lastActiveMs = snap?.lastActiveAt
+      ? Date.parse(snap.lastActiveAt)
+      : (existingRun?.lastActiveAt ? Date.parse(existingRun.lastActiveAt) : Date.now());
+    const effectiveLastActiveMs = Number.isNaN(lastActiveMs) ? Date.now() : lastActiveMs;
+    const { activeTasks: prunedTasks } = pruneStaleBackgroundTasks(rawActiveTasks, {
+      nowMs: Date.now(),
+      lastActiveAtMs: effectiveLastActiveMs,
+    });
+
+    const stallThresholdMs = this.config.backgroundTaskStallThresholdMs ?? DEFAULT_BACKGROUND_TASK_STALL_THRESHOLD_MS;
+    const activeTasks = prunedTasks.map((t) => {
+      const progress = assessBackgroundTaskProgress(t, {
+        brainDir,
+        cascadeId: conversationId,
+        nowMs: Date.now(),
+        stallThresholdMs,
+        transcriptLastActiveAt: snap?.lastActiveAt ?? existingRun?.lastActiveAt,
+      });
+      if (progress.isStalled) {
+        return {
+          ...t,
+          isStalled: true,
+          stalledDurationMs: progress.stalledDurationMs,
+          lastProgressAt: progress.lastProgressAt,
+        };
+      }
+      return t;
+    });
+    if (snap) {
+      snap.activeBackgroundTasks = activeTasks;
+    }
+
     const blockingTasks = activeTasks.filter((t) => {
       const silence = this.isTaskSilenced(conversationId, t.taskId);
       return !silence || !silence.infinite;
@@ -2099,15 +2184,6 @@ export class AntigravityService extends Service {
       return !!silence && silence.infinite;
     });
     const hasActiveChildren = Boolean(snap?.hasActiveChildren || structuredTasks.hasActiveChildren);
-
-    let startedAt = existingRun?.startedAt;
-    if (!startedAt) {
-      if (snap?.firstCreatedAt) {
-        const parsed = Date.parse(snap.firstCreatedAt);
-        if (!Number.isNaN(parsed)) startedAt = parsed;
-      }
-      startedAt = startedAt ?? Date.now();
-    }
 
     const isExplicitlyStopped = Boolean(
       structuredTasks.isCanceled ||
@@ -2207,6 +2283,7 @@ export class AntigravityService extends Service {
         status === 'done'
           ? (snap?.maxStepIndex ?? existingRun?.settledStepIndex)
           : existingRun?.settledStepIndex,
+      hasStalledBackgroundTasks: activeTasks.some((t) => t.isStalled),
     };
     this.runs.set(conversationId, updatedRun);
     this.saveStateDebounced();
@@ -2219,6 +2296,7 @@ export class AntigravityService extends Service {
       error: updatedRun.error,
       activeBackgroundTasks: snap?.activeBackgroundTasks,
       residualBackgroundTasks: updatedRun.residualBackgroundTasks,
+      hasStalledBackgroundTasks: updatedRun.hasStalledBackgroundTasks,
     };
   }
 
@@ -2438,7 +2516,19 @@ export class AntigravityService extends Service {
               stepNow,
               true /* forceRefresh */,
             );
-            const activeTasks = snap?.activeBackgroundTasks ?? structuredTasks.activeTasks;
+            const outsideGraceWindow = Date.now() - (run.startedAt ?? Date.now()) >= LAUNCH_OBSERVATION_GRACE_MS;
+            const rawActiveTasks = (structuredTasks.authoritative && outsideGraceWindow)
+              ? structuredTasks.activeTasks
+              : (snap?.activeBackgroundTasks ?? structuredTasks.activeTasks);
+            const lastActiveMs = snap?.lastActiveAt
+              ? Date.parse(snap.lastActiveAt)
+              : (run.lastActiveAt ? Date.parse(run.lastActiveAt) : Date.now());
+            const effectiveLastActiveMs = Number.isNaN(lastActiveMs) ? Date.now() : lastActiveMs;
+            const { activeTasks: prunedTasks } = pruneStaleBackgroundTasks(rawActiveTasks, {
+              nowMs: Date.now(),
+              lastActiveAtMs: effectiveLastActiveMs,
+            });
+            const activeTasks = prunedTasks;
             const blockingTasks = activeTasks.filter((t) => {
               const silence = this.isTaskSilenced(cascadeId, t.taskId);
               return !silence.infinite;
@@ -2552,6 +2642,10 @@ export class AntigravityService extends Service {
         const stalledMs = Date.now() - stallSince;
 
         // Structured task state query (GetCascadeTrajectory with throttling + caching + SQLite fallback)
+        const sinceLifecycleStartMs = Date.now() - (run.startedAt ?? Date.now());
+        const outsideGraceWindow = sinceLifecycleStartMs >= LAUNCH_OBSERVATION_GRACE_MS;
+
+        // Structured task state query (GetCascadeTrajectory with throttling + caching + SQLite fallback)
         // Requirement 2: Settlement decision path MUST bypass cache (forceRefresh = true).
         // Non-settlement monitoring / notification path uses 3s cache throttling.
         const isSettleCandidate = snap && !snap.error && !snap.pendingApproval && snap.isFinished;
@@ -2562,14 +2656,56 @@ export class AntigravityService extends Service {
           Boolean(isSettleCandidate),
         );
 
-        if (snap) {
-          if (structuredTasks.activeTasks.length > 0 || structuredTasks.allTasks.length > 0 || structuredTasks.hasActiveChildren) {
+        if (structuredTasks.authoritative && outsideGraceWindow) {
+          if (snap) {
+            snap.activeBackgroundTasks = structuredTasks.activeTasks;
+            snap.hasActiveChildren = structuredTasks.hasActiveChildren;
+          }
+        } else if (structuredTasks.activeTasks.length > 0 || structuredTasks.allTasks.length > 0 || structuredTasks.hasActiveChildren) {
+          if (snap) {
             snap.activeBackgroundTasks = structuredTasks.activeTasks;
             snap.hasActiveChildren = structuredTasks.hasActiveChildren;
           }
         }
 
-        const activeTasks = snap?.activeBackgroundTasks ?? structuredTasks.activeTasks;
+        const rawActiveTasks = (structuredTasks.authoritative && outsideGraceWindow)
+          ? structuredTasks.activeTasks
+          : (snap?.activeBackgroundTasks ?? structuredTasks.activeTasks);
+
+        const lastActiveMs = snap?.lastActiveAt
+          ? Date.parse(snap.lastActiveAt)
+          : (run.lastActiveAt ? Date.parse(run.lastActiveAt) : Date.now());
+        const effectiveLastActiveMs = Number.isNaN(lastActiveMs) ? Date.now() : lastActiveMs;
+        const { activeTasks: prunedTasks } = pruneStaleBackgroundTasks(rawActiveTasks, {
+          nowMs: Date.now(),
+          lastActiveAtMs: effectiveLastActiveMs,
+        });
+
+        const stallThresholdMs = this.config.backgroundTaskStallThresholdMs ?? DEFAULT_BACKGROUND_TASK_STALL_THRESHOLD_MS;
+        const activeTasks = prunedTasks.map((t) => {
+          const progress = assessBackgroundTaskProgress(t, {
+            brainDir,
+            cascadeId,
+            nowMs: Date.now(),
+            stallThresholdMs,
+            transcriptLastActiveAt: snap?.lastActiveAt ?? run.lastActiveAt,
+          });
+          if (progress.isStalled) {
+            return {
+              ...t,
+              isStalled: true,
+              stalledDurationMs: progress.stalledDurationMs,
+              lastProgressAt: progress.lastProgressAt,
+            };
+          }
+          return t;
+        });
+        if (snap) {
+          snap.activeBackgroundTasks = activeTasks;
+        }
+
+        run.hasStalledBackgroundTasks = activeTasks.some((t) => t.isStalled);
+
         const blockingTasks = activeTasks.filter((t) => {
           const silence = this.isTaskSilenced(cascadeId, t.taskId);
           return !silence.infinite;
@@ -2900,7 +3036,15 @@ export class AntigravityService extends Service {
             }
             const freshStepNow = freshSnap?.maxStepIndex ?? -1;
             const freshHash = computeTranscriptHash(freshSnap);
-            const freshActiveTasks = freshTasks.activeTasks.filter(
+            const freshLastActiveMs = freshSnap?.lastActiveAt
+              ? Date.parse(freshSnap.lastActiveAt)
+              : (run.lastActiveAt ? Date.parse(run.lastActiveAt) : Date.now());
+            const effectiveFreshLastActiveMs = Number.isNaN(freshLastActiveMs) ? Date.now() : freshLastActiveMs;
+            const { activeTasks: prunedFreshTasks } = pruneStaleBackgroundTasks(freshTasks.activeTasks, {
+              nowMs: Date.now(),
+              lastActiveAtMs: effectiveFreshLastActiveMs,
+            });
+            const freshActiveTasks = prunedFreshTasks.filter(
               (t) => !this.isTaskSilenced(cascadeId, t.taskId).infinite
             );
 
@@ -3224,12 +3368,51 @@ export class AntigravityService extends Service {
           snap.maxStepIndex,
           true,
         );
-        if (structuredTasks.activeTasks.length > 0 || structuredTasks.allTasks.length > 0 || structuredTasks.hasActiveChildren) {
+        const outsideGraceWindow = Date.now() - startedAt >= LAUNCH_OBSERVATION_GRACE_MS;
+        if (structuredTasks.authoritative && outsideGraceWindow) {
+          snap.activeBackgroundTasks = structuredTasks.activeTasks;
+          snap.hasActiveChildren = structuredTasks.hasActiveChildren;
+        } else if (structuredTasks.activeTasks.length > 0 || structuredTasks.allTasks.length > 0 || structuredTasks.hasActiveChildren) {
           snap.activeBackgroundTasks = structuredTasks.activeTasks;
           snap.hasActiveChildren = structuredTasks.hasActiveChildren;
         }
       }
-      const activeTasks = snap?.activeBackgroundTasks ?? structuredTasks.activeTasks;
+      const outsideGraceWindow = Date.now() - startedAt >= LAUNCH_OBSERVATION_GRACE_MS;
+      const rawActiveTasks = (structuredTasks.authoritative && outsideGraceWindow)
+        ? structuredTasks.activeTasks
+        : (snap?.activeBackgroundTasks ?? structuredTasks.activeTasks);
+
+      const lastActiveMs = snap?.lastActiveAt
+        ? Date.parse(snap.lastActiveAt)
+        : Date.now();
+      const effectiveLastActiveMs = Number.isNaN(lastActiveMs) ? Date.now() : lastActiveMs;
+      const { activeTasks: prunedTasks } = pruneStaleBackgroundTasks(rawActiveTasks, {
+        nowMs: Date.now(),
+        lastActiveAtMs: effectiveLastActiveMs,
+      });
+
+      const stallThresholdMs = this.config.backgroundTaskStallThresholdMs ?? DEFAULT_BACKGROUND_TASK_STALL_THRESHOLD_MS;
+      const activeTasks = prunedTasks.map((t) => {
+        const progress = assessBackgroundTaskProgress(t, {
+          brainDir,
+          cascadeId: conversationId,
+          nowMs: Date.now(),
+          stallThresholdMs,
+          transcriptLastActiveAt: snap?.lastActiveAt,
+        });
+        if (progress.isStalled) {
+          return {
+            ...t,
+            isStalled: true,
+            stalledDurationMs: progress.stalledDurationMs,
+            lastProgressAt: progress.lastProgressAt,
+          };
+        }
+        return t;
+      });
+      if (snap) {
+        snap.activeBackgroundTasks = activeTasks;
+      }
       const hasBlockingTasks = activeTasks.some((t) => {
         const silence = this.isTaskSilenced(conversationId, t.taskId);
         return !silence.infinite;
