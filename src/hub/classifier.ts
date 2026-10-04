@@ -5,6 +5,8 @@
  * 1. Empty model output ('model_output_empty')
  * 2. Interrupted stream ('stream_interrupted')
  * 3. Expired OAuth access token ('auth_token_expired') - HTTP 401 with invalid_token / UNAUTHENTICATED
+ * 4. Network / transport failures ('network_error') - HTTP 5xx/429, socket drops, EOF,
+ *    and TLS/HTTP2 wire-level faults (e.g. `local error: tls: bad record MAC`)
  *
  * Terminal non-retryable errors:
  * - DELIVERY FAILED / hub-side dead state
@@ -55,8 +57,38 @@ export const MODEL_FORMAT_ERROR_PATTERN =
   /(?:improperly formatted function call|Malformed function call|Failed to parse function call|Function call is empty|Please retry with a properly formatted function call)/i;
 
 /** Common network, transport, server unavailable, and connection error pattern. */
-export const NETWORK_ERROR_PATTERN =
+const NETWORK_ERROR_BASE_PATTERN =
   /(?:network\s*(?:error|timeout)|fetch failed|ECONNRESET|ECONNREFUSED|ETIMEDOUT|EPIPE|ENOTFOUND|socket hang up|connection (?:reset|closed|aborted|refused)|connect(?:ion)? refused|stream (?:disconnected|closed|error)|event stream (?:closed|error|disconnected)|SSE (?:error|disconnect|closed)|UND_ERR_\w+|\b(?:502|503|504|429)\b|UNAVAILABLE|RESOURCE_EXHAUSTED|Service Unavailable|Bad Gateway|Gateway Timeout|Too Many Requests|Rate limit|\bEOF\b|unexpected EOF|连接拒绝|拒绝连接|连接重置|网络异常|网络超时)/i;
+
+/**
+ * TLS / HTTP2 / socket-layer transport failure pattern.
+ *
+ * These are wire-level faults raised by Go's crypto/tls, net/http2 and the OS socket stack, e.g. the
+ * production capture
+ *   `API error (attempt 1): request failed: Post ".../streamGenerateContent?alt=sse": local error: tls: bad record MAC`
+ * They mean the TLS session or the TCP stream broke mid-request while the cascade's own state stayed
+ * intact, so the bridge must back off and let the engine re-issue the request — never terminate.
+ *
+ * Scope is deliberately enumerated rather than a blanket `tls:` / `certificate`: certificate and
+ * hostname verification failures (`x509: certificate signed by unknown authority`,
+ * `tls: failed to verify certificate`) are NOT transient — they repeat forever and stay terminal.
+ *
+ * Grouped by layer:
+ * - TLS record/handshake: bad MAC, non-handshake first record, handshake failure/timeout,
+ *   protocol-version negotiation, missing close_notify.
+ * - TCP/socket teardown: peer reset, forcible close by remote host, closed network connection,
+ *   broken pipe, idle-connection close, dial failure, DNS resolution failure.
+ * - HTTP/2: GOAWAY, client connection lost, connection/stream error.
+ * - WebSocket: abnormal close codes 1001-1006 (1000 is a clean close and is deliberately absent).
+ */
+export const TLS_TRANSPORT_ERROR_PATTERN =
+  /(?:bad record MAC|first record does not look like a TLS handshake|handshake failure|TLS handshake timeout|tls:\s*timeout|i\/o timeout|(?:tls:\s*protocol version not supported|server selected unsupported protocol version)|without sending TLS close_notify|connection reset by peer|forcibly closed by (?:the )?remote host|remote host closed the connection|use of closed network connection|broken pipe|server closed idle connection|dial tcp|transport: Error while dialing|EAI_AGAIN|no such host|http2:\s*(?:server sent GOAWAY|client connection lost|connection error|stream error)|websocket:\s*(?:close 100[1-6]|abnormal closure|unexpected close|not established))/i;
+
+/** Composed network error pattern: D3 HTTP/status/socket keywords + TLS/HTTP2 transport faults. */
+export const NETWORK_ERROR_PATTERN = new RegExp(
+  `${NETWORK_ERROR_BASE_PATTERN.source}|${TLS_TRANSPORT_ERROR_PATTERN.source}`,
+  'i',
+);
 
 /** Recognized transient retryable error signatures. */
 const TRANSIENT_PATTERNS: Array<{ signature: TransientErrorSignature; pattern: RegExp }> = [
@@ -173,6 +205,9 @@ export function formatExhaustedRetryError(
 
 /**
  * Checks if the error string matches a network error, connection drop, fetch failure, or socket timeout.
+ *
+ * Raw text helper: it only applies the terminal guard + network table and does NOT implement the
+ * `Retries remaining: 0` precedence rule. Use `classifyError` for any retry/settle decision.
  */
 export function isNetworkError(rawError: string): boolean {
   for (const term of TERMINAL_PATTERNS) {

@@ -718,6 +718,8 @@ declare class HubClient {
  * 1. Empty model output ('model_output_empty')
  * 2. Interrupted stream ('stream_interrupted')
  * 3. Expired OAuth access token ('auth_token_expired') - HTTP 401 with invalid_token / UNAUTHENTICATED
+ * 4. Network / transport failures ('network_error') - HTTP 5xx/429, socket drops, EOF,
+ *    and TLS/HTTP2 wire-level faults (e.g. `local error: tls: bad record MAC`)
  *
  * Terminal non-retryable errors:
  * - DELIVERY FAILED / hub-side dead state
@@ -741,7 +743,29 @@ interface ErrorClassification {
 }
 /** Pattern recognizing model format and malformed function call errors. */
 declare const MODEL_FORMAT_ERROR_PATTERN: RegExp;
-/** Common network, transport, server unavailable, and connection error pattern. */
+/**
+ * TLS / HTTP2 / socket-layer transport failure pattern.
+ *
+ * These are wire-level faults raised by Go's crypto/tls, net/http2 and the OS socket stack, e.g. the
+ * production capture
+ *   `API error (attempt 1): request failed: Post ".../streamGenerateContent?alt=sse": local error: tls: bad record MAC`
+ * They mean the TLS session or the TCP stream broke mid-request while the cascade's own state stayed
+ * intact, so the bridge must back off and let the engine re-issue the request — never terminate.
+ *
+ * Scope is deliberately enumerated rather than a blanket `tls:` / `certificate`: certificate and
+ * hostname verification failures (`x509: certificate signed by unknown authority`,
+ * `tls: failed to verify certificate`) are NOT transient — they repeat forever and stay terminal.
+ *
+ * Grouped by layer:
+ * - TLS record/handshake: bad MAC, non-handshake first record, handshake failure/timeout,
+ *   protocol-version negotiation, missing close_notify.
+ * - TCP/socket teardown: peer reset, forcible close by remote host, closed network connection,
+ *   broken pipe, idle-connection close, dial failure, DNS resolution failure.
+ * - HTTP/2: GOAWAY, client connection lost, connection/stream error.
+ * - WebSocket: abnormal close codes 1001-1006 (1000 is a clean close and is deliberately absent).
+ */
+declare const TLS_TRANSPORT_ERROR_PATTERN: RegExp;
+/** Composed network error pattern: D3 HTTP/status/socket keywords + TLS/HTTP2 transport faults. */
 declare const NETWORK_ERROR_PATTERN: RegExp;
 /** Default exponential backoff delay schedule for auto-resume: 2s, 5s, 10s. */
 declare const BACKOFF_SCHEDULE_MS: readonly [2000, 5000, 10000];
@@ -770,6 +794,9 @@ declare function formatAuthExpiredTerminalError(details?: string): string;
 declare function formatExhaustedRetryError(retries: number, originalError: string, signature?: TransientErrorSignature): string;
 /**
  * Checks if the error string matches a network error, connection drop, fetch failure, or socket timeout.
+ *
+ * Raw text helper: it only applies the terminal guard + network table and does NOT implement the
+ * `Retries remaining: 0` precedence rule. Use `classifyError` for any retry/settle decision.
  */
 declare function isNetworkError(rawError: string): boolean;
 /**
@@ -1409,5 +1436,5 @@ declare class AntigravityBridgePlugin {
   constructor(ctx: Context, config: LiveAntigravityConfig);
 }
 //#endregion
-export { ANTIGRAVITY_MODELS, AUTO_CONTINUE_QUIET_MS, ActiveBackgroundTask, AgentInitConfig, AgentStep, AntigravityAgent, AntigravityConfig, AntigravityEngine, AntigravityModelInfo, AntigravityService, AutoContinueReason, AutoResumeConfig, BACKOFF_SCHEDULE_MS, BackgroundTaskProgress, CASCADE_RUN_ACTIVE_CODES, CASCADE_RUN_ACTIVE_NAMES, CORTEX_ACTIVE_STATUS_CODES, CORTEX_ACTIVE_STATUS_NAMES, CORTEX_TERMINAL_STATUS_CODES, CORTEX_TERMINAL_STATUS_NAMES, CascadeDetailedResult, Config, ConversationSummary, ConversationTreeNode, DEFAULT_AUTO_CONTINUE_MAX, DEFAULT_AUTO_CONTINUE_MESSAGE, DEFAULT_BACKGROUND_TASK_STALL_THRESHOLD_MS, DEFAULT_MODEL_ID, DEFAULT_WATCH_MAX_MS, EngineConfig, ErrorClassification, HarnessSessionInfo, HubCallOptions, HubClient, HubInfo, HubRun, IDE_TIMER_SYSTEM_MESSAGE_REGEX, LAUNCH_OBSERVATION_GRACE_MS, ListConversationsOptions, LiveAntigravityConfig, LoadedTranscript, MAX_CONSECUTIVE_NOTICE_WAKES, MODEL_FORMAT_ERROR_PATTERN, MediaInput, NETWORK_ERROR_PATTERN, OBSERVATIONAL_TOOL_NAMES, PendingToolApproval, PersistedBridgeState, PersistedQueuedMessage, PersistedRun, PollResult, PromptContent, PromptItem, ProtoMediaPart, PruneStaleTasksOptions, RunOneShotOptions, SETTLE_CONFIRMATION_INTERVAL_MS, SETTLE_STABLE_MS, SessionContinuationMode, SettleGuardAction, SettleGuardDecision, SettleGuardInput, SettleGuardReason, SettlementNoticePayload, SettlementOutboxItem, StartCascadeOptions, StatusTransition, StructuredCascadeTasksResult, TaskSilenceEntry, TokenUsage, TrajectoryResponse, TrajectoryStep, TrajectoryStepDetail, TrajectoryStepMetadata, TranscriptSnapshot, TranscriptStep, TranscriptTailKind, TransientErrorSignature, assessBackgroundTaskProgress, buildConversationGraph, buildSettlementNotice, classifyError, clearHubCache, computeTranscriptHash, decideTailSettle, decodeProtobufTaskDetails, AntigravityBridgePlugin as default, discoverHub, extractErrorMessage, fileToMedia, formatAuthExpiredTerminalError, formatExhaustedRetryError, getAutoResumeBackoffMs, getConversationTree, getDefaultAppDataDir, getMaxRetriesForSignature, getStepEffectiveStatus, guessMimeType, isAuthTokenExpiredError, isCascadeRunStatusActive, isCortexStatusActive, isCortexStatusTerminal, isInternalEngineRetryError, isNetworkError, isStaleHubError, isTaskIdMatch, isTransientRetryableError, isWaitingSpeech, listConversations, loadTranscriptFile, normalizeModelName, normalizePromptParts, parseRetriesRemaining, parseStructuredTrajectoryTasks, parseTranscript, pollTranscript, pruneStaleBackgroundTasks, readCascadeTranscript, readStructuredTasksFromSqlite, renderAsciiTree, snapshotAntigravityConfig };
+export { ANTIGRAVITY_MODELS, AUTO_CONTINUE_QUIET_MS, ActiveBackgroundTask, AgentInitConfig, AgentStep, AntigravityAgent, AntigravityConfig, AntigravityEngine, AntigravityModelInfo, AntigravityService, AutoContinueReason, AutoResumeConfig, BACKOFF_SCHEDULE_MS, BackgroundTaskProgress, CASCADE_RUN_ACTIVE_CODES, CASCADE_RUN_ACTIVE_NAMES, CORTEX_ACTIVE_STATUS_CODES, CORTEX_ACTIVE_STATUS_NAMES, CORTEX_TERMINAL_STATUS_CODES, CORTEX_TERMINAL_STATUS_NAMES, CascadeDetailedResult, Config, ConversationSummary, ConversationTreeNode, DEFAULT_AUTO_CONTINUE_MAX, DEFAULT_AUTO_CONTINUE_MESSAGE, DEFAULT_BACKGROUND_TASK_STALL_THRESHOLD_MS, DEFAULT_MODEL_ID, DEFAULT_WATCH_MAX_MS, EngineConfig, ErrorClassification, HarnessSessionInfo, HubCallOptions, HubClient, HubInfo, HubRun, IDE_TIMER_SYSTEM_MESSAGE_REGEX, LAUNCH_OBSERVATION_GRACE_MS, ListConversationsOptions, LiveAntigravityConfig, LoadedTranscript, MAX_CONSECUTIVE_NOTICE_WAKES, MODEL_FORMAT_ERROR_PATTERN, MediaInput, NETWORK_ERROR_PATTERN, OBSERVATIONAL_TOOL_NAMES, PendingToolApproval, PersistedBridgeState, PersistedQueuedMessage, PersistedRun, PollResult, PromptContent, PromptItem, ProtoMediaPart, PruneStaleTasksOptions, RunOneShotOptions, SETTLE_CONFIRMATION_INTERVAL_MS, SETTLE_STABLE_MS, SessionContinuationMode, SettleGuardAction, SettleGuardDecision, SettleGuardInput, SettleGuardReason, SettlementNoticePayload, SettlementOutboxItem, StartCascadeOptions, StatusTransition, StructuredCascadeTasksResult, TLS_TRANSPORT_ERROR_PATTERN, TaskSilenceEntry, TokenUsage, TrajectoryResponse, TrajectoryStep, TrajectoryStepDetail, TrajectoryStepMetadata, TranscriptSnapshot, TranscriptStep, TranscriptTailKind, TransientErrorSignature, assessBackgroundTaskProgress, buildConversationGraph, buildSettlementNotice, classifyError, clearHubCache, computeTranscriptHash, decideTailSettle, decodeProtobufTaskDetails, AntigravityBridgePlugin as default, discoverHub, extractErrorMessage, fileToMedia, formatAuthExpiredTerminalError, formatExhaustedRetryError, getAutoResumeBackoffMs, getConversationTree, getDefaultAppDataDir, getMaxRetriesForSignature, getStepEffectiveStatus, guessMimeType, isAuthTokenExpiredError, isCascadeRunStatusActive, isCortexStatusActive, isCortexStatusTerminal, isInternalEngineRetryError, isNetworkError, isStaleHubError, isTaskIdMatch, isTransientRetryableError, isWaitingSpeech, listConversations, loadTranscriptFile, normalizeModelName, normalizePromptParts, parseRetriesRemaining, parseStructuredTrajectoryTasks, parseTranscript, pollTranscript, pruneStaleBackgroundTasks, readCascadeTranscript, readStructuredTasksFromSqlite, renderAsciiTree, snapshotAntigravityConfig };
 //# sourceMappingURL=index.d.mts.map

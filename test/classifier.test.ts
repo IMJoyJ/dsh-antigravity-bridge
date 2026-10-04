@@ -11,6 +11,8 @@ import {
   BACKOFF_SCHEDULE_MS,
   parseRetriesRemaining,
   isInternalEngineRetryError,
+  isNetworkError,
+  TLS_TRANSPORT_ERROR_PATTERN,
 } from '../src/hub/classifier.js';
 import { Config } from '../src/index.js';
 
@@ -459,6 +461,156 @@ describe('Error Signature Classifier', () => {
         expect(res.signature).toBe('network_error');
         expect(isTransientRetryableError(sample)).toBe(true);
       }
+    });
+  });
+
+  describe('TLS / HTTP2 Transport-Layer Transient Errors (W15 D3 follow-up)', () => {
+    /** Real production capture: the cascade that died before this fix. */
+    const productionErrorPayload = {
+      step_index: 180,
+      source: 'SYSTEM',
+      type: 'ERROR_MESSAGE',
+      status: 'DONE',
+      error:
+        'API error (attempt 1): request failed: Post "https://daily-cloudcode-pa.googleapis.com/v1internal:streamGenerateContent?alt=sse": local error: tls: bad record MAC',
+      created_at: '2026-10-04T17:00:56Z',
+    };
+    const productionErrorWrapper = `unknown agent error (raw: ${JSON.stringify(productionErrorPayload)})`;
+
+    const transportSamples: Array<[layer: string, message: string]> = [
+      // TLS record / handshake layer
+      ['tls bad record MAC', 'local error: tls: bad record MAC'],
+      ['tls first record is not a handshake', 'tls: first record does not look like a TLS handshake'],
+      ['tls handshake failure', 'net/http: TLS handshake failure'],
+      ['tls timeout', 'write: tls: timeout'],
+      ['i/o timeout', 'read tcp 10.0.0.1:52000->142.250.1.1:443: i/o timeout'],
+      ['tls protocol version not supported', 'remote error: tls: protocol version not supported'],
+      ['missing TLS close_notify', 'remote end closed connection without sending TLS close_notify'],
+      // TCP / socket teardown layer
+      ['connection reset by peer', 'read tcp 127.0.0.1:5000->127.0.0.1:7778: connection reset by peer'],
+      ['forcibly closed by remote host', 'An existing connection was forcibly closed by the remote host.'],
+      ['closed network connection', 'use of closed network connection'],
+      ['broken pipe', 'write tcp 10.0.0.5:443: write: broken pipe'],
+      ['server closed idle connection', 'http2: server closed idle connection'],
+      ['dial tcp failure', 'dial tcp: connectex: No connection could be made because the target machine actively refused it.'],
+      ['DNS resolution failure', 'dial tcp: lookup daily-cloudcode-pa.googleapis.com on 8.8.8.8:53: no such host'],
+      // HTTP/2 layer
+      ['http2 GOAWAY', 'http2: server sent GOAWAY and closed the connection'],
+      ['http2 client connection lost', 'http2: client connection lost'],
+      ['http2 connection error', 'http2: connection error: unexpected EOF'],
+      // WebSocket layer
+      ['websocket abnormal close 1006', 'read: websocket: close 1006 (abnormal closure): unexpected EOF'],
+      // D3 baseline coverage must survive the composition
+      ['D3 baseline connection closed', 'connection closed: EOF'],
+      ['D3 baseline Chinese connection reset', '远程主机强迫关闭了一个现有的连接 (连接重置)'],
+    ];
+
+    it.each(transportSamples)(
+      'should classify %s as transient network_error with backoff retry',
+      (_layer, message) => {
+        const res = classifyError(message);
+        expect(res.retryable).toBe(true);
+        expect(res.signature).toBe('network_error');
+        expect(res.reason).toBeUndefined();
+        expect(res.engineInternal).toBeUndefined();
+        expect(isTransientRetryableError(message)).toBe(true);
+        expect(isNetworkError(message)).toBe(true);
+        // network_error contract: capped retries + exponential backoff, never an immediate give-up.
+        expect(getMaxRetriesForSignature(res.signature)).toBe(3);
+        expect(getAutoResumeBackoffMs(0, res.signature)).toBe(2000);
+        expect(getAutoResumeBackoffMs(2, res.signature)).toBe(10000);
+      },
+    );
+
+    it('should classify the real production "tls: bad record MAC" cascade failure as retryable', () => {
+      // The trajectory payload shape the bridge actually receives.
+      expect(extractErrorMessage(productionErrorPayload)).toBe(productionErrorPayload.error);
+      const inputs: unknown[] = [
+        productionErrorPayload,
+        productionErrorWrapper,
+        new Error(productionErrorWrapper),
+      ];
+      for (const input of inputs) {
+        const res = classifyError(input);
+        expect(res.retryable).toBe(true);
+        expect(res.signature).toBe('network_error');
+      }
+    });
+
+    it('should keep the transport pattern layer-scoped (cert/verification faults excluded)', () => {
+      expect(TLS_TRANSPORT_ERROR_PATTERN.test('local error: tls: bad record MAC')).toBe(true);
+      expect(TLS_TRANSPORT_ERROR_PATTERN.test('http2: server sent GOAWAY and closed the connection')).toBe(true);
+      expect(TLS_TRANSPORT_ERROR_PATTERN.test('x509: certificate signed by unknown authority')).toBe(false);
+      expect(TLS_TRANSPORT_ERROR_PATTERN.test('tls: failed to verify certificate')).toBe(false);
+    });
+
+    // ---------------------------------------------------------------------
+    // REVERSE CASES (D3 core boundary — must never regress to retryable)
+    // ---------------------------------------------------------------------
+    it('REVERSE: "Retries remaining: 0" model format error stays terminal, NOT network_error', () => {
+      const exhaustedError =
+        'Your previous response contained an improperly formatted function call: Malformed function call: Failed to parse function call: Function call is empty - no input to parse. Please retry with a properly formatted function call\nRetries remaining: 0';
+      const res = classifyError(exhaustedError);
+      expect(res.retryable).toBe(false);
+      expect(res.reason).toBe('model_format_retries_exhausted');
+      expect(res.retriesRemaining).toBe(0);
+      expect(res.signature).toBeUndefined();
+      expect(isTransientRetryableError(exhaustedError)).toBe(false);
+      expect(isInternalEngineRetryError(exhaustedError)).toBe(false);
+    });
+
+    it('REVERSE: TLS/network keywords cannot rescue a "Retries remaining: 0" exhausted error', () => {
+      const exhaustedTlsError = `${productionErrorWrapper}\nRetries remaining: 0`;
+      const res = classifyError(exhaustedTlsError);
+      // Authoritative entry point is classifyError (index.ts resume/settle path);
+      // the retries-remaining gate runs BEFORE the transient network table.
+      expect(res.retryable).toBe(false);
+      expect(res.reason).toBe('model_format_retries_exhausted');
+      expect(res.retriesRemaining).toBe(0);
+      expect(res.signature).not.toBe('network_error');
+      expect(isTransientRetryableError(exhaustedTlsError)).toBe(false);
+
+      const exhaustedFormatWithEof =
+        'Malformed function call: Failed to parse function call\nunexpected EOF\nRetries remaining: 0';
+      const res2 = classifyError(exhaustedFormatWithEof);
+      expect(res2.retryable).toBe(false);
+      expect(res2.reason).toBe('model_format_retries_exhausted');
+      expect(res2.signature).toBeUndefined();
+    });
+
+    it('REVERSE: TLS certificate/verification failures stay terminal (not transient transport)', () => {
+      const certErrors = [
+        'x509: certificate signed by unknown authority',
+        'tls: failed to verify certificate: x509: certificate signed by unknown authority',
+        'x509: certificate is valid for gemini.google.com, not daily-cloudcode-pa.googleapis.com',
+      ];
+      for (const err of certErrors) {
+        const res = classifyError(err);
+        expect(res.retryable).toBe(false);
+        expect(res.reason).toBe('unclassified_terminal_error');
+        expect(isTransientRetryableError(err)).toBe(false);
+      }
+    });
+
+    it('REVERSE: terminal markers still win over TLS keywords', () => {
+      const deliveryFailed =
+        'DELIVERY FAILED for abc-123: message not visible in transcript after send + resend. The conversation may be in a hub-side dead state after local error: tls: bad record MAC';
+      expect(classifyError(deliveryFailed).reason).toBe('terminal_delivery_failed');
+      expect(classifyError(deliveryFailed).retryable).toBe(false);
+
+      const permissionDenied = 'HTTP 403 Forbidden: tls: bad record MAC';
+      expect(classifyError(permissionDenied).reason).toBe('terminal_permission_denied');
+      expect(classifyError(permissionDenied).retryable).toBe(false);
+
+      const authPermanent = 'OAuth 凭据已失效，请重新登录 Antigravity (http2: server sent GOAWAY)';
+      expect(classifyError(authPermanent).reason).toBe('terminal_auth_permanent_failure');
+      expect(classifyError(authPermanent).retryable).toBe(false);
+    });
+
+    it('REVERSE: clean websocket close (1000) is not swept into the network bucket', () => {
+      const cleanClose = 'read: websocket: close 1000 (normal)';
+      expect(TLS_TRANSPORT_ERROR_PATTERN.test(cleanClose)).toBe(false);
+      expect(classifyError(cleanClose).retryable).toBe(false);
     });
   });
 });
