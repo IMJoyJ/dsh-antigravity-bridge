@@ -1326,6 +1326,34 @@ export class AntigravityService extends Service {
     this.config = config;
   }
 
+  /**
+   * Check if there are any active (running or waiting-background) runs,
+   * optionally filtered by callerAgentId.
+   */
+  public hasActiveRuns(agentId?: string): boolean {
+    for (const run of this.runs.values()) {
+      if (agentId && run.callerAgentId && run.callerAgentId !== agentId) continue;
+      if (run.status === 'running' || run.status === 'waiting-background') {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  /**
+   * Retrieve active (running or waiting-background) runs, optionally filtered by callerAgentId.
+   */
+  public getActiveRuns(agentId?: string): HubRun[] {
+    const list: HubRun[] = [];
+    for (const run of this.runs.values()) {
+      if (agentId && run.callerAgentId && run.callerAgentId !== agentId) continue;
+      if (run.status === 'running' || run.status === 'waiting-background') {
+        list.push(run);
+      }
+    }
+    return list;
+  }
+
   /** Proactively push a settlement/approval notice to DSH session (steering / followup) with idempotency. */
   notifySettlementToDsh(run: HubRun, callerAgent?: any): void {
     if (this.disposed) return;
@@ -1390,6 +1418,12 @@ export class AntigravityService extends Service {
       );
 
       (this.ctx as any).emit?.('antigravity/settled', { run, summary, noticeText, delivered });
+      (this.ctx as any).emit?.('antigravity/run-settled', {
+        run,
+        cascadeId: run.cascadeId,
+        agentId: run.callerAgentId,
+        status: run.status,
+      });
       this.saveStateDebounced();
     } catch {
       // Settlement notices must be safe and never throw

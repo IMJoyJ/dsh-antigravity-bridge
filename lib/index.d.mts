@@ -1244,6 +1244,15 @@ declare class AntigravityService extends Service {
   };
   /** Hot-swap live config (loader/volatile-update snapshot). All fields are read at use-time. */
   updateConfig(config: AntigravityConfig): void;
+  /**
+   * Check if there are any active (running or waiting-background) runs,
+   * optionally filtered by callerAgentId.
+   */
+  hasActiveRuns(agentId?: string): boolean;
+  /**
+   * Retrieve active (running or waiting-background) runs, optionally filtered by callerAgentId.
+   */
+  getActiveRuns(agentId?: string): HubRun[];
   /** Proactively push a settlement/approval notice to DSH session (steering / followup) with idempotency. */
   notifySettlementToDsh(run: HubRun, callerAgent?: any): void;
   /** Push a resumption notice when user approvals in IDE are granted. */
