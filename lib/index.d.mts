@@ -253,7 +253,9 @@ interface TrajectoryResponse {
 }
 interface StructuredCascadeTasksResult {
   activeTasks: ActiveBackgroundTask[];
-  allTasks: ActiveBackgroundTask[];
+  allTasks: (ActiveBackgroundTask & {
+    isActive?: boolean;
+  })[];
   hasActiveChildren: boolean;
   isCascadeActive?: boolean;
   /** Whether the cascade has been explicitly canceled or interrupted. */
@@ -376,8 +378,8 @@ declare const DEFAULT_BACKGROUND_TASK_STALL_THRESHOLD_MS: number;
  * right after launch legitimately reads `activeBackgroundTasks: []`.
  *
  * An empty task list inside this window therefore means "not observed yet", NOT
- * "there is no background work". Reading it as "none" settles a lane that is
- * still running and forces a later revert-from-done — the false-idle defect.
+ * "there is no background work". Reading it as "none" prematurely settles a lane
+ * that is still running — the false-idle defect.
  *
  * Size rationale (latency-neutral by construction): the settle path already
  * requires `settleStableMs` (15s) of transcript stillness before it even records
@@ -440,19 +442,46 @@ interface ParsedTranscript {
  * Invoking these tools does not imply that previous background tasks have finished.
  */
 declare const OBSERVATIONAL_TOOL_NAMES: Set<string>;
-/**
- * R2 等待话术门:
- * Inspects whether the planner's final text output conveys waiting on a background task,
- * timer, or background execution without genuine completion semantics.
- */
-declare function isWaitingSpeech(text: string | undefined | null): boolean;
 declare function isTaskIdMatch(a: string, b: string): boolean;
+/**
+ * Merges active background tasks discovered from the transcript with those
+ * reported by structured hub queries.
+ *
+ * De-duplicates by taskId (using {@link isTaskIdMatch}).
+ * Transcript entries have strict priority; hub entries can only supplement
+ * tasks missing from the transcript table. Hub queries must NEVER erase
+ * transcript-tracked tasks, EXCEPT when `hubAllTasks` explicitly provides
+ * positive termination evidence (`isActive === false`) confirming a task has
+ * reached a terminal state (e.g. crashed without SYSTEM_MESSAGE).
+ */
+declare function mergeBackgroundTasks(transcriptTasks: ActiveBackgroundTask[], hubActiveTasks: ActiveBackgroundTask[], hubAllTasks?: (ActiveBackgroundTask & {
+  isActive?: boolean;
+})[]): ActiveBackgroundTask[];
+/**
+ * hub 工具执行结果中即时注入的后台任务启动标记模板。
+ * 真实样本：
+ * "Tool is running as a background task with task id: <cascadeId>/task-148 Task Description: dotnet build ... Task logs are available at: file:///.../tasks/task-148.log"
+ */
+declare const BACKGROUND_TASK_LAUNCH_MARKER_REGEX: RegExp;
+/**
+ * hub 工具执行结果模板中注入的任务专属日志 URI 正则。
+ */
+declare const BACKGROUND_TASK_LOG_URI_REGEX: RegExp;
 /**
  * 残余盲区②：结构化不可得的唯一例外。
  * IDE 层定时调度任务（如 schedule 工具创建的计时器），其触发完成通知仅以 SYSTEM_MESSAGE 注入，
  * 不产生独立的 tool execution step 状态变更。因此保留且仅保留这一条窄正则识别该通知，提取完成的任务 ID。
  */
 declare const IDE_TIMER_SYSTEM_MESSAGE_REGEX: RegExp;
+/**
+ * manage_task list 工具调用的空列表响应正则。
+ * 真实形态（GENERIC 步，结构化工具结果尾部）及测试形态（MANAGE_TASK 步，裸短语）：
+ * "No background tasks are currently running."
+ * 作为 hub 阳性证据表明当前无任何非调度类后台任务在运行。
+ * 严格尾部锚定（禁止短语出现在文本中间），且要求短语必须位于 Created At 结构化标头之后
+ * （或为纯裸短语），防止 view_file 读取包含该字面量的文件时产生假 done。
+ */
+declare const MANAGE_TASK_EMPTY_LIST_REGEX: RegExp;
 /**
  * Parses raw JSON lines from a cascade transcript into a structured snapshot.
  *
@@ -515,8 +544,8 @@ interface SettleGuardDecision {
  *   seconds, so a task list read shortly after launch is empty *because it was
  *   not populated yet*, not because there is no background work. Inside
  *   {@link LAUNCH_OBSERVATION_GRACE_MS} an empty observation is UNKNOWN, so the
- *   honest answer is "keep polling" instead of settling a lane that is still
- *   running (which the done-residency watcher would later have to revert).
+ *   honest answer is "keep polling" instead of prematurely settling a lane that is
+ *   still running (settle immediately breaks the watcher loop without residency detection).
  * - (a) `tool-tail`: the LAST valid entry is a tool call or tool result with no
  *   assistant text after it. `isFinished` is then stale state left behind by an
  *   earlier final text or CHECKPOINT (executor DONE steps never reset it) — the
@@ -1012,10 +1041,8 @@ interface HubRun {
   lastBackgroundWarningAt?: number;
   /** Timestamp when the current waiting-background episode began. */
   waitingBackgroundStartedAt?: number;
-  /** R1: The maxStepIndex at which the cascade was settled as done; used by resident watcher to detect growth. */
+  /** The maxStepIndex at which the cascade was settled as done (audit snapshot recorded at settlement). */
   settledStepIndex?: number;
-  /** R1: Content hash of planner output when cascade was settled as done. */
-  settledContentHash?: string;
   /** Silenced tasks by normalized task id (e.g. 'task-114' or 'cascadeId/task-114'). */
   silencedTasks?: Record<string, TaskSilenceEntry>;
   /** Residual background task IDs that were alive (infinitely silenced) when cascade settled. */
@@ -1073,10 +1100,8 @@ interface PersistedRun {
   lastBackgroundWarningAt?: number;
   /** Timestamp when the current waiting-background episode began. */
   waitingBackgroundStartedAt?: number;
-  /** R1: The maxStepIndex at which the cascade was settled as done. */
+  /** The maxStepIndex at which the cascade was settled as done (audit snapshot recorded at settlement). */
   settledStepIndex?: number;
-  /** R1: Content hash of planner output when cascade was settled as done. */
-  settledContentHash?: string;
   /** Silenced tasks by normalized task id. */
   silencedTasks?: Record<string, TaskSilenceEntry>;
   /** Residual background task IDs that were alive (infinitely silenced) when cascade settled. */
@@ -1257,13 +1282,6 @@ declare class AntigravityService extends Service {
   notifySettlementToDsh(run: HubRun, callerAgent?: any): void;
   /** Push a resumption notice when user approvals in IDE are granted. */
   notifyResumedToDsh(run: HubRun, callerAgent?: any): void;
-  /** Push a settlement revocation notice when R1 detects that a settled cascade resumed activity. */
-  notifyRevertedFromDoneToDsh(run: HubRun, details: {
-    oldSettledStep?: number;
-    currentStep?: number;
-    oldActiveAt?: string;
-    currentActiveAt?: string;
-  }, callerAgent?: any): void;
   /**
    * Proactively push a waiting-background warning notice to DSH session.
    * Rate-limited to once every 5 minutes (300,000ms) for the same running background task state.
@@ -1445,5 +1463,5 @@ declare class AntigravityBridgePlugin {
   constructor(ctx: Context, config: LiveAntigravityConfig);
 }
 //#endregion
-export { ANTIGRAVITY_MODELS, AUTO_CONTINUE_QUIET_MS, ActiveBackgroundTask, AgentInitConfig, AgentStep, AntigravityAgent, AntigravityConfig, AntigravityEngine, AntigravityModelInfo, AntigravityService, AutoContinueReason, AutoResumeConfig, BACKOFF_SCHEDULE_MS, BackgroundTaskProgress, CASCADE_RUN_ACTIVE_CODES, CASCADE_RUN_ACTIVE_NAMES, CORTEX_ACTIVE_STATUS_CODES, CORTEX_ACTIVE_STATUS_NAMES, CORTEX_TERMINAL_STATUS_CODES, CORTEX_TERMINAL_STATUS_NAMES, CascadeDetailedResult, Config, ConversationSummary, ConversationTreeNode, DEFAULT_AUTO_CONTINUE_MAX, DEFAULT_AUTO_CONTINUE_MESSAGE, DEFAULT_BACKGROUND_TASK_STALL_THRESHOLD_MS, DEFAULT_MODEL_ID, DEFAULT_WATCH_MAX_MS, EngineConfig, ErrorClassification, HarnessSessionInfo, HubCallOptions, HubClient, HubInfo, HubRun, IDE_TIMER_SYSTEM_MESSAGE_REGEX, LAUNCH_OBSERVATION_GRACE_MS, ListConversationsOptions, LiveAntigravityConfig, LoadedTranscript, MAX_CONSECUTIVE_NOTICE_WAKES, MODEL_FORMAT_ERROR_PATTERN, MediaInput, NETWORK_ERROR_PATTERN, OBSERVATIONAL_TOOL_NAMES, PendingToolApproval, PersistedBridgeState, PersistedQueuedMessage, PersistedRun, PollResult, PromptContent, PromptItem, ProtoMediaPart, PruneStaleTasksOptions, RunOneShotOptions, SETTLE_CONFIRMATION_INTERVAL_MS, SETTLE_STABLE_MS, SessionContinuationMode, SettleGuardAction, SettleGuardDecision, SettleGuardInput, SettleGuardReason, SettlementNoticePayload, SettlementOutboxItem, StartCascadeOptions, StatusTransition, StructuredCascadeTasksResult, TLS_TRANSPORT_ERROR_PATTERN, TaskSilenceEntry, TokenUsage, TrajectoryResponse, TrajectoryStep, TrajectoryStepDetail, TrajectoryStepMetadata, TranscriptSnapshot, TranscriptStep, TranscriptTailKind, TransientErrorSignature, assessBackgroundTaskProgress, buildConversationGraph, buildSettlementNotice, classifyError, clearHubCache, computeTranscriptHash, decideTailSettle, decodeProtobufTaskDetails, AntigravityBridgePlugin as default, discoverHub, extractErrorMessage, fileToMedia, formatAuthExpiredTerminalError, formatExhaustedRetryError, getAutoResumeBackoffMs, getConversationTree, getDefaultAppDataDir, getMaxRetriesForSignature, getStepEffectiveStatus, guessMimeType, isAuthTokenExpiredError, isCascadeRunStatusActive, isCortexStatusActive, isCortexStatusTerminal, isInternalEngineRetryError, isNetworkError, isStaleHubError, isTaskIdMatch, isTransientRetryableError, isWaitingSpeech, listConversations, loadTranscriptFile, normalizeModelName, normalizePromptParts, parseRetriesRemaining, parseStructuredTrajectoryTasks, parseTranscript, pollTranscript, pruneStaleBackgroundTasks, readCascadeTranscript, readStructuredTasksFromSqlite, renderAsciiTree, snapshotAntigravityConfig };
+export { ANTIGRAVITY_MODELS, AUTO_CONTINUE_QUIET_MS, ActiveBackgroundTask, AgentInitConfig, AgentStep, AntigravityAgent, AntigravityConfig, AntigravityEngine, AntigravityModelInfo, AntigravityService, AutoContinueReason, AutoResumeConfig, BACKGROUND_TASK_LAUNCH_MARKER_REGEX, BACKGROUND_TASK_LOG_URI_REGEX, BACKOFF_SCHEDULE_MS, BackgroundTaskProgress, CASCADE_RUN_ACTIVE_CODES, CASCADE_RUN_ACTIVE_NAMES, CORTEX_ACTIVE_STATUS_CODES, CORTEX_ACTIVE_STATUS_NAMES, CORTEX_TERMINAL_STATUS_CODES, CORTEX_TERMINAL_STATUS_NAMES, CascadeDetailedResult, Config, ConversationSummary, ConversationTreeNode, DEFAULT_AUTO_CONTINUE_MAX, DEFAULT_AUTO_CONTINUE_MESSAGE, DEFAULT_BACKGROUND_TASK_STALL_THRESHOLD_MS, DEFAULT_MODEL_ID, DEFAULT_WATCH_MAX_MS, EngineConfig, ErrorClassification, HarnessSessionInfo, HubCallOptions, HubClient, HubInfo, HubRun, IDE_TIMER_SYSTEM_MESSAGE_REGEX, LAUNCH_OBSERVATION_GRACE_MS, ListConversationsOptions, LiveAntigravityConfig, LoadedTranscript, MANAGE_TASK_EMPTY_LIST_REGEX, MAX_CONSECUTIVE_NOTICE_WAKES, MODEL_FORMAT_ERROR_PATTERN, MediaInput, NETWORK_ERROR_PATTERN, OBSERVATIONAL_TOOL_NAMES, PendingToolApproval, PersistedBridgeState, PersistedQueuedMessage, PersistedRun, PollResult, PromptContent, PromptItem, ProtoMediaPart, PruneStaleTasksOptions, RunOneShotOptions, SETTLE_CONFIRMATION_INTERVAL_MS, SETTLE_STABLE_MS, SessionContinuationMode, SettleGuardAction, SettleGuardDecision, SettleGuardInput, SettleGuardReason, SettlementNoticePayload, SettlementOutboxItem, StartCascadeOptions, StatusTransition, StructuredCascadeTasksResult, TLS_TRANSPORT_ERROR_PATTERN, TaskSilenceEntry, TokenUsage, TrajectoryResponse, TrajectoryStep, TrajectoryStepDetail, TrajectoryStepMetadata, TranscriptSnapshot, TranscriptStep, TranscriptTailKind, TransientErrorSignature, assessBackgroundTaskProgress, buildConversationGraph, buildSettlementNotice, classifyError, clearHubCache, computeTranscriptHash, decideTailSettle, decodeProtobufTaskDetails, AntigravityBridgePlugin as default, discoverHub, extractErrorMessage, fileToMedia, formatAuthExpiredTerminalError, formatExhaustedRetryError, getAutoResumeBackoffMs, getConversationTree, getDefaultAppDataDir, getMaxRetriesForSignature, getStepEffectiveStatus, guessMimeType, isAuthTokenExpiredError, isCascadeRunStatusActive, isCortexStatusActive, isCortexStatusTerminal, isInternalEngineRetryError, isNetworkError, isStaleHubError, isTaskIdMatch, isTransientRetryableError, listConversations, loadTranscriptFile, mergeBackgroundTasks, normalizeModelName, normalizePromptParts, parseRetriesRemaining, parseStructuredTrajectoryTasks, parseTranscript, pollTranscript, pruneStaleBackgroundTasks, readCascadeTranscript, readStructuredTasksFromSqlite, renderAsciiTree, snapshotAntigravityConfig };
 //# sourceMappingURL=index.d.mts.map
