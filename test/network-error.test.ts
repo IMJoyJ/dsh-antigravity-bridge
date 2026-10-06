@@ -38,6 +38,13 @@ function makeService(config: Partial<AntigravityConfig> = {}): {
   const svc = new AntigravityService(ctx, config as AntigravityConfig);
   const sendMessage = vi.fn(async () => ({}));
   (svc as unknown as { getHubClient: () => Promise<unknown> }).getHubClient = async () => ({ sendMessage });
+  vi.spyOn(svc, 'getStructuredCascadeTasks').mockResolvedValue({
+    authoritative: true,
+    activeTasks: [],
+    allTasks: [],
+    hasActiveChildren: false,
+    isCascadeActive: false,
+  });
   return { svc, ctx, sendMessage };
 }
 

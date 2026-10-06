@@ -80,8 +80,8 @@ export const DEFAULT_BACKGROUND_TASK_STALL_THRESHOLD_MS = 15 * 60 * 1000;
  * right after launch legitimately reads `activeBackgroundTasks: []`.
  *
  * An empty task list inside this window therefore means "not observed yet", NOT
- * "there is no background work". Reading it as "none" settles a lane that is
- * still running and forces a later revert-from-done — the false-idle defect.
+ * "there is no background work". Reading it as "none" prematurely settles a lane
+ * that is still running — the false-idle defect.
  *
  * Size rationale (latency-neutral by construction): the settle path already
  * requires `settleStableMs` (15s) of transcript stillness before it even records
@@ -170,82 +170,6 @@ export const OBSERVATIONAL_TOOL_NAMES = new Set([
   'list_resources',
 ]);
 
-/**
- * R2 等待话术门:
- * Inspects whether the planner's final text output conveys waiting on a background task,
- * timer, or background execution without genuine completion semantics.
- */
-export function isWaitingSpeech(text: string | undefined | null): boolean {
-  if (!text || typeof text !== 'string') return false;
-  const trimmed = text.trim();
-  if (!trimmed) return false;
-
-  // Inspect the trailing portion of the text (last paragraph or last 600 chars)
-  const paragraphs = trimmed.split(/\n\s*\n/).map((p) => p.trim()).filter(Boolean);
-  const tail = paragraphs.length > 0 ? paragraphs[paragraphs.length - 1] : trimmed;
-
-  // 1. Completion semantics veto: if the tail clearly indicates completion has ALREADY occurred
-  // e.g. "has finished", "is completed", "completed successfully", "已运行完成，测试全部通过"
-  const hasCompletion =
-    /(?:has|have|is|are)\s+(?:completed|finished|terminated|succeeded|done)\b|(?:completed|finished|terminated)\s+successfully|all\s+tasks\s+(?:finished|done|completed)|(?:已运行完成|已执行完毕|执行完毕|运行完成|全部完成|已全部完成|已结束)\s*[,，。、;；\s]*(?:测试|所有|全部|任务|结果)?/i.test(
-      tail
-    );
-
-  // If completion is declared AND it doesn't have an ongoing future-wait clause (like "请等待" or "静待")
-  if (hasCompletion && !/(?:请等待|静待|耐心等待|稍后|正在等待|等待中)/i.test(tail)) {
-    return false;
-  }
-
-  // 2. Explicit task waiting: /waiting for .*task-\d+/i or Chinese equivalent
-  if (
-    /waiting\s+(?:for|on)\s+.*task-\d+/i.test(tail) ||
-    /(?:等待|静待|请稍候|稍后|耐心等待).*(?:task-\d+|后台任务)/i.test(tail)
-  ) {
-    return true;
-  }
-
-  // 3. Waiting for background process / job / command / test / build / output / notification / timer
-  if (
-    /(?:wait|waiting)\s+(?:for|on)\s+(?:the\s+)?(?:background\s+)?(?:task|process|job|command|build|test|run|output|completion|notification|result|timer)/i.test(
-      tail
-    )
-  ) {
-    return true;
-  }
-
-  // 4. Still running in background / running as background / awaiting timer / wake on notification / pausing to await
-  if (
-    /(?:still\s+running\s+in\s+(?:the\s+)?background|running\s+as\s+a\s+background\s+task|awaiting?\s+(?:timer|background|completion)|will\s+notify\s+(?:you|me|us)\s+when|wake\s+(?:when|up|upon)|pause\s+(?:and\s+wait|to\s+await))/i.test(
-      tail
-    ) ||
-    /(?:后台仍在运行|在后台运行|转入后台|已提交后台|后台执行中|正在后台运行|等待唤醒|等待通知|等待.*完成|静待.*结果|已启动后台)/i.test(tail)
-  ) {
-    return true;
-  }
-
-  // 5. General waiting clauses (e.g. "Please wait a moment", "请稍候", "耐心等待")
-  if (
-    /(?:please\s+wait|wait\s+a\s+moment|waiting\s+for\s+(?:it\s+to\s+finish|completion))/i.test(tail) ||
-    /(?:请稍候|请等待|耐心等待)/i.test(tail)
-  ) {
-    return true;
-  }
-
-  // Also check across the full text if it's relatively short (<1000 chars)
-  if (trimmed.length < 1000) {
-    if (
-      /waiting\s+(?:for|on)\s+.*task-\d+/i.test(trimmed) ||
-      /(?:等待|静待|请稍候|稍后|耐心等待).*(?:task-\d+|后台任务)/i.test(trimmed) ||
-      /(?:后台仍在运行|在后台运行|转入后台|已提交后台)/i.test(trimmed) ||
-      /(?:please\s+wait|wait\s+a\s+moment)/i.test(trimmed) ||
-      /(?:请稍候|请等待|耐心等待)/i.test(trimmed)
-    ) {
-      return true;
-    }
-  }
-
-  return false;
-}
 
 interface TrackedBackgroundTask {
   taskId: string;
@@ -284,12 +208,82 @@ export function isTaskIdMatch(a: string, b: string): boolean {
 }
 
 /**
+ * Merges active background tasks discovered from the transcript with those
+ * reported by structured hub queries.
+ *
+ * De-duplicates by taskId (using {@link isTaskIdMatch}).
+ * Transcript entries have strict priority; hub entries can only supplement
+ * tasks missing from the transcript table. Hub queries must NEVER erase
+ * transcript-tracked tasks, EXCEPT when `hubAllTasks` explicitly provides
+ * positive termination evidence (`isActive === false`) confirming a task has
+ * reached a terminal state (e.g. crashed without SYSTEM_MESSAGE).
+ */
+export function mergeBackgroundTasks(
+  transcriptTasks: ActiveBackgroundTask[],
+  hubActiveTasks: ActiveBackgroundTask[],
+  hubAllTasks?: (ActiveBackgroundTask & { isActive?: boolean })[],
+): ActiveBackgroundTask[] {
+  let result: ActiveBackgroundTask[] = Array.isArray(transcriptTasks) ? [...transcriptTasks] : [];
+
+  // Positive termination evidence: if hubAllTasks explicitly reports a task with isActive === false,
+  // the task has definitely reached a terminal state on the hub (e.g. crashed without SYSTEM_MESSAGE).
+  // Such tasks are retired from transcript tracking.
+  if (Array.isArray(hubAllTasks) && hubAllTasks.length > 0) {
+    result = result.filter((tTask) => {
+      if (!tTask || typeof tTask.taskId !== 'string') return false;
+      const isPositivelyTerminated = hubAllTasks.some(
+        (h) => h && typeof h.taskId === 'string' && isTaskIdMatch(tTask.taskId, h.taskId) && h.isActive === false,
+      );
+      return !isPositivelyTerminated;
+    });
+  }
+
+  // Supplement with hub active tasks not yet present in the result
+  if (Array.isArray(hubActiveTasks) && hubActiveTasks.length > 0) {
+    for (const hTask of hubActiveTasks) {
+      if (!hTask || typeof hTask.taskId !== 'string') continue;
+      const exists = result.some((t) => isTaskIdMatch(t.taskId, hTask.taskId));
+      if (!exists) {
+        result.push(hTask);
+      }
+    }
+  }
+
+  return result;
+}
+
+/**
+ * hub 工具执行结果中即时注入的后台任务启动标记模板。
+ * 真实样本：
+ * "Tool is running as a background task with task id: <cascadeId>/task-148 Task Description: dotnet build ... Task logs are available at: file:///.../tasks/task-148.log"
+ */
+export const BACKGROUND_TASK_LAUNCH_MARKER_REGEX =
+  /running as a background task with task id:\s*([a-zA-Z0-9_-]+)\/(task-\d+)/i;
+
+/**
+ * hub 工具执行结果模板中注入的任务专属日志 URI 正则。
+ */
+export const BACKGROUND_TASK_LOG_URI_REGEX =
+  /Task logs are available at:\s*(file:\/\/\/\S+?\.log)/i;
+
+/**
  * 残余盲区②：结构化不可得的唯一例外。
  * IDE 层定时调度任务（如 schedule 工具创建的计时器），其触发完成通知仅以 SYSTEM_MESSAGE 注入，
  * 不产生独立的 tool execution step 状态变更。因此保留且仅保留这一条窄正则识别该通知，提取完成的任务 ID。
  */
 export const IDE_TIMER_SYSTEM_MESSAGE_REGEX =
   /(?:sender=|(?:Task id|任务)\s*")([a-zA-Z0-9_-]+\/)?(task-\d+)\b/i;
+
+/**
+ * manage_task list 工具调用的空列表响应正则。
+ * 真实形态（GENERIC 步，结构化工具结果尾部）及测试形态（MANAGE_TASK 步，裸短语）：
+ * "No background tasks are currently running."
+ * 作为 hub 阳性证据表明当前无任何非调度类后台任务在运行。
+ * 严格尾部锚定（禁止短语出现在文本中间），且要求短语必须位于 Created At 结构化标头之后
+ * （或为纯裸短语），防止 view_file 读取包含该字面量的文件时产生假 done。
+ */
+export const MANAGE_TASK_EMPTY_LIST_REGEX =
+  /(?:Created At:[\s\S]*?|^\s*)No background tasks are currently running[.\s]*$/i;
 
 /**
  * Parses raw JSON lines from a cascade transcript into a structured snapshot.
@@ -466,6 +460,105 @@ export function parseTranscript(
       }
     }
 
+    // 1b. 文本模板任务启动 (hub 注入工具结果启动模板)
+    // 即时拦截 hub 在工具结果里注入的后台任务启动文本，消除注册空窗。
+    if (isLaunchStepType && typeof step.content === 'string') {
+      const launchMatch = step.content.match(BACKGROUND_TASK_LAUNCH_MARKER_REGEX);
+      if (launchMatch) {
+        const cascadePrefix = launchMatch[1];
+        const rawTaskId = launchMatch[2];
+        const taskId = rawTaskId.toLowerCase();
+
+        // 共存规则：文本分支仅在 tasksMap 尚无该 taskId 时注册，绝不覆盖结构化分支已注册的条目
+        if (!tasksMap.has(taskId)) {
+          // Cascade isolation: if a cascade prefix exists and target cascadeId is specified, must match
+          if (cascadePrefix && cascadeId && cascadePrefix !== cascadeId) {
+            console.warn(
+              `[antigravity] Rejecting background task ${rawTaskId} from foreign cascade ${cascadePrefix} (target: ${cascadeId})`
+            );
+          } else if (!/^task-\d+$/.test(taskId)) {
+            // Validation: taskId must strictly match task-\d+
+            console.warn(
+              `[antigravity] Dropping invalid taskId: "${taskId}" in cascade ${cascadeId ?? 'unknown'}`
+            );
+          } else {
+            let description: string | undefined;
+            if (
+              structDetails?.description ||
+              structDetails?.summary ||
+              structDetails?.toolSummary ||
+              structDetails?.tool_summary
+            ) {
+              description = String(
+                structDetails.description ||
+                structDetails.summary ||
+                structDetails.toolSummary ||
+                structDetails.tool_summary
+              ).trim();
+            } else {
+              const descMatch = step.content.match(
+                /Task Description:\s*([\s\S]*?)(?=Task logs are available at:|$)/i
+              );
+              if (descMatch && descMatch[1]) {
+                const extracted = descMatch[1].replace(/[\r\n]+/g, ' ').trim();
+                if (extracted) {
+                  description = extracted;
+                }
+              }
+            }
+
+            // Validation on description: no newlines, no standalone file URIs
+            if (description) {
+              if (
+                /[\r\n]/.test(description) ||
+                /^file:\/\/\//i.test(description)
+              ) {
+                console.warn(
+                  `[antigravity] Dropping invalid task description for ${taskId}: "${description}"`
+                );
+                description = undefined;
+              } else if (description.length > 300) {
+                description = description.slice(0, 300);
+              }
+            }
+
+            let logUri = structDetails?.logUri || structDetails?.log_uri;
+            if (!logUri) {
+              const logMatch = step.content.match(BACKGROUND_TASK_LOG_URI_REGEX);
+              if (logMatch && logMatch[1]) {
+                logUri = logMatch[1].trim();
+              }
+            }
+
+            const durationSeconds = lastDurationSeconds;
+
+            const isSchedule =
+              lastToolWasSchedule ||
+              Boolean(lastTimerCondition) ||
+              durationSeconds !== undefined ||
+              Boolean(description && /timer|schedule|cron/i.test(description));
+
+            tasksMap.set(taskId, {
+              taskId,
+              cascadeId: cascadePrefix || cascadeId,
+              description,
+              startedAt: step.created_at,
+              startStepIndex: step.step_index ?? 0,
+              timerCondition: lastTimerCondition,
+              isSchedule,
+              durationSeconds,
+              finished: false,
+              logUri,
+            });
+
+            lastTimerCondition = null;
+            lastToolWasSchedule = false;
+            lastDurationSeconds = undefined;
+          }
+        }
+      }
+    }
+
     // 2. Structured Task Finish
     // 2a. SYSTEM_MESSAGE from hub
     // 残余盲区②：结构化不可得的唯一例外。
@@ -504,6 +597,33 @@ export function parseTranscript(
         markTimerConditionSatisfied(matched.taskId);
       }
       markTimerConditionSatisfied(rawId.toLowerCase());
+    }
+
+    // 2c. Empty Background Task List Signal (manage_task "No background tasks are currently running")
+    // When manage_task returns "No background tasks are currently running", it provides explicit
+    // positive evidence from hub that all foreground background tasks have finished.
+    const isManageTaskEmptyListStep = isLaunchStepType || step.type === 'MANAGE_TASK';
+    if (
+      isManageTaskEmptyListStep &&
+      typeof step.content === 'string' &&
+      MANAGE_TASK_EMPTY_LIST_REGEX.test(step.content)
+    ) {
+      for (const [id, t] of tasksMap) {
+        // schedule / timerCondition tasks must NEVER be cleared by empty background task list!
+        const isTimerOrSchedule =
+          Boolean(t.timerCondition) ||
+          t.isSchedule ||
+          t.taskId.includes('timer') ||
+          Boolean(t.description && /timer|schedule|cron/i.test(t.description));
+        if (isTimerOrSchedule) {
+          continue;
+        }
+
+        if (!t.finished) {
+          t.finished = true;
+          markTimerConditionSatisfied(id);
+        }
+      }
     }
 
     // 3. Foreground Progress Fallback (前台步骤推进兜底)
@@ -816,8 +936,8 @@ export interface SettleGuardDecision {
  *   seconds, so a task list read shortly after launch is empty *because it was
  *   not populated yet*, not because there is no background work. Inside
  *   {@link LAUNCH_OBSERVATION_GRACE_MS} an empty observation is UNKNOWN, so the
- *   honest answer is "keep polling" instead of settling a lane that is still
- *   running (which the done-residency watcher would later have to revert).
+ *   honest answer is "keep polling" instead of prematurely settling a lane that is
+ *   still running (settle immediately breaks the watcher loop without residency detection).
  * - (a) `tool-tail`: the LAST valid entry is a tool call or tool result with no
  *   assistant text after it. `isFinished` is then stale state left behind by an
  *   earlier final text or CHECKPOINT (executor DONE steps never reset it) — the
@@ -905,7 +1025,6 @@ export function decideTailSettle(input: SettleGuardInput): SettleGuardDecision {
   }
 
   // Genuine-looking final reply (assistant text / checkpoint tail): settle after stillness window.
-  // Note: isWaitingSpeech is NO LONGER evaluated here! Zero regexes on settle path.
   if (tailQuietMs < settleStableMs) return { action: 'wait' };
   return { action: 'settle' };
 }

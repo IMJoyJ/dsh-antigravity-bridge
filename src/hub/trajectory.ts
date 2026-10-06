@@ -96,7 +96,7 @@ export interface TrajectoryResponse {
 
 export interface StructuredCascadeTasksResult {
   activeTasks: ActiveBackgroundTask[];
-  allTasks: ActiveBackgroundTask[];
+  allTasks: (ActiveBackgroundTask & { isActive?: boolean })[];
   hasActiveChildren: boolean;
   isCascadeActive?: boolean;
   /** Whether the cascade has been explicitly canceled or interrupted. */
@@ -295,20 +295,26 @@ export function parseStructuredTrajectoryTasks(
     });
   }
 
-  const allTasks: ActiveBackgroundTask[] = [];
+  const allTasks: (ActiveBackgroundTask & { isActive?: boolean })[] = [];
   const activeTasks: ActiveBackgroundTask[] = [];
 
   for (const [, item] of tasksMap) {
-    const task: ActiveBackgroundTask = {
+    allTasks.push({
       taskId: item.taskId,
       description: item.description,
       startedAt: item.startedAt,
       startStepIndex: item.startStepIndex,
       logUri: item.logUri,
-    };
-    allTasks.push(task);
+      isActive: item.isActive,
+    });
     if (item.isActive) {
-      activeTasks.push(task);
+      activeTasks.push({
+        taskId: item.taskId,
+        description: item.description,
+        startedAt: item.startedAt,
+        startStepIndex: item.startStepIndex,
+        logUri: item.logUri,
+      });
     }
   }
 
@@ -458,19 +464,24 @@ export function readStructuredTasksFromSqlite(
         }
       }
 
-      const allTasks: ActiveBackgroundTask[] = [];
+      const allTasks: (ActiveBackgroundTask & { isActive?: boolean })[] = [];
       const activeTasks: ActiveBackgroundTask[] = [];
 
       for (const [, item] of tasksMap) {
-        const task: ActiveBackgroundTask = {
+        allTasks.push({
           taskId: item.taskId,
           description: item.description,
           startStepIndex: item.startStepIndex,
           logUri: item.logUri,
-        };
-        allTasks.push(task);
+          isActive: item.isActive,
+        });
         if (item.isActive) {
-          activeTasks.push(task);
+          activeTasks.push({
+            taskId: item.taskId,
+            description: item.description,
+            startStepIndex: item.startStepIndex,
+            logUri: item.logUri,
+          });
         }
       }
 

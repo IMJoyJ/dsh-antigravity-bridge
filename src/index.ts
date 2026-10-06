@@ -32,6 +32,7 @@ import {
   assessBackgroundTaskProgress,
   parseStructuredTrajectoryTasks,
   readStructuredTasksFromSqlite,
+  mergeBackgroundTasks,
   type TranscriptSnapshot,
   type AutoContinueReason,
   type ActiveBackgroundTask,
@@ -247,10 +248,8 @@ export interface HubRun {
   lastBackgroundWarningAt?: number;
   /** Timestamp when the current waiting-background episode began. */
   waitingBackgroundStartedAt?: number;
-  /** R1: The maxStepIndex at which the cascade was settled as done; used by resident watcher to detect growth. */
+  /** The maxStepIndex at which the cascade was settled as done (audit snapshot recorded at settlement). */
   settledStepIndex?: number;
-  /** R1: Content hash of planner output when cascade was settled as done. */
-  settledContentHash?: string;
   /** Silenced tasks by normalized task id (e.g. 'task-114' or 'cascadeId/task-114'). */
   silencedTasks?: Record<string, TaskSilenceEntry>;
   /** Residual background task IDs that were alive (infinitely silenced) when cascade settled. */
@@ -323,10 +322,8 @@ export interface PersistedRun {
   lastBackgroundWarningAt?: number;
   /** Timestamp when the current waiting-background episode began. */
   waitingBackgroundStartedAt?: number;
-  /** R1: The maxStepIndex at which the cascade was settled as done. */
+  /** The maxStepIndex at which the cascade was settled as done (audit snapshot recorded at settlement). */
   settledStepIndex?: number;
-  /** R1: Content hash of planner output when cascade was settled as done. */
-  settledContentHash?: string;
   /** Silenced tasks by normalized task id. */
   silencedTasks?: Record<string, TaskSilenceEntry>;
   /** Residual background task IDs that were alive (infinitely silenced) when cascade settled. */
@@ -656,7 +653,6 @@ export class AntigravityService extends Service {
           lastBackgroundWarningAt: run.lastBackgroundWarningAt,
           waitingBackgroundStartedAt: run.waitingBackgroundStartedAt,
           settledStepIndex: run.settledStepIndex,
-          settledContentHash: run.settledContentHash,
           silencedTasks: run.silencedTasks,
           residualBackgroundTasks: run.residualBackgroundTasks,
         };
@@ -758,7 +754,6 @@ export class AntigravityService extends Service {
           lastBackgroundWarningAt: prun.lastBackgroundWarningAt,
           waitingBackgroundStartedAt: prun.waitingBackgroundStartedAt,
           settledStepIndex: prun.settledStepIndex,
-          settledContentHash: prun.settledContentHash,
           silencedTasks: prun.silencedTasks,
           residualBackgroundTasks: prun.residualBackgroundTasks,
         };
@@ -814,10 +809,6 @@ export class AntigravityService extends Service {
               run.settledStepIndex = snap.maxStepIndex;
               if (snap.plannerContents && snap.plannerContents.length > 0) {
                 run.content = snap.plannerContents.join('\n\n');
-                run.settledContentHash = crypto
-                  .createHash('sha256')
-                  .update(run.content)
-                  .digest('hex');
               }
             }
             await this.landReport(run);
@@ -838,15 +829,6 @@ export class AntigravityService extends Service {
                   item.reject(new Error(`Cascade ${cascadeId} failed during restart; queued message cancelled.`));
                 }
                 this.messageQueues.delete(cascadeId);
-              }
-            }
-
-            // R1: If settled as done, keep done-resident watcher running if within watchMaxMs window
-            if (run.status === 'done') {
-              const watchMaxMs = this.config.watchMaxMs ?? DEFAULT_WATCH_MAX_MS;
-              const elapsed = Date.now() - run.startedAt;
-              if (elapsed < watchMaxMs) {
-                this.ensureActiveWatcher(cascadeId, run.callerAgent, run.baselineStepIndex);
               }
             }
           } else if (run.status === 'waiting-background' && !hasActiveTasks) {
@@ -882,7 +864,7 @@ export class AntigravityService extends Service {
           this.ensureActiveWatcher(cascadeId, run.callerAgent, run.baselineStepIndex);
         }
       } else if (run.status === 'done') {
-        // R1: Restart recovery for done runs: check if transcript grew while host was down
+        // Restart recovery for done runs: check if transcript grew while host was down
         try {
           const snap = await readCascadeTranscript(brainDir, cascadeId, run.baselineStepIndex ?? -1);
           if (snap) {
@@ -899,14 +881,7 @@ export class AntigravityService extends Service {
               run.status = 'running';
               run.lastNotifiedTransition = undefined;
               run.settledStepIndex = undefined;
-              run.settledContentHash = undefined;
               this.ensureActiveWatcher(cascadeId, run.callerAgent, run.baselineStepIndex);
-            } else {
-              const watchMaxMs = this.config.watchMaxMs ?? DEFAULT_WATCH_MAX_MS;
-              const elapsed = Date.now() - run.startedAt;
-              if (elapsed < watchMaxMs) {
-                this.ensureActiveWatcher(cascadeId, run.callerAgent, run.baselineStepIndex);
-              }
             }
           }
         } catch (e) {
@@ -1478,54 +1453,7 @@ export class AntigravityService extends Service {
     }
   }
 
-  /** Push a settlement revocation notice when R1 detects that a settled cascade resumed activity. */
-  notifyRevertedFromDoneToDsh(
-    run: HubRun,
-    details: { oldSettledStep?: number; currentStep?: number; oldActiveAt?: string; currentActiveAt?: string },
-    callerAgent?: any,
-  ): void {
-    if (this.disposed) return;
-    try {
-      const summary = `⚠️ [Antigravity] ${run.cascadeId.slice(0, 8)} 结算撤回 (Reverted from Done)`;
-      const noticeText =
-        `### ⚠️ Antigravity Cascade 结算撤回 (Reverted from Done)\n` +
-        `- **Cascade ID**: \`${run.cascadeId}\`\n` +
-        `- **Status**: \`running\` (原 done 判定已撤销)\n` +
-        `- **原因**: 检测到 cascade 在声称完成后产生了新活动 (步骤: ${details.oldSettledStep ?? 'N/A'} -> ${details.currentStep ?? 'N/A'})\n\n` +
-        `> ⚠️ 该 Cascade 尚未真正结束，已自动恢复为 running 状态并继续跟踪其生命周期。`;
-      const message = {
-        id: crypto.randomUUID(),
-        role: 'user' as const,
-        content: [{ type: 'text' as const, text: noticeText }],
-        source: {
-          kind: 'subagent-settled' as const,
-          form: 'notice' as const,
-          summary,
-          senderSessionId: run.cascadeId,
-          revertedFromDone: true,
-          oldSettledStep: details.oldSettledStep,
-          currentStep: details.currentStep,
-        },
-      };
 
-      let targetAgent = callerAgent || run.callerAgent;
-      if (!targetAgent && run.callerAgentId) {
-        targetAgent = this.findLiveAgent(run.callerAgentId);
-        if (targetAgent) {
-          run.callerAgent = targetAgent;
-        }
-      }
-      const delivered = this.deliverMessageToAgent(targetAgent, message);
-      console.log(
-        `[antigravity][notify] status=reverted-from-done cascadeId=${run.cascadeId} delivered=${delivered}`,
-      );
-
-      (this.ctx as any).emit?.('antigravity/reverted-from-done', { run, details, summary, noticeText, delivered });
-      this.saveStateDebounced();
-    } catch {
-      // safe ignore
-    }
-  }
 
   /**
    * Proactively push a waiting-background warning notice to DSH session.
@@ -1994,7 +1922,6 @@ export class AntigravityService extends Service {
     run.autoContinueExhausted = undefined;
     run.lastAutoContinueReason = undefined;
     run.settledStepIndex = undefined;
-    run.settledContentHash = undefined;
     if (callerAgent) {
       run.callerAgent = callerAgent;
       const id = callerAgent.id ?? callerAgent.session?.header?.id ?? callerAgent.name;
@@ -2163,19 +2090,21 @@ export class AntigravityService extends Service {
 
     if (structuredTasks.authoritative && outsideGraceWindow) {
       if (snap) {
-        snap.activeBackgroundTasks = structuredTasks.activeTasks;
+        snap.activeBackgroundTasks = mergeBackgroundTasks(
+          snap.activeBackgroundTasks ?? [],
+          structuredTasks.activeTasks,
+          structuredTasks.allTasks,
+        );
         snap.hasActiveChildren = structuredTasks.hasActiveChildren;
       }
     } else if (structuredTasks.activeTasks.length > 0 || structuredTasks.allTasks.length > 0 || structuredTasks.hasActiveChildren) {
       if (snap) {
-        snap.activeBackgroundTasks = structuredTasks.activeTasks;
+        snap.activeBackgroundTasks = mergeBackgroundTasks(snap.activeBackgroundTasks ?? [], structuredTasks.activeTasks);
         snap.hasActiveChildren = structuredTasks.hasActiveChildren;
       }
     }
 
-    const rawActiveTasks = (structuredTasks.authoritative && outsideGraceWindow)
-      ? structuredTasks.activeTasks
-      : (snap?.activeBackgroundTasks ?? structuredTasks.activeTasks);
+    const rawActiveTasks = snap?.activeBackgroundTasks ?? structuredTasks.activeTasks;
 
     const lastActiveMs = snap?.lastActiveAt
       ? Date.parse(snap.lastActiveAt)
@@ -2226,6 +2155,7 @@ export class AntigravityService extends Service {
     ) && !structuredTasks.isCascadeActive;
 
     const isNaturallyIdle =
+      structuredTasks.authoritative === true &&
       structuredTasks.isCascadeActive === false &&
       blockingTasks.length === 0 &&
       !hasActiveChildren &&
@@ -2253,12 +2183,10 @@ export class AntigravityService extends Service {
     } else if (snap?.isFinished && snap.plannerContents.length > 0) {
       // Strict done: a bare isFinished (e.g. setup CHECKPOINT with zero planner
       // output) must not classify as done — that poisoned the registry before.
-      // v0.2.6 tail guard: when the LAST valid entry is a tool call/tool result,
-      // the model has not produced its closing reply for this turn (an earlier
-      // final text or CHECKPOINT leaves a stale isFinished behind while late
-      // executor steps land). Report running so the single watcher poller can
-      // auto-continue instead of settling the cascade prematurely.
-      if (snap.tailKind === 'tool-call' || snap.tailKind === 'tool-result') {
+      // Non-authoritative structured tasks must not settle as done (circuit breaker).
+      if (!structuredTasks.authoritative) {
+        status = 'running';
+      } else if (snap.tailKind === 'tool-call' || snap.tailKind === 'tool-result') {
         const sinceStart = Date.now() - startedAt;
         if (isNaturallyIdle && sinceStart >= LAUNCH_OBSERVATION_GRACE_MS) {
           status = 'done';
@@ -2266,7 +2194,6 @@ export class AntigravityService extends Service {
           status = 'running';
         }
       } else {
-        // Zero-regex settle: isWaitingSpeech is no longer evaluated here!
         status = 'done';
       }
     } else if (!snap && existingRun?.status === 'done') {
@@ -2531,96 +2458,8 @@ export class AntigravityService extends Service {
         const stepNow = snap?.maxStepIndex ?? -1;
         const lastActiveNow = snap?.lastActiveAt;
 
-        // R1: watcher done-驻留: 假 done 实锤检测
         if (run.status === 'done') {
-          const stepGrew = run.settledStepIndex !== undefined && stepNow > run.settledStepIndex;
-          const activeGrew = Boolean(
-            lastActiveNow &&
-            run.lastActiveAt &&
-            lastActiveNow > run.lastActiveAt
-          );
-
-          if (stepGrew || activeGrew) {
-            // D4: Only revert to running if the cascade has genuine active work.
-            // Inert steps (like cancellation notices, subagent killed updates, or interrupt notifications)
-            // must NOT trigger a false revert to running.
-            const structuredTasks = await this.getStructuredCascadeTasks(
-              cascadeId,
-              brainDir,
-              stepNow,
-              true /* forceRefresh */,
-            );
-            const outsideGraceWindow = Date.now() - (run.startedAt ?? Date.now()) >= LAUNCH_OBSERVATION_GRACE_MS;
-            const rawActiveTasks = (structuredTasks.authoritative && outsideGraceWindow)
-              ? structuredTasks.activeTasks
-              : (snap?.activeBackgroundTasks ?? structuredTasks.activeTasks);
-            const lastActiveMs = snap?.lastActiveAt
-              ? Date.parse(snap.lastActiveAt)
-              : (run.lastActiveAt ? Date.parse(run.lastActiveAt) : Date.now());
-            const effectiveLastActiveMs = Number.isNaN(lastActiveMs) ? Date.now() : lastActiveMs;
-            const { activeTasks: prunedTasks } = pruneStaleBackgroundTasks(rawActiveTasks, {
-              nowMs: Date.now(),
-              lastActiveAtMs: effectiveLastActiveMs,
-            });
-            const activeTasks = prunedTasks;
-            const blockingTasks = activeTasks.filter((t) => {
-              const silence = this.isTaskSilenced(cascadeId, t.taskId);
-              return !silence.infinite;
-            });
-            const hasActiveWork =
-              Boolean(structuredTasks.isCascadeActive) ||
-              blockingTasks.length > 0 ||
-              Boolean(snap?.hasActiveChildren || structuredTasks.hasActiveChildren) ||
-              Boolean(snap?.pendingApproval) ||
-              (Boolean(snap?.engaged) && (!snap?.isFinished || snap?.tailKind === 'tool-call' || snap?.tailKind === 'tool-result'));
-
-            const isCanceledOrStopped = Boolean(
-              structuredTasks.isCanceled ||
-              structuredTasks.hasCanceledStep ||
-              snap?.hasCanceledStep
-            );
-
-            if (hasActiveWork && !isCanceledOrStopped) {
-              console.log(
-                `[antigravity] Cascade ${cascadeId} fake done detected: step grew from ${run.settledStepIndex} to ${stepNow} (active: ${run.lastActiveAt} -> ${lastActiveNow}). Reverting status to running.`
-              );
-              const oldSettledStep = run.settledStepIndex;
-              run.status = 'running';
-              run.lastNotifiedTransition = undefined;
-              run.settledStepIndex = undefined;
-              run.settledContentHash = undefined;
-              stallSince = Date.now();
-              idleCycles = 0;
-              lastStepSeen = stepNow;
-              lastActiveSeen = lastActiveNow;
-              this.runs.set(cascadeId, run);
-              this.saveStateDebounced();
-              this.notifyRevertedFromDoneToDsh(run, {
-                oldSettledStep,
-                currentStep: stepNow,
-                oldActiveAt: run.lastActiveAt,
-                currentActiveAt: lastActiveNow,
-              });
-              // Continue below into normal running loop
-            } else {
-              // Not genuinely active: update settled indices and remain in done state
-              run.settledStepIndex = Math.max(run.settledStepIndex ?? -1, stepNow);
-              if (lastActiveNow) run.lastActiveAt = lastActiveNow;
-              if (snap && snap.plannerContents.length > 0) {
-                run.content = snap.plannerContents.join('\n\n');
-              }
-              lastStepSeen = stepNow;
-              lastActiveSeen = lastActiveNow;
-              this.runs.set(cascadeId, run);
-              this.saveStateDebounced();
-              await new Promise((r) => setTimeout(r, 2000));
-              continue;
-            }
-          } else {
-            // Cascade is settled as done and resident; no new activity yet.
-            await new Promise((r) => setTimeout(r, 2000));
-            continue;
-          }
+          break;
         }
 
         if (snap) {
@@ -2692,19 +2531,21 @@ export class AntigravityService extends Service {
 
         if (structuredTasks.authoritative && outsideGraceWindow) {
           if (snap) {
-            snap.activeBackgroundTasks = structuredTasks.activeTasks;
+            snap.activeBackgroundTasks = mergeBackgroundTasks(
+              snap.activeBackgroundTasks ?? [],
+              structuredTasks.activeTasks,
+              structuredTasks.allTasks,
+            );
             snap.hasActiveChildren = structuredTasks.hasActiveChildren;
           }
         } else if (structuredTasks.activeTasks.length > 0 || structuredTasks.allTasks.length > 0 || structuredTasks.hasActiveChildren) {
           if (snap) {
-            snap.activeBackgroundTasks = structuredTasks.activeTasks;
+            snap.activeBackgroundTasks = mergeBackgroundTasks(snap.activeBackgroundTasks ?? [], structuredTasks.activeTasks);
             snap.hasActiveChildren = structuredTasks.hasActiveChildren;
           }
         }
 
-        const rawActiveTasks = (structuredTasks.authoritative && outsideGraceWindow)
-          ? structuredTasks.activeTasks
-          : (snap?.activeBackgroundTasks ?? structuredTasks.activeTasks);
+        const rawActiveTasks = snap?.activeBackgroundTasks ?? structuredTasks.activeTasks;
 
         const lastActiveMs = snap?.lastActiveAt
           ? Date.parse(snap.lastActiveAt)
@@ -2788,7 +2629,7 @@ export class AntigravityService extends Service {
             residualBackgroundTasks: run.residualBackgroundTasks,
           });
           await new Promise((r) => setTimeout(r, 2000));
-          continue;
+          break;
         }
 
         if (
@@ -2949,8 +2790,8 @@ export class AntigravityService extends Service {
           // cascade after its executor has been running for a few seconds, so an
           // empty task list read inside LAUNCH_OBSERVATION_GRACE_MS is
           // "unobserved", not "none". Feeding it to the settle gate as "none"
-          // settles a lane that is still running and forces a revert-from-done
-          // moments later — the false-idle defect.
+          // prematurely settles a lane that is still running — the false-idle
+          // defect (settle immediately breaks the watcher loop without rollback).
           const sinceLifecycleStartMs = Date.now() - (run.startedAt ?? Date.now());
           const decision = decideTailSettle({
             snap,
@@ -3087,6 +2928,7 @@ export class AntigravityService extends Service {
               !freshSnap.error &&
               !freshPendingApproval &&
               freshSnap.isFinished &&
+              freshTasks.authoritative === true &&
               freshStepNow === run.settleCandidateSnapshot.stepIndex &&
               freshHash === run.settleCandidateSnapshot.transcriptHash &&
               freshActiveTasks.length === 0 &&
@@ -3101,7 +2943,7 @@ export class AntigravityService extends Service {
               console.log(
                 `[antigravity] Cascade ${cascadeId} two-phase settle confirmation rejected: fresh read inconsistent with round 1 snapshot. `
                 + `(step: ${run.settleCandidateSnapshot.stepIndex} -> ${freshStepNow}, hashMatch: ${freshHash === run.settleCandidateSnapshot.transcriptHash}, `
-                + `tasks: ${freshActiveTasks.length}, activeChildren: ${freshTasks.hasActiveChildren}, cascadeActive: ${freshTasks.isCascadeActive}). Resetting settle gate.`
+                + `tasks: ${freshActiveTasks.length}, activeChildren: ${freshTasks.hasActiveChildren}, cascadeActive: ${freshTasks.isCascadeActive}, authoritative: ${freshTasks.authoritative}). Resetting settle gate.`
               );
               run.settleCandidateSnapshot = undefined;
               stallSince = Date.now();
@@ -3117,10 +2959,6 @@ export class AntigravityService extends Service {
               run.status = 'done';
               run.error = undefined;
               run.settledStepIndex = snap.maxStepIndex;
-              run.settledContentHash = crypto
-                .createHash('sha256')
-                .update(snap.plannerContents.join('\n\n'))
-                .digest('hex');
               run.residualBackgroundTasks = residualTasks.length > 0 ? residualTasks.map((t) => t.taskId) : undefined;
               this.runs.set(cascadeId, run);
               this.saveStateDebounced();
@@ -3135,9 +2973,7 @@ export class AntigravityService extends Service {
                 activeBackgroundTasks: snap.activeBackgroundTasks,
                 residualBackgroundTasks: run.residualBackgroundTasks,
               });
-              // R1: watcher done-驻留: 不 break，继续轮询以捕获假 done，直到 watchMaxMs 结束才真正退出
-              await new Promise((r) => setTimeout(r, 2000));
-              continue;
+              break;
             } else {
               // Turn ended with zero assistant text and the nudge budget is gone:
               // an honest error beats silently polling until the watcher cap.
@@ -3404,17 +3240,19 @@ export class AntigravityService extends Service {
         );
         const outsideGraceWindow = Date.now() - startedAt >= LAUNCH_OBSERVATION_GRACE_MS;
         if (structuredTasks.authoritative && outsideGraceWindow) {
-          snap.activeBackgroundTasks = structuredTasks.activeTasks;
+          snap.activeBackgroundTasks = mergeBackgroundTasks(
+            snap?.activeBackgroundTasks ?? [],
+            structuredTasks.activeTasks,
+            structuredTasks.allTasks,
+          );
           snap.hasActiveChildren = structuredTasks.hasActiveChildren;
         } else if (structuredTasks.activeTasks.length > 0 || structuredTasks.allTasks.length > 0 || structuredTasks.hasActiveChildren) {
-          snap.activeBackgroundTasks = structuredTasks.activeTasks;
+          snap.activeBackgroundTasks = mergeBackgroundTasks(snap?.activeBackgroundTasks ?? [], structuredTasks.activeTasks);
           snap.hasActiveChildren = structuredTasks.hasActiveChildren;
         }
       }
       const outsideGraceWindow = Date.now() - startedAt >= LAUNCH_OBSERVATION_GRACE_MS;
-      const rawActiveTasks = (structuredTasks.authoritative && outsideGraceWindow)
-        ? structuredTasks.activeTasks
-        : (snap?.activeBackgroundTasks ?? structuredTasks.activeTasks);
+      const rawActiveTasks = snap?.activeBackgroundTasks ?? structuredTasks.activeTasks;
 
       const lastActiveMs = snap?.lastActiveAt
         ? Date.parse(snap.lastActiveAt)

@@ -3,7 +3,10 @@ import { Context } from '@deepseek-ai/cordis';
 import {
   parseTranscript,
   decideTailSettle,
-  isWaitingSpeech,
+  mergeBackgroundTasks,
+  BACKGROUND_TASK_LAUNCH_MARKER_REGEX,
+  BACKGROUND_TASK_LOG_URI_REGEX,
+  MANAGE_TASK_EMPTY_LIST_REGEX,
   pruneStaleBackgroundTasks,
   isTaskIdMatch,
   assessBackgroundTaskProgress,
@@ -297,6 +300,13 @@ describe('AntigravityService tail-guard watcher', () => {
       },
     ]);
     const { svc, sendMessage } = makeService();
+    vi.spyOn(svc, 'getStructuredCascadeTasks').mockResolvedValue({
+      authoritative: true,
+      activeTasks: [],
+      allTasks: [],
+      hasActiveChildren: false,
+      isCascadeActive: false,
+    });
     svc.ensureActiveWatcher('cid-a', undefined, -1);
     await driveUntilSettled(svc, 'cid-a');
 
@@ -329,6 +339,13 @@ describe('AntigravityService tail-guard watcher', () => {
       stallAt(20, 18),
     ]);
     const { svc, sendMessage } = makeService();
+    vi.spyOn(svc, 'getStructuredCascadeTasks').mockResolvedValue({
+      authoritative: true,
+      activeTasks: [],
+      allTasks: [],
+      hasActiveChildren: false,
+      isCascadeActive: false,
+    });
     svc.ensureActiveWatcher('cid-b', undefined, -1);
     await driveUntilSettled(svc, 'cid-b');
 
@@ -351,6 +368,13 @@ describe('AntigravityService tail-guard watcher', () => {
       },
     ]);
     const { svc, sendMessage } = makeService();
+    vi.spyOn(svc, 'getStructuredCascadeTasks').mockResolvedValue({
+      authoritative: true,
+      activeTasks: [],
+      allTasks: [],
+      hasActiveChildren: false,
+      isCascadeActive: false,
+    });
     svc.ensureActiveWatcher('cid-c', undefined, -1);
     await driveUntilSettled(svc, 'cid-c');
 
@@ -371,6 +395,13 @@ describe('AntigravityService tail-guard watcher', () => {
       },
     ]);
     const { svc, sendMessage } = makeService();
+    vi.spyOn(svc, 'getStructuredCascadeTasks').mockResolvedValue({
+      authoritative: true,
+      activeTasks: [],
+      allTasks: [],
+      hasActiveChildren: false,
+      isCascadeActive: false,
+    });
     svc.ensureActiveWatcher('cid-d', undefined, -1);
     await driveUntilSettled(svc, 'cid-d');
 
@@ -384,6 +415,13 @@ describe('AntigravityService tail-guard watcher', () => {
 
   it('classifies a tool-tail snapshot as running, never as done (classifySnapshot)', async () => {
     const { svc } = makeService();
+    vi.spyOn(svc, 'getStructuredCascadeTasks').mockResolvedValue({
+      authoritative: true,
+      activeTasks: [],
+      allTasks: [],
+      hasActiveChildren: false,
+      isCascadeActive: false,
+    });
     const classify = (svc as unknown as {
       classifySnapshot: (brainDir: string, id: string, baseline: number) => Promise<{ status: string }>;
     }).classifySnapshot.bind(svc);
@@ -398,6 +436,7 @@ describe('AntigravityService tail-guard watcher', () => {
       snap({ maxStepIndex: 6, isFinished: true, plannerContents: ['All done.'], tailKind: 'assistant-text', engaged: true }),
     );
     expect(await classify('D:/brain', 'cid-f', -1)).toMatchObject({ status: 'done' });
+    expect(runOf(svc, 'cid-f').status).toBe('done');
   });
 
   it('sendAutoContinue: archives content, re-baselines, honours the budget, and flags failed delivery', async () => {
@@ -1050,6 +1089,13 @@ describe('AntigravityService Background Task Watcher Lifecycle', () => {
 
   it('enters waiting-background status and does not settle or auto-continue', async () => {
     const { svc, sendMessage } = makeService();
+    vi.spyOn(svc, 'getStructuredCascadeTasks').mockResolvedValue({
+      authoritative: true,
+      activeTasks: [],
+      allTasks: [],
+      hasActiveChildren: false,
+      isCascadeActive: false,
+    });
     const deliverSpy = vi.spyOn(svc, 'deliverMessageToAgent' as any).mockReturnValue(true);
 
     let state: 'waiting' | 'finished' = 'waiting';
@@ -1226,24 +1272,7 @@ describe('AntigravityService Background Task Watcher Lifecycle', () => {
     expect(runOf(svc, 'cid-bg-classify').status).toBe('waiting-background');
   });
 
-  describe('R2: waiting speech gate (isWaitingSpeech and decideTailSettle)', () => {
-    it('isWaitingSpeech correctly recognizes waiting speech and respects completion override', () => {
-      expect(isWaitingSpeech('I am waiting for task-602 to complete.')).toBe(true);
-      expect(isWaitingSpeech('Waiting for task-1234 to finish.')).toBe(true);
-      expect(isWaitingSpeech('The process is still running in background, waiting for notification.')).toBe(true);
-      expect(isWaitingSpeech('已设置定时器，等待后台任务唤醒。')).toBe(true);
-      expect(isWaitingSpeech('Awaiting timer notification from task-500.')).toBe(true);
-
-      // Negative cases: completion semantics take precedence
-      expect(isWaitingSpeech('Task-602 has finished running.')).toBe(false);
-      expect(isWaitingSpeech('Waiting for task-602 is completed; all tests passed.')).toBe(false);
-      expect(isWaitingSpeech('Background execution finished successfully.')).toBe(false);
-      expect(isWaitingSpeech('后台任务已运行完成，测试全部通过。')).toBe(false);
-      expect(isWaitingSpeech('Done.')).toBe(false);
-      expect(isWaitingSpeech(undefined)).toBe(false);
-      expect(isWaitingSpeech('')).toBe(false);
-    });
-
+  describe('R2: zero-regex speech gate and decideTailSettle', () => {
     it('decideTailSettle does NOT wait on waiting speech alone (zero-regex settle)', () => {
       const snapWait = snap({
         maxStepIndex: 10,
@@ -1305,74 +1334,70 @@ describe('AntigravityService Background Task Watcher Lifecycle', () => {
     });
   });
 
-  describe('R1: watcher done-residency & fake-done recovery', () => {
-    it('detects fake-done on transcript growth, reverts status to running, and delivers second done notification', async () => {
+  describe('R1: watcher done-residency & removal of fake-done rollback', () => {
+    it('settle 之后 transcript 增长不会触发任何 revert/复活：watcher 已 break', async () => {
       const { svc } = makeService();
       vi.spyOn(svc as any, 'deliverMessageToAgent').mockReturnValue(true);
       const notifySpy = vi.spyOn(svc, 'notifySettlementToDsh');
 
-      // 1. Initial fake done at step 10
+      vi.spyOn(svc, 'getStructuredCascadeTasks').mockResolvedValue({
+        authoritative: true,
+        activeTasks: [],
+        allTasks: [],
+        hasActiveChildren: false,
+        isCascadeActive: false,
+      });
+
+      // 1. Initial settlement at step 10
       let currentSnap = snap({
         maxStepIndex: 10,
         isFinished: true,
         engaged: true,
         tailKind: 'assistant-text',
-        plannerContents: ['Premature done at step 10'],
+        plannerContents: ['Settling at step 10'],
       });
 
       mockRead.mockImplementation(async () => currentSnap);
 
-      svc.ensureActiveWatcher('cid-fake-done', undefined, -1);
+      svc.ensureActiveWatcher('cid-settle-break', undefined, -1);
 
-      // Advance timers past settleStableMs (15_000ms) and confirmation window (10_000ms) to trigger first settlement
-      await vi.advanceTimersByTimeAsync(20_000);
+      // Advance timers past settleStableMs (15_000ms) and confirmation window (10_000ms) to settle
+      await vi.advanceTimersByTimeAsync(25_000);
 
-      const run = runOf(svc, 'cid-fake-done');
+      const run = runOf(svc, 'cid-settle-break');
       expect(run.status).toBe('done');
       expect(run.settledStepIndex).toBe(10);
       expect(notifySpy).toHaveBeenCalledTimes(1);
       expect(run.lastNotifiedTransition).toContain('done:turn1::step10');
 
-      // 2. Transcript grows to step 15 (e.g. background task completed, model woke up)
+      // 2. Transcript grows to step 15
       currentSnap = snap({
         maxStepIndex: 15,
         isFinished: false,
         engaged: true,
         tailKind: 'tool-call',
-        plannerContents: ['Premature done at step 10', 'Resuming work after background task...'],
+        plannerContents: ['Settling at step 10', 'Late wake up or background message arrived...'],
       });
 
-      // Advance timers: watcher should detect fake done and revert to running
-      await vi.advanceTimersByTimeAsync(2000);
-
-      expect(run.status).toBe('running');
-      expect(run.lastNotifiedTransition).toBeUndefined();
-      expect(run.settledStepIndex).toBeUndefined();
-
-      // 3. Real completion at step 20
-      currentSnap = snap({
-        maxStepIndex: 20,
-        isFinished: true,
-        engaged: true,
-        tailKind: 'assistant-text',
-        plannerContents: [
-          'Premature done at step 10',
-          'Resuming work after background task...',
-          'Real final completion: task-602 finished successfully!',
-        ],
-      });
-
-      await vi.advanceTimersByTimeAsync(20_000);
+      // Advance timers: watcher has broken out upon settlement, no rollback/revert path exists
+      await vi.advanceTimersByTimeAsync(30_000);
 
       expect(run.status).toBe('done');
-      expect(run.settledStepIndex).toBe(20);
-      expect(notifySpy).toHaveBeenCalledTimes(2);
-      expect(run.lastNotifiedTransition).toContain('done:turn1::step20');
+      expect(run.settledStepIndex).toBe(10);
+      expect(notifySpy).toHaveBeenCalledTimes(1);
+      expect(run.lastNotifiedTransition).toContain('done:turn1::step10');
     });
 
     it('evicts phantom task in watcher loop, transitions from waiting-background to running, and settles to done', async () => {
       const { svc } = makeService();
       vi.spyOn(svc, 'deliverMessageToAgent' as any).mockReturnValue(true);
+      vi.spyOn(svc, 'getStructuredCascadeTasks').mockResolvedValue({
+        authoritative: true,
+        activeTasks: [],
+        allTasks: [],
+        hasActiveChildren: false,
+        isCascadeActive: false,
+      });
 
       const phantomTask: ActiveBackgroundTask = {
         taskId: 'task-37',
@@ -1625,47 +1650,6 @@ describe('AntigravityService Background Task Watcher Lifecycle', () => {
       );
     });
 
-    it('R1 false-done rollback: pushes reverted-from-done notification when activity resumes after settlement', () => {
-      const { svc } = makeService();
-      const deliverSpy = vi.spyOn(svc, 'deliverMessageToAgent' as any).mockReturnValue(true);
-
-      const run: HubRun = {
-        cascadeId: 'cid-r1-revert-test',
-        status: 'running',
-        startedAt: Date.now() - 100_000,
-        baselineStepIndex: 0,
-        settledStepIndex: 40,
-        callerAgentId: 'agent-1',
-      };
-
-      svc.notifyRevertedFromDoneToDsh(run, {
-        oldSettledStep: 40,
-        currentStep: 45,
-        oldActiveAt: '2026-09-26T10:00:00Z',
-        currentActiveAt: '2026-09-26T10:01:00Z',
-      });
-
-      expect(deliverSpy).toHaveBeenCalledTimes(1);
-      const msg = deliverSpy.mock.calls[0][1];
-      expect(msg.source.kind).toBe('subagent-settled');
-      expect(msg.source.revertedFromDone).toBe(true);
-      expect(msg.source.oldSettledStep).toBe(40);
-      expect(msg.source.currentStep).toBe(45);
-      expect(msg.content[0].text).toContain('结算撤回 (Reverted from Done)');
-      expect(msg.content[0].text).toContain('40 -> 45');
-    });
-
-    it('3s early probe: waiting speech prevents premature done settlement', () => {
-      // isWaitingSpeech checks
-      expect(isWaitingSpeech('已提交后台运行，请稍候。')).toBe(true);
-      expect(isWaitingSpeech('后台任务已启动，正在后台运行')).toBe(true);
-      expect(isWaitingSpeech('耐心等待测试完成')).toBe(true);
-      expect(isWaitingSpeech('All background tasks launched. Please wait a moment.')).toBe(true);
-      // Legitimate completions must not be flagged
-      expect(isWaitingSpeech('所有测试已全部执行完毕，结果如下：通过。')).toBe(false);
-      expect(isWaitingSpeech('All tasks completed successfully.')).toBe(false);
-    });
-
     it('parseTranscript: structured step.taskDetails and step.task_details are parsed without regex reliance', () => {
       const rawLines = [
         step({
@@ -1801,6 +1785,7 @@ describe('AntigravityService Background Task Watcher Lifecycle', () => {
       mockRead.mockResolvedValue(transcriptSnap);
 
       vi.spyOn(svc, 'getStructuredCascadeTasks').mockResolvedValue({
+        authoritative: true,
         activeTasks: [],
         allTasks: [],
         hasActiveChildren: false,
@@ -1930,6 +1915,7 @@ describe('AntigravityService Background Task Watcher Lifecycle', () => {
 
       mockRead.mockResolvedValue(settledLooking());
       vi.spyOn(svc, 'getStructuredCascadeTasks').mockResolvedValue({
+        authoritative: true,
         activeTasks: [],
         allTasks: [],
         hasActiveChildren: false,
@@ -1993,7 +1979,6 @@ describe('AntigravityService Background Task Watcher Lifecycle', () => {
 
     it('does not falsely revert to running when new cancellation steps arrive on a settled cascade', async () => {
       const { svc } = makeService();
-      const revertSpy = vi.spyOn(svc, 'notifyRevertedFromDoneToDsh');
       const notifySpy = vi.spyOn(svc, 'notifySettlementToDsh');
 
       // 1. Initial done state (e.g. parent cascade settled at step 49)
@@ -2007,6 +1992,7 @@ describe('AntigravityService Background Task Watcher Lifecycle', () => {
       mockRead.mockImplementation(async () => currentSnap);
 
       vi.spyOn(svc, 'getStructuredCascadeTasks').mockImplementation(async () => ({
+        authoritative: true,
         activeTasks: [],
         allTasks: [],
         hasActiveChildren: false,
@@ -2035,6 +2021,7 @@ describe('AntigravityService Background Task Watcher Lifecycle', () => {
       });
 
       vi.spyOn(svc, 'getStructuredCascadeTasks').mockImplementation(async () => ({
+        authoritative: true,
         activeTasks: [],
         allTasks: [],
         hasActiveChildren: false,
@@ -2043,13 +2030,13 @@ describe('AntigravityService Background Task Watcher Lifecycle', () => {
         hasCanceledStep: true,
       }));
 
-      // Advance watcher: watcher sees step 58 > 49, but cascade is stopped / idle
+      // Advance watcher: watcher had already broken out upon settlement, status stays done
       await vi.advanceTimersByTimeAsync(3000);
 
-      // Must NOT revert to running!
+      // Must NOT revert to running! Settled cascade stays done
       expect(run.status).toBe('done');
-      expect(run.settledStepIndex).toBe(58);
-      expect(revertSpy).not.toHaveBeenCalled();
+      expect(run.settledStepIndex).toBe(49);
+      expect(notifySpy).toHaveBeenCalledTimes(1);
     });
 
     it('preserves D2 launch hysteresis: empty task list inside 20s window without cancel mark still waits', () => {
@@ -2287,10 +2274,10 @@ describe('AntigravityService Background Task Watcher Lifecycle', () => {
           }),
         );
 
-        // Authoritative source reports activeTasks empty
+        // Authoritative source reports activeTasks empty, with lingering task positively terminated in allTasks
         vi.spyOn(svc, 'getStructuredCascadeTasks').mockResolvedValue({
           activeTasks: [],
-          allTasks: [],
+          allTasks: [{ ...lingeringTask, isActive: false }],
           hasActiveChildren: false,
           isCascadeActive: false,
           authoritative: true,
@@ -2312,6 +2299,258 @@ describe('AntigravityService Background Task Watcher Lifecycle', () => {
         expect(result.status).toBe('done');
         expect(result.activeBackgroundTasks).toEqual([]);
       });
+    });
+  });
+
+  describe('Waiting-Background Terminal Spec Requirements (§5.2)', () => {
+    it('1. parseTranscript recognizes launch marker template in GENERIC step and clears it on completion SYSTEM_MESSAGE', () => {
+      const cid = 'cascade-launch-test';
+      const launchContent =
+        'Tool is running as a background task with task id: cascade-launch-test/task-148 ' +
+        'Task Description: dotnet build ' +
+        'Task logs are available at: file:///C:/x/task-148.log ' +
+        'YOU MUST TAKE ONE OF THE FOLLOWING TWO ACTIONS: A) either proceed to other relevant work (if any) or, B) simply update the user with a short message';
+
+      const lines = [
+        step({ step_index: 0, type: 'USER_INPUT', source: 'USER_EXPLICIT', content: 'run dotnet build' }),
+        JSON.stringify({
+          step_index: 1,
+          type: 'GENERIC',
+          source: 'SYSTEM',
+          status: 'DONE',
+          content: launchContent,
+        }),
+      ];
+
+      const snap1 = parseTranscript(lines, -1, cid);
+      expect(snap1.activeBackgroundTasks).toHaveLength(1);
+      expect(snap1.activeBackgroundTasks[0].taskId).toBe('task-148');
+      expect(snap1.activeBackgroundTasks[0].description).toBe('dotnet build');
+      expect(snap1.activeBackgroundTasks[0].logUri).toBe('file:///C:/x/task-148.log');
+
+      // Append completion SYSTEM_MESSAGE
+      const linesWithCompletion = [
+        ...lines,
+        JSON.stringify({
+          step_index: 2,
+          type: 'SYSTEM_MESSAGE',
+          source: 'SYSTEM',
+          status: 'DONE',
+          content: 'Task id "cascade-launch-test/task-148" finished with result: Build succeeded.',
+        }),
+      ];
+
+      const snap2 = parseTranscript(linesWithCompletion, -1, cid);
+      expect(snap2.activeBackgroundTasks).toHaveLength(0);
+    });
+
+    it('2. manage_task empty list in GENERIC step finishes non-schedule active tasks while protecting schedule tasks', () => {
+      const cid = 'cascade-empty-list-test';
+      const launchContent =
+        'Tool is running as a background task with task id: cascade-empty-list-test/task-148 ' +
+        'Task Description: dotnet build ' +
+        'Task logs are available at: file:///C:/x/task-148.log';
+
+      const lines = [
+        step({ step_index: 0, type: 'USER_INPUT', source: 'USER_EXPLICIT', content: 'start commands' }),
+        // Normal background task from launch template
+        JSON.stringify({
+          step_index: 1,
+          type: 'GENERIC',
+          source: 'SYSTEM',
+          status: 'DONE',
+          content: launchContent,
+        }),
+        // Schedule/timer task
+        JSON.stringify({
+          step_index: 2,
+          type: 'TOOL_EXECUTION',
+          source: 'MODEL',
+          status: 'RUNNING',
+          taskDetails: {
+            id: 'task-99',
+            description: 'Timer: 10s wait',
+            is_schedule: true,
+          },
+        }),
+      ];
+
+      const snap1 = parseTranscript(lines, -1, cid);
+      expect(snap1.activeBackgroundTasks).toHaveLength(2);
+
+      // manage_task response with "No background tasks are currently running." at the end
+      const linesWithManageTask = [
+        ...lines,
+        JSON.stringify({
+          step_index: 3,
+          type: 'GENERIC',
+          source: 'SYSTEM',
+          status: 'DONE',
+          content: 'Created At: 2026-10-06\nTask: task-148\nStatus: TERMINATED\nNo background tasks are currently running.',
+        }),
+      ];
+
+      const snap2 = parseTranscript(linesWithManageTask, -1, cid);
+      expect(snap2.activeBackgroundTasks).toHaveLength(1);
+      expect(snap2.activeBackgroundTasks[0].taskId).toBe('task-99');
+      expect(snap2.activeBackgroundTasks[0].isSchedule).toBe(true);
+    });
+
+    it('3. registration grace window regression: does not settle when transcript tracks active task and hub query returns authoritative empty', async () => {
+      const { svc } = makeService();
+      const notifySpy = vi.spyOn(svc, 'notifySettlementToDsh');
+
+      const transcriptTask: ActiveBackgroundTask = {
+        taskId: 'task-148',
+        description: 'dotnet build',
+        startStepIndex: 1,
+        startedAt: new Date(Date.now() - 30_000).toISOString(),
+      };
+
+      // 1. Transcript tracks task-148, but hub query returns empty (hub registration delay)
+      let currentSnap = snap({
+        maxStepIndex: 5,
+        isFinished: true,
+        engaged: true,
+        plannerContents: ['dotnet build launched in background'],
+        tailKind: 'assistant-text',
+        activeBackgroundTasks: [transcriptTask],
+      });
+      mockRead.mockImplementation(async () => currentSnap);
+
+      vi.spyOn(svc, 'getStructuredCascadeTasks').mockResolvedValue({
+        authoritative: true,
+        activeTasks: [],
+        allTasks: [], // task-148 not even registered in allTasks yet
+        hasActiveChildren: false,
+        isCascadeActive: false,
+      });
+
+      const cid = 'cid-reg-window-regression';
+      (svc as any).runs.set(cid, {
+        cascadeId: cid,
+        status: 'running',
+        startedAt: Date.now() - 30_000, // outside grace window
+        baselineStepIndex: -1,
+        turnSeq: 1,
+        priorContents: [],
+      });
+
+      svc.ensureActiveWatcher(cid, undefined, -1);
+
+      // Advance 30 seconds past settleStableMs (15s) and confirmation interval (10s)
+      await vi.advanceTimersByTimeAsync(30_000);
+
+      const run = runOf(svc, cid);
+      // MUST NOT settle to done! Union preserves transcript task
+      expect(run.status).toBe('waiting-background');
+      expect(notifySpy).not.toHaveBeenCalled();
+
+      // 2. Task completion SYSTEM_MESSAGE arrives
+      currentSnap = snap({
+        maxStepIndex: 8,
+        isFinished: true,
+        engaged: true,
+        plannerContents: ['dotnet build launched in background', 'dotnet build completed successfully.'],
+        tailKind: 'assistant-text',
+        activeBackgroundTasks: [],
+      });
+
+      // Advance timers for settlement
+      await vi.advanceTimersByTimeAsync(30_000);
+
+      expect(run.status).toBe('done');
+      expect(notifySpy).toHaveBeenCalledTimes(1);
+    });
+
+    describe('4. mergeBackgroundTasks utility', () => {
+      it('gives transcript tasks priority and de-duplicates by taskId', () => {
+        const tTasks: ActiveBackgroundTask[] = [
+          { taskId: 'task-148', description: 'from transcript', startStepIndex: 1 },
+        ];
+        const hActiveTasks: ActiveBackgroundTask[] = [
+          { taskId: 'cascade-x/task-148', description: 'from hub', startStepIndex: 1 },
+          { taskId: 'task-200', description: 'hub extra task', startStepIndex: 2 },
+        ];
+
+        const merged = mergeBackgroundTasks(tTasks, hActiveTasks);
+        expect(merged).toHaveLength(2);
+        expect(merged[0].taskId).toBe('task-148');
+        expect(merged[0].description).toBe('from transcript');
+        expect(merged[1].taskId).toBe('task-200');
+        expect(merged[1].description).toBe('hub extra task');
+      });
+
+      it('retires transcript task when hubAllTasks has positive termination evidence (isActive === false)', () => {
+        const tTasks: ActiveBackgroundTask[] = [
+          { taskId: 'task-148', description: 'from transcript', startStepIndex: 1 },
+          { taskId: 'task-149', description: 'still alive', startStepIndex: 2 },
+        ];
+        const hubAllTasks = [
+          { taskId: 'task-148', isActive: false, startStepIndex: 1 },
+        ];
+
+        const merged = mergeBackgroundTasks(tTasks, [], hubAllTasks);
+        expect(merged).toHaveLength(1);
+        expect(merged[0].taskId).toBe('task-149');
+      });
+
+      it('does NOT retire transcript task when hubAllTasks does not contain that taskId', () => {
+        const tTasks: ActiveBackgroundTask[] = [
+          { taskId: 'task-148', description: 'from transcript', startStepIndex: 1 },
+        ];
+        const hubAllTasks = [
+          { taskId: 'task-999', isActive: false, startStepIndex: 999 },
+        ];
+
+        const merged = mergeBackgroundTasks(tTasks, [], hubAllTasks);
+        expect(merged).toHaveLength(1);
+        expect(merged[0].taskId).toBe('task-148');
+      });
+    });
+
+    it('5. circuit breaker: Round-2 refuses to settle to done when freshTasks.authoritative is false', async () => {
+      const { svc } = makeService();
+      const notifySpy = vi.spyOn(svc, 'notifySettlementToDsh');
+
+      mockRead.mockResolvedValue(
+        snap({
+          maxStepIndex: 10,
+          isFinished: true,
+          engaged: true,
+          plannerContents: ['All work completed.'],
+          tailKind: 'assistant-text',
+          activeBackgroundTasks: [],
+        }),
+      );
+
+      // Hub returns authoritative: false
+      vi.spyOn(svc, 'getStructuredCascadeTasks').mockResolvedValue({
+        authoritative: false,
+        activeTasks: [],
+        allTasks: [],
+        hasActiveChildren: false,
+        isCascadeActive: false,
+      });
+
+      const cid = 'cid-circuit-breaker-test';
+      (svc as any).runs.set(cid, {
+        cascadeId: cid,
+        status: 'running',
+        startedAt: Date.now() - 30_000,
+        baselineStepIndex: -1,
+        turnSeq: 1,
+        priorContents: [],
+      });
+
+      svc.ensureActiveWatcher(cid, undefined, -1);
+
+      // Advance 30 seconds
+      await vi.advanceTimersByTimeAsync(30_000);
+
+      const run = runOf(svc, cid);
+      expect(run.status).toBe('running');
+      expect(notifySpy).not.toHaveBeenCalled();
     });
   });
 });

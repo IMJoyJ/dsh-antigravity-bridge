@@ -21,7 +21,6 @@ import {
   loadTranscriptFile,
   getDefaultAppDataDir,
   buildSettlementNotice,
-  isWaitingSpeech,
 } from '../lib/index.mjs';
 
 const DEFAULT_MODEL = process.env.AG_DEFAULT_MODEL || 'gemini-3.8-flash-high';
@@ -274,8 +273,6 @@ async function classifyCascade(client, cascadeId) {
     if (snap.tailKind === 'tool-call' || snap.tailKind === 'tool-result') {
       return { status: 'running', snap }; // stale isFinished; model stalled mid-turn
     }
-    const last = snap.plannerContents[snap.plannerContents.length - 1];
-    if (isWaitingSpeech(last)) return { status: 'running', snap };
     return {
       status: 'done-candidate',
       snap,
