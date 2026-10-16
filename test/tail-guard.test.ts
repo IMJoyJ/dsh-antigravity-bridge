@@ -436,7 +436,10 @@ describe('AntigravityService tail-guard watcher', () => {
       snap({ maxStepIndex: 6, isFinished: true, plannerContents: ['All done.'], tailKind: 'assistant-text', engaged: true }),
     );
     expect(await classify('D:/brain', 'cid-f', -1)).toMatchObject({ status: 'done' });
-    expect(runOf(svc, 'cid-f').status).toBe('done');
+    // Read-side classification is observational for terminal `done`: the run
+    // record must NOT latch it (the watcher is the single announcer; a latched
+    // done here made check_run polls swallow the settlement notice).
+    expect(runOf(svc, 'cid-f').status).toBe('running');
   });
 
   it('sendAutoContinue: archives content, re-baselines, honours the budget, and flags failed delivery', async () => {

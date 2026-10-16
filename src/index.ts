@@ -2208,9 +2208,20 @@ export class AntigravityService extends Service {
       status = 'running';
     }
 
+    // Read-side classification must stay observational for terminal `done`.
+    // Latching `done` here let any antigravity_check_run poll (instant snapshot,
+    // or a parked wait hitting its deadline) pre-empt the watcher's two-phase
+    // settle: the watcher then exited on `run.status === 'done'` without ever
+    // announcing, permanently swallowing the settlement notice — and with the
+    // watcher gone, every later notice for the cascade with it. Terminal
+    // transitions are owned by the watcher (the single announcer); the caller
+    // still receives the computed status through the return value below.
+    const latchStatus: HubRun['status'] =
+      status === 'done' ? (existingRun?.status ?? 'running') : status;
+
     const updatedRun: HubRun = {
       cascadeId: conversationId,
-      status,
+      status: latchStatus,
       startedAt,
       baselineStepIndex,
       callerAgent: existingRun?.callerAgent,
@@ -2237,13 +2248,19 @@ export class AntigravityService extends Service {
           ? existingRun?.waitingBackgroundStartedAt ?? Date.now()
           : undefined,
       residualBackgroundTasks:
-        status === 'done'
+        latchStatus === 'done'
           ? (residualTasks.length > 0 ? residualTasks.map((t) => t.taskId) : undefined)
           : existingRun?.residualBackgroundTasks,
       settledStepIndex:
-        status === 'done'
+        latchStatus === 'done'
           ? (snap?.maxStepIndex ?? existingRun?.settledStepIndex)
           : existingRun?.settledStepIndex,
+      // Watcher-owned state must survive a read-side refresh: dropping the
+      // two-phase settle gate reset settlement on every check_run poll (a
+      // polling coordinator could starve the done notice forever), and dropping
+      // silencedTasks wiped the task-silence scope on every poll.
+      silencedTasks: existingRun?.silencedTasks,
+      settleCandidateSnapshot: existingRun?.settleCandidateSnapshot,
       hasStalledBackgroundTasks: activeTasks.some((t) => t.isStalled),
     };
     this.runs.set(conversationId, updatedRun);
@@ -2459,6 +2476,21 @@ export class AntigravityService extends Service {
         const lastActiveNow = snap?.lastActiveAt;
 
         if (run.status === 'done') {
+          // A `done` latched by a read-side path (the delegate probe's early
+          // settle, restored state) must not swallow the settlement notice:
+          // finish the announcement duties before leaving. notifySettlementToDsh
+          // is idempotent per transition key, so a normal settle is never
+          // re-announced here, and parked check_run waiters are always released.
+          this.notifySettlementToDsh(run);
+          this.settleWaiters(cascadeId, {
+            status: 'done',
+            content: AntigravityService.fullReportText(run),
+            lastActiveAt: run.lastActiveAt,
+            autoContinueCount: run.autoContinueCount,
+            autoContinueExhausted: run.autoContinueExhausted,
+            activeBackgroundTasks: snap?.activeBackgroundTasks,
+            residualBackgroundTasks: run.residualBackgroundTasks,
+          });
           break;
         }
 
