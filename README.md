@@ -59,9 +59,12 @@ Native TypeScript Google Antigravity (Gemini Agent) Bridge for DeepSeek Harness 
 程序化响应 Antigravity IDE 中挂起的权限与交互弹窗（免去人工在 IDE 中点击授权）。
 - **参数**：
   - `run_id` (string, 必需)：处于 `awaiting-approval` 状态的 Cascade UUID。
-  - `confirm` (boolean, 必需)：`true` 同意/授权，`false` 拒绝。
+  - `confirm` (boolean)：审批类弹窗必需，`true` 同意/授权，`false` 拒绝（缺省不会默认批准）；askQuestion 弹窗里 `false` 等同取消，`true` 本身不构成答案。
   - `scope` (string, 可选)：授权范围（如 `PERMISSION_SCOPE_ONCE`, `PERMISSION_SCOPE_CONVERSATION`, `PERMISSION_SCOPE_WORKSPACE`, `PERMISSION_SCOPE_PROJECT`, `PERMISSION_SCOPE_GLOBAL`，默认为单次授权）。
-- **支持类型**：`runCommand`（终端命令）、`readUrlContent`（网页抓取）、`filePermission` / `permission`（文件与系统资源权限）、`mcp`（MCP 工具调用）、`openBrowserUrl`、`approvalInteraction` 等。
+  - `answers` (array, 可选)：askQuestion 专用，每个待答问题一项：`{ question_index?, option_ids?, option_texts?, write_in?, skip? }`。每个问题都必须作答或显式 `skip`；单选题选多个、未知选项会被拒绝并列出合法选项。
+  - `option_id` / `option_text` / `write_in` (string, 可选)：单问题快捷参数，与 `answers` 互斥。
+  - `cancel` (boolean, 可选)：askQuestion 专用，取消整个提问。
+- **支持类型**：`runCommand`（终端命令）、`readUrlContent`（网页抓取）、`filePermission` / `permission`（文件与系统资源权限）、`mcp`（MCP 工具调用）、`openBrowserUrl`、`approvalInteraction`、`askQuestion`（agent 的 ask_question 选项提问）等。
 
 ### 5. `antigravity_list_models`
 获取本地 Antigravity Hub 当前可用的全部模型列表，包含实时配额比例（`quotaRemainingFraction`）、配额重置时间（`quotaResetTime`）、支持多模态与上下文窗口等。

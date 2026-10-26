@@ -303,6 +303,19 @@ HandleCascadeUserInteractionRequest -> HandleCascadeUserInteractionResponse
       - `approval_interaction`: `{ confirm: bool }`
       - `mcp`: `{ confirm: bool }`
       - `open_browser_url`: `{ confirm: bool }`
+      - `ask_question`: `{ responses: repeated AskQuestionEntry, cancelled: bool }`
+
+`ask_question` 的格式（`exa.cortex_pb`，取自 hub 描述符并经真实轨迹核对）：待决项在
+`requestedInteraction.askQuestion.questions`（`AskQuestionInteractionSpec`），答复需**回显每个
+问题条目**并填入选择：
+
+```
+AskQuestionEntry { question: string, options: [{ id: string, text: string }],
+                   is_multi_select: bool, selected_option_ids: [string],
+                   write_in_response: string, skipped: bool }
+```
+
+已回答的步骤会以 `step.askQuestion.questions[].selectedOptionIds` 形式留在轨迹里（选项 id 形如 `"1"`、`"2"`）。
 
 
 ## 关键配置消息结构摘录

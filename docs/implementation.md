@@ -55,7 +55,7 @@ src/
 | `antigravity_delegate` | 任务委托（同步阻塞或后台异步） | `task`, `model?`, `project_id?`, `conversation_id?`, `background?` | `client.startCascade` + `client.sendMessage` + 监视器守卫 |
 | `antigravity_check_run` | 查询后台任务状态或阻塞等待 | `run_id`, `wait?` (bool/seconds) | 读取注册表/实时 transcript 快照，或 `waitCascadeDetailed` 阻塞等待 |
 | `antigravity_send_message` | 发送追加消息或转向指令 | `conversation_id`, `content`, `wait?`, `mode?` (`step-end`/`turn-end`/`interrupt`) | 智能插入判定 + 队列排队 + `confirmMessageDelivered` 落盘确认 |
-| `antigravity_respond` | 程序化响应 IDE 审批弹窗 | `run_id`, `confirm`, `scope?` | `client.getCascadeTrajectory` 提取 `requestedInteraction` → `client.handleCascadeUserInteraction` |
+| `antigravity_respond` | 程序化响应 IDE 审批弹窗 / askQuestion 提问 | `run_id`, `confirm?`, `scope?`, `answers?`, `option_id?`, `option_text?`, `write_in?`, `cancel?` | `client.getCascadeTrajectory` 提取 `requestedInteraction` → `src/hub/interaction.ts` 构造变体 → `client.handleCascadeUserInteraction` |
 | `antigravity_list_models` | 查看模型目录与配额余量 | 无 | `client.getAvailableModels` + lossless JSON 归并 |
 | `antigravity_create_project` | 创建关联本地目录的 Project | `name`, `folder_uri` | `client.createProject` (自动生成 UUID) |
 | `antigravity_list_conversations` | 检索本地历史会话 | `limit?`, `only_roots?`, `include_subagents?`, `max_depth?`, `parent_id?` | `storage.ts` 解析 `.gemini/antigravity/` 下 `.db` 与 `transcript.jsonl` |
