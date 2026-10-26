@@ -22,6 +22,13 @@ import {
 } from './models.js';
 import { HubClient } from './hub/client.js';
 import {
+  findPendingInteraction,
+  buildApprovalVariant,
+  buildAskQuestionReply,
+  extractPendingQuestions,
+  type AskQuestionAnswerInput,
+} from './hub/interaction.js';
+import {
   readCascadeTranscript,
   loadTranscriptFile,
   PendingToolApproval,
@@ -3730,12 +3737,22 @@ export class AntigravityService extends Service {
   }
 
   /**
-   * Answer a pending approval in the IDE programmatically (YOLO leaves network/permission
-   * prompts blocking; this is the orchestrator-side approval channel).
+   * Answer a pending approval/question in the IDE programmatically (YOLO leaves
+   * network/permission prompts blocking; this is the orchestrator-side approval channel).
    * Reads the pending interaction from the live trajectory and answers it via
-   * HandleCascadeUserInteraction. confirm=false rejects.
+   * HandleCascadeUserInteraction.
+   *
+   * - Approval-style interactions (command/url/permission/file_permission/mcp/...):
+   *   `confirm` is mandatory (true = allow, false = reject); it is never defaulted.
+   * - askQuestion: pass `ask.answers` (option ids/texts, write-in, skip) to answer, or
+   *   `ask.cancel` / confirm=false to cancel. confirm=true alone is not an answer.
    */
-  async hubRespondApproval(cascadeId: string, confirm: boolean, scope?: string): Promise<unknown> {
+  async hubRespondApproval(
+    cascadeId: string,
+    confirm?: boolean,
+    scope?: string,
+    ask?: { answers?: AskQuestionAnswerInput[]; cancel?: boolean },
+  ): Promise<unknown> {
     const client = await this.getHubClient();
     const traj = (await client.getCascadeTrajectory(cascadeId)) as any;
     const trajectory = traj?.trajectory ?? {};
@@ -3743,54 +3760,49 @@ export class AntigravityService extends Service {
     const steps: any[] = trajectory.steps ?? [];
     if (!trajectoryId) throw new Error('GetCascadeTrajectory returned no trajectoryId');
 
-    let pending: { stepIndex: number; ri: any } | undefined;
-    for (let i = steps.length - 1; i >= 0; i--) {
-      const ri = steps[i]?.requestedInteraction;
-      if (ri && Object.keys(ri).length > 0) {
-        pending = { stepIndex: i, ri };
-        break;
-      }
-    }
+    const pending = findPendingInteraction(steps);
     if (!pending) throw new Error('No pending requestedInteraction in trajectory (nothing to approve)');
 
     const { stepIndex, ri } = pending;
     const scopeName = scope ?? 'PERMISSION_SCOPE_ONCE';
-    let variant: Record<string, unknown>;
-    let kind: string;
-    if (ri.runCommand) {
-      kind = 'run_command';
-      const proposed = ri.runCommand.commandLine ?? ri.runCommand.proposedCommandLine ?? '';
-      variant = { runCommand: { confirm, proposedCommandLine: proposed, submittedCommandLine: proposed } };
-    } else if (ri.readUrlContent) {
-      kind = 'read_url_content';
-      variant = { readUrlContent: { confirm } };
-    } else if (ri.permission) {
-      kind = `permission(${ri.permission.resource?.action ?? '?'}:${ri.permission.resource?.target ?? '?'})`;
-      variant = { permission: { allow: confirm, scope: scopeName } };
-    } else if (ri.filePermission) {
-      kind = `file_permission(${ri.filePermission.absolutePathUri ?? '?'})`;
-      variant = { filePermission: { allow: confirm, scope: scopeName, absolutePathUri: ri.filePermission.absolutePathUri ?? '' } };
-    } else if (ri.approvalInteraction) {
-      kind = 'approval_interaction';
-      variant = { approvalInteraction: { confirm } };
-    } else if (ri.mcp) {
-      kind = 'mcp';
-      variant = { mcp: { confirm } };
-    } else if (ri.openBrowserUrl) {
-      kind = 'open_browser_url';
-      variant = { openBrowserUrl: { confirm } };
-    } else {
+
+    if (ri.askQuestion) {
+      const reply = buildAskQuestionReply(extractPendingQuestions(pending), {
+        answers: ask?.answers,
+        cancel: ask?.cancel,
+        confirm,
+      });
+      const resp = await client.handleCascadeUserInteraction(cascadeId, {
+        trajectoryId,
+        stepIndex,
+        ...reply.variant,
+      });
+      return AntigravityService.lossless({
+        cascadeId,
+        answered: reply.kind,
+        cancelled: reply.cancelled,
+        answers: reply.summary,
+        stepIndex,
+        hubResponse: resp ?? {},
+      });
+    }
+
+    const approval = buildApprovalVariant(ri, confirm === true, scopeName);
+    if (!approval) {
       throw new Error(`Unsupported interaction variant; keys present: ${Object.keys(ri).join(', ')}`);
+    }
+    if (typeof confirm !== 'boolean') {
+      throw new Error(`confirm (true/false) is required to answer a pending ${approval.kind} interaction; refusing to guess.`);
     }
 
     const resp = await client.handleCascadeUserInteraction(cascadeId, {
       trajectoryId,
       stepIndex,
-      ...variant,
+      ...approval.variant,
     });
     return AntigravityService.lossless({
       cascadeId,
-      answered: kind,
+      answered: approval.kind,
       confirm,
       scope: scopeName,
       stepIndex,
@@ -4030,24 +4042,68 @@ Google Antigravity (AGY) is Google's multi-agent coding harness running locally 
 
       tools.register({
         name: 'antigravity_respond',
-        description: 'Answer a pending Antigravity IDE approval prompt programmatically (orchestrator-side approval channel for when the user is away — e.g. YOLO mode leaves network/permission prompts blocking). '
-          + 'Reads the pending interaction from the live cascade trajectory and answers it. confirm=false rejects. '
-          + 'scope defaults to PERMISSION_SCOPE_ONCE (options: PERMISSION_SCOPE_ONCE/CONVERSATION/WORKSPACE/PROJECT/GLOBAL).',
+        description: 'Answer a pending Antigravity IDE prompt programmatically (orchestrator-side channel for when the user is away — e.g. YOLO mode leaves network/permission prompts blocking). '
+          + 'Reads the pending interaction from the live cascade trajectory and answers it. '
+          + 'Approval prompts (command/url/permission/file_permission/mcp/...): confirm is REQUIRED (true = allow, false = reject); it is never defaulted. '
+          + 'scope defaults to PERMISSION_SCOPE_ONCE (options: PERMISSION_SCOPE_ONCE/CONVERSATION/WORKSPACE/PROJECT/GLOBAL). '
+          + 'askQuestion prompts (agent ask_question): pass `answers` (one item per question: option_ids / option_texts / write_in / skip) '
+          + 'or the single-question shortcuts option_id / option_text / write_in; `cancel: true` (or confirm=false) cancels the prompt. '
+          + 'confirm=true alone never answers a question. Unknown options, unanswered questions and several picks on a single-select question are rejected with the valid options listed.',
         parameters: {
           type: 'object',
           properties: {
-            run_id: { type: 'string', description: 'Cascade UUID with a pending approval' },
-            confirm: { type: 'boolean', description: 'true = allow/approve, false = reject' },
+            run_id: { type: 'string', description: 'Cascade UUID with a pending approval or question' },
+            confirm: { type: 'boolean', description: 'Approval prompts: true = allow/approve, false = reject (required there). askQuestion: false = cancel; true is not an answer.' },
             scope: { type: 'string', description: 'Permission scope for permission/file_permission interactions (default PERMISSION_SCOPE_ONCE)' },
+            answers: {
+              type: 'array',
+              description: 'askQuestion only: answers, one per pending question (every question must be answered or skipped).',
+              items: {
+                type: 'object',
+                properties: {
+                  question_index: { type: 'number', description: '0-based question index (defaults to the item position)' },
+                  option_ids: { type: 'array', items: { type: 'string' }, description: 'Selected option ids (multi-select questions accept several)' },
+                  option_texts: { type: 'array', items: { type: 'string' }, description: 'Selected options by visible text' },
+                  write_in: { type: 'string', description: 'Free-form write-in reply' },
+                  skip: { type: 'boolean', description: 'Skip this question' },
+                },
+              },
+            },
+            option_id: { type: 'string', description: 'askQuestion shortcut for a single pending question: the selected option id' },
+            option_text: { type: 'string', description: 'askQuestion shortcut for a single pending question: the selected option text' },
+            write_in: { type: 'string', description: 'askQuestion shortcut for a single pending question: free-form write-in reply (may accompany option_id/option_text)' },
+            cancel: { type: 'boolean', description: 'askQuestion only: cancel the whole prompt' },
           },
-          required: ['run_id', 'confirm'],
+          required: ['run_id'],
         },
         output: { schema: { type: 'object' }, render: renderText },
-        execute: async (args: { run_id: string; confirm: boolean; scope?: string }) => {
+        execute: async (args: {
+          run_id: string;
+          confirm?: boolean;
+          scope?: string;
+          answers?: AskQuestionAnswerInput[];
+          option_id?: string;
+          option_text?: string;
+          write_in?: string;
+          cancel?: boolean;
+        }) => {
+          let answers = args.answers;
+          const hasShortcut = args.option_id !== undefined || args.option_text !== undefined || args.write_in !== undefined;
+          if (hasShortcut) {
+            if (answers && answers.length > 0) {
+              throw new Error('antigravity_respond: pass either `answers` or the option_id/option_text/write_in shortcuts, not both.');
+            }
+            answers = [{
+              ...(args.option_id !== undefined ? { option_ids: [args.option_id] } : {}),
+              ...(args.option_text !== undefined ? { option_texts: [args.option_text] } : {}),
+              ...(args.write_in !== undefined ? { write_in: args.write_in } : {}),
+            }];
+          }
           return await (ctx.get('antigravity') as AntigravityService).hubRespondApproval(
             args.run_id,
             args.confirm,
             args.scope,
+            { answers, cancel: args.cancel },
           );
         },
       });
