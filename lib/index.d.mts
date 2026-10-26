@@ -192,6 +192,21 @@ declare const DEFAULT_MODEL_ID = "gemini-3.8-flash";
  */
 declare function normalizeModelName(input?: string): string;
 //#endregion
+//#region src/hub/interaction.d.ts
+/** One caller-supplied answer to one pending question. */
+interface AskQuestionAnswerInput {
+  /** 0-based index into the pending questions; defaults to the answer's own position. */
+  question_index?: number;
+  /** Selected option ids (exact match against the pending options). */
+  option_ids?: string[];
+  /** Selected options by visible text (exact, then case-insensitive trimmed match). */
+  option_texts?: string[];
+  /** Free-form "write-in" reply. */
+  write_in?: string;
+  /** Explicitly skip this question. */
+  skip?: boolean;
+}
+//#endregion
 //#region src/hub/trajectory.d.ts
 /**
  * CortexStepStatus code mappings:
@@ -1394,12 +1409,20 @@ declare class AntigravityService extends Service {
   private confirmMessageDelivered;
   hubSendMessage(conversationId: string, content: string, wait?: boolean | number, mode?: 'step-end' | 'turn-end' | 'interrupt', callerAgent?: any): Promise<unknown>;
   /**
-   * Answer a pending approval in the IDE programmatically (YOLO leaves network/permission
-   * prompts blocking; this is the orchestrator-side approval channel).
+   * Answer a pending approval/question in the IDE programmatically (YOLO leaves
+   * network/permission prompts blocking; this is the orchestrator-side approval channel).
    * Reads the pending interaction from the live trajectory and answers it via
-   * HandleCascadeUserInteraction. confirm=false rejects.
+   * HandleCascadeUserInteraction.
+   *
+   * - Approval-style interactions (command/url/permission/file_permission/mcp/...):
+   *   `confirm` is mandatory (true = allow, false = reject); it is never defaulted.
+   * - askQuestion: pass `ask.answers` (option ids/texts, write-in, skip) to answer, or
+   *   `ask.cancel` / confirm=false to cancel. confirm=true alone is not an answer.
    */
-  hubRespondApproval(cascadeId: string, confirm: boolean, scope?: string): Promise<unknown>;
+  hubRespondApproval(cascadeId: string, confirm?: boolean, scope?: string, ask?: {
+    answers?: AskQuestionAnswerInput[];
+    cancel?: boolean;
+  }): Promise<unknown>;
   hubCreateProject(name: string, folderUri: string): Promise<unknown>;
 }
 declare class AntigravityBridgePlugin {
