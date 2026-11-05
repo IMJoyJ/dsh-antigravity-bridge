@@ -1301,7 +1301,10 @@ declare class AntigravityService extends Service {
    * Proactively push a waiting-background warning notice to DSH session.
    * Rate-limited to once every 5 minutes (300,000ms) for the same running background task state.
    */
-  notifyWaitingBackgroundToDsh(run: HubRun, activeTasks: ActiveBackgroundTask[], callerAgent?: any): void;
+  notifyWaitingBackgroundToDsh(run: HubRun, activeTasks: ActiveBackgroundTask[], callerAgent?: any, options?: {
+    hasActiveChildren?: boolean;
+    isCascadeActive?: boolean;
+  }): void;
   createAgent(initConfig?: AgentInitConfig): AntigravityAgent;
   listModels(): AntigravityModelInfo[];
   /** Coalesce undefined leaves to null so tool output stays lossless JSON. */
