@@ -2670,12 +2670,12 @@ describe('AntigravityService Background Task Watcher Lifecycle', () => {
         expect(notifySpy).toHaveBeenCalledTimes(1);
       });
 
-      it('authoritative inactive + bare stale SUBAGENT_STATE_ALIVE file (without child dir) also settles to done once', async () => {
+      it('active flag unpublished or state conflict (SUBAGENT_STATE_ALIVE without terminal child evidence yet) conservatively waits in waiting-background until child terminal evidence lands', async () => {
         const { svc, sendMessage } = makeService();
         const notifySpy = vi.spyOn(svc, 'notifySettlementToDsh');
 
-        const cid = 'cid-bare-stale-subagent';
-        const childId = 'child-bare-stale-002';
+        const cid = 'cid-conflict-subagent';
+        const childId = 'child-unpublished-002';
         const subagentsDir = join(tempBrainDir, cid, '.system_generated', 'subagents');
         mkdirSync(subagentsDir, { recursive: true });
         writeFileSync(
@@ -2683,10 +2683,13 @@ describe('AntigravityService Background Task Watcher Lifecycle', () => {
           JSON.stringify({
             conversationId: childId,
             state: 'SUBAGENT_STATE_ALIVE',
+            spawnStepIndex: 2,
           }),
           'utf8',
         );
 
+        // Hub reports authoritative inactive (e.g. INVOKE_SUBAGENT step is DONE in parent trajectory
+        // and child active flag is unpublished), and child has no terminal transcript/SQLite/return yet.
         (svc as any).getHubClient = async () => ({
           sendMessage,
           getCascadeTasks: async () => ({
@@ -2703,7 +2706,7 @@ describe('AntigravityService Background Task Watcher Lifecycle', () => {
             maxStepIndex: 9,
             isFinished: true,
             engaged: true,
-            plannerContents: ['Done.'],
+            plannerContents: ['Waiting on subagent...'],
             tailKind: 'assistant-text',
             activeBackgroundTasks: [],
             lastActiveAt: new Date(Date.now() - 25_000).toISOString(),
@@ -2720,8 +2723,208 @@ describe('AntigravityService Background Task Watcher Lifecycle', () => {
           priorContents: [],
         });
 
+        // 1. State conflict / unpublished active flag MUST conservatively wait (never done/notify)
+        const taskResConflict = await svc.getStructuredCascadeTasks(cid, tempBrainDir, 9, true);
+        expect(taskResConflict.hasActiveChildren).toBe(true);
+
+        const classifiedConflict = await (svc as any).classifySnapshot(tempBrainDir, cid, -1);
+        expect(classifiedConflict.status).toBe('waiting-background');
+
         svc.ensureActiveWatcher(cid, undefined, -1);
-        await vi.advanceTimersByTimeAsync(30_000);
+        await vi.advanceTimersByTimeAsync(35_000);
+
+        expect(runOf(svc, cid).status).toBe('waiting-background');
+        expect(notifySpy).not.toHaveBeenCalled();
+
+        // 2. Now verifiable child return SYSTEM_MESSAGE lands in parent transcript on disk
+        //    (even though SUBAGENT_STATE_ALIVE file remains stale)
+        const parentLogsDir = join(tempBrainDir, cid, '.system_generated', 'logs');
+        mkdirSync(parentLogsDir, { recursive: true });
+        writeFileSync(
+          join(parentLogsDir, 'transcript.jsonl'),
+          [
+            JSON.stringify({
+              step_index: 0,
+              type: 'USER_INPUT',
+              status: 'DONE',
+              content: 'Run subagent',
+            }),
+            JSON.stringify({
+              step_index: 10,
+              type: 'SYSTEM_MESSAGE',
+              status: 'DONE',
+              content: `[Message] timestamp=2026-11-05T14:21:14Z sender=${childId} priority=MESSAGE_PRIORITY_HIGH content=Subagent completed`,
+            }),
+            JSON.stringify({
+              step_index: 11,
+              type: 'PLANNER_RESPONSE',
+              status: 'DONE',
+              content: 'Final report after child returned.',
+            }),
+          ].join('\n') + '\n',
+          'utf8',
+        );
+
+        mockRead.mockResolvedValue(
+          snap({
+            maxStepIndex: 11,
+            isFinished: true,
+            engaged: true,
+            plannerContents: ['Waiting on subagent...', 'Final report after child returned.'],
+            tailKind: 'assistant-text',
+            activeBackgroundTasks: [],
+            lastActiveAt: new Date(Date.now() - 20_000).toISOString(),
+          }),
+        );
+
+        await vi.advanceTimersByTimeAsync(35_000);
+
+        expect(runOf(svc, cid).status).toBe('done');
+        expect(notifySpy).toHaveBeenCalledTimes(1);
+      });
+
+      it('9cde45d9 counter-example: INVOKE_SUBAGENT before assistant-text tail ("等待只读子代理") never settles via ordinary assistant-text while child is running or unreturned', async () => {
+        const { svc, sendMessage } = makeService();
+        const notifySpy = vi.spyOn(svc, 'notifySettlementToDsh');
+
+        const cid = '9cde45d9-8d32-4f10-853f-88ca518e3bbc';
+        const childId = '54d0c460-5533-4803-84d3-7cbb054f6acf';
+        const parentLogsDir = join(tempBrainDir, cid, '.system_generated', 'logs');
+        mkdirSync(parentLogsDir, { recursive: true });
+        const parentTranscriptPath = join(parentLogsDir, 'transcript.jsonl');
+
+        const initialParentLines = [
+          JSON.stringify({
+            step_index: 0,
+            type: 'USER_INPUT',
+            status: 'DONE',
+            content: 'Fix DSH Antigravity completion notification',
+            created_at: new Date(Date.now() - 100_000).toISOString(),
+          }),
+          JSON.stringify({
+            step_index: 9,
+            type: 'PLANNER_RESPONSE',
+            status: 'DONE',
+            content: '',
+            tool_calls: [
+              {
+                name: 'invoke_subagent',
+                args: {
+                  Subagents: [{ TypeName: 'research', Role: 'Codebase Researcher' }],
+                },
+              },
+            ],
+            created_at: new Date(Date.now() - 95_000).toISOString(),
+          }),
+          JSON.stringify({
+            step_index: 10,
+            type: 'GENERIC',
+            status: 'DONE',
+            content: `Created the following subagents:\n{\n  "conversationId": "${childId}",\n  "type": "research",\n  "role": "Codebase Researcher"\n}`,
+            created_at: new Date(Date.now() - 94_000).toISOString(),
+          }),
+          JSON.stringify({
+            step_index: 11,
+            type: 'PLANNER_RESPONSE',
+            status: 'DONE',
+            content: '正在等待只读子代理汇总两个仓库的完整上下文与测试辅助结构，收到返回后立即按顺序执行修复。',
+            created_at: new Date(Date.now() - 90_000).toISOString(),
+          }),
+        ];
+        writeFileSync(parentTranscriptPath, initialParentLines.join('\n') + '\n', 'utf8');
+
+        // 1. Verify parseTranscript detects the unreturned subagent from INVOKE_SUBAGENT + Created the following subagents
+        const parsedWaiting = parseTranscript(initialParentLines, -1, cid);
+        expect(parsedWaiting.tailKind).toBe('assistant-text');
+        expect(parsedWaiting.isFinished).toBe(true);
+        expect(parsedWaiting.hasActiveChildren).toBe(true);
+        expect(parsedWaiting.activeSubagentIds).toEqual([childId]);
+
+        // 2. Even when Hub getCascadeTasks reports authoritative:true, hasActiveChildren:false
+        //    (because INVOKE_SUBAGENT step 10 is DONE), parent MUST stay waiting-background
+        //    and NEVER emit premature done at ~96s!
+        (svc as any).getHubClient = async () => ({
+          sendMessage,
+          getCascadeTasks: async () => ({
+            activeTasks: [],
+            allTasks: [],
+            hasActiveChildren: false,
+            isCascadeActive: false,
+            authoritative: true,
+          }),
+        });
+
+        mockRead.mockResolvedValue(
+          snap({
+            maxStepIndex: 11,
+            isFinished: parsedWaiting.isFinished,
+            engaged: parsedWaiting.engagedAfterInput,
+            plannerContents: parsedWaiting.plannerContents,
+            tailKind: parsedWaiting.tailKind,
+            activeBackgroundTasks: [],
+            hasActiveChildren: parsedWaiting.hasActiveChildren,
+            activeSubagentIds: parsedWaiting.activeSubagentIds,
+            lastActiveAt: parsedWaiting.lastActiveAt,
+          }),
+        );
+
+        (svc as any).runs.set(cid, {
+          cascadeId: cid,
+          brainDir: tempBrainDir,
+          status: 'running',
+          startedAt: Date.now() - 100_000,
+          baselineStepIndex: -1,
+          turnSeq: 1,
+          priorContents: [],
+        });
+
+        const classifiedAt96s = await (svc as any).classifySnapshot(tempBrainDir, cid, -1);
+        expect(classifiedAt96s.status).toBe('waiting-background');
+
+        svc.ensureActiveWatcher(cid, undefined, -1);
+        await vi.advanceTimersByTimeAsync(100_000);
+
+        expect(runOf(svc, cid).status).toBe('waiting-background');
+        expect(notifySpy).not.toHaveBeenCalled();
+
+        // 3. Subagent returns SYSTEM_MESSAGE (step 36) and parent completes final report (step 37)
+        const completedParentLines = [
+          ...initialParentLines,
+          JSON.stringify({
+            step_index: 36,
+            type: 'SYSTEM_MESSAGE',
+            status: 'DONE',
+            content: `[Message] timestamp=2026-11-05T14:21:14Z sender=${childId} priority=MESSAGE_PRIORITY_HIGH content=Subagent research finished`,
+            created_at: new Date(Date.now() - 25_000).toISOString(),
+          }),
+          JSON.stringify({
+            step_index: 37,
+            type: 'PLANNER_RESPONSE',
+            status: 'DONE',
+            content: '两个仓库修复与回归测试已全部完成。',
+            created_at: new Date(Date.now() - 20_000).toISOString(),
+          }),
+        ];
+        writeFileSync(parentTranscriptPath, completedParentLines.join('\n') + '\n', 'utf8');
+
+        const parsedDone = parseTranscript(completedParentLines, -1, cid);
+        expect(parsedDone.hasActiveChildren).toBeFalsy();
+
+        mockRead.mockResolvedValue(
+          snap({
+            maxStepIndex: 37,
+            isFinished: parsedDone.isFinished,
+            engaged: parsedDone.engagedAfterInput,
+            plannerContents: parsedDone.plannerContents,
+            tailKind: parsedDone.tailKind,
+            activeBackgroundTasks: [],
+            hasActiveChildren: parsedDone.hasActiveChildren,
+            activeSubagentIds: parsedDone.activeSubagentIds,
+            lastActiveAt: parsedDone.lastActiveAt,
+          }),
+        );
+
+        await vi.advanceTimersByTimeAsync(35_000);
 
         expect(runOf(svc, cid).status).toBe('done');
         expect(notifySpy).toHaveBeenCalledTimes(1);

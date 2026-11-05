@@ -40,6 +40,7 @@ import {
   assessBackgroundTaskProgress,
   parseStructuredTrajectoryTasks,
   readStructuredTasksFromSqlite,
+  inspectChildSqliteTerminalState,
   mergeBackgroundTasks,
   type TranscriptSnapshot,
   type AutoContinueReason,
@@ -1790,8 +1791,18 @@ export class AntigravityService extends Service {
               }
             }
           } else if (step.type === 'SYSTEM_MESSAGE') {
-            const sender = String(step.sender ?? '').trim().toLowerCase();
-            if (sender === normalizedChildId) {
+            const candidateSenders = new Set<string>();
+            if (typeof step.sender === 'string' && step.sender.trim()) {
+              candidateSenders.add(step.sender.trim().toLowerCase());
+            }
+            if (typeof step.content === 'string' && step.content.length > 0) {
+              const senderRe = /(?:\bsender=|"sender"\s*:\s*")([a-zA-Z0-9_-]+)/gi;
+              let m: RegExpExecArray | null;
+              while ((m = senderRe.exec(step.content)) !== null) {
+                if (m[1]) candidateSenders.add(m[1].trim().toLowerCase());
+              }
+            }
+            if (candidateSenders.has(normalizedChildId)) {
               lastReturnStep = Math.max(lastReturnStep, idx >= 0 ? idx : 0);
             }
           }
@@ -1803,104 +1814,165 @@ export class AntigravityService extends Service {
     const enrichResult = (res: StructuredCascadeTasksResult): StructuredCascadeTasksResult => {
       if (!brainDir) return res;
       try {
-        // A. If this cascade spawned subagents, inspect .system_generated/subagents/
+        // A. Reconcile parent-child subagent relationships from both:
+        //    1) .system_generated/subagents/*.json (SUBAGENT_STATE_ALIVE / SUBAGENT_STATE_KILLED)
+        //    2) parent transcript (INVOKE_SUBAGENT / Created the following subagents / SYSTEM_MESSAGE)
         // Antigravity writes state="SUBAGENT_STATE_ALIVE" when spawning a subagent and
         // never updates the file on natural child completion (only on explicit kill).
-        // Therefore:
-        // 1. A bare SUBAGENT_STATE_ALIVE file must not override an authoritative
-        //    inactive result (authoritative-first). Only non-authoritative fallback uses
-        //    a bare ALIVE file as supplementary blocking evidence.
-        // 2. If the child conversation has a transcript on disk, inspect its real state:
-        //    an actively running child transcript blocks settle even when the parent's
-        //    INVOKE_SUBAGENT step already returned DONE, whereas a terminally completed
-        //    child transcript (or parent return SYSTEM_MESSAGE) is recognized as stale.
+        // Meanwhile, INVOKE_SUBAGENT immediately marks its own step DONE (3) once the child
+        // conversation is created, so Hub/SQLite getCascadeTasks on the parent may report
+        // authoritative:true, hasActiveChildren:false while the child is still running or
+        // before active child state is published.
+        // Reconciliation rules:
+        // - If child is verified terminal (killed in subagents/*.json, terminal child transcript
+        //   on disk, terminal child SQLite trajectory on disk, or returned SYSTEM_MESSAGE in
+        //   parent transcript after last dispatch), the child does not block settlement.
+        // - If child is verified running (running child transcript or running child SQLite),
+        //   OR if a parent-child relationship exists with no verifiable terminal evidence yet
+        //   (active flag unpublished / state conflict), CONSERVATIVELY WAIT (hasActiveChildren=true).
+        let parentLinesLoaded = false;
+        let parentLines: string[] | undefined;
+        const getParentLines = (): string[] | undefined => {
+          if (!parentLinesLoaded) {
+            parentLinesLoaded = true;
+            parentLines = readTranscriptLinesSync(cascadeId);
+          }
+          return parentLines;
+        };
+
+        const candidateChildrenMap = new Map<string, { childId: string; spawnStepIndex: number }>();
+        const killedChildIds = new Set<string>();
+
         const subagentsDir = path.join(brainDir, cascadeId, '.system_generated', 'subagents');
         if (existsSync(subagentsDir)) {
           const files = readdirSync(subagentsDir);
-          let hasLiveChild = false;
-          let aliveCount = 0;
-          let verifiedTerminalCount = 0;
-          let parentLinesLoaded = false;
-          let parentLines: string[] | undefined;
-          const getParentLines = (): string[] | undefined => {
-            if (!parentLinesLoaded) {
-              parentLinesLoaded = true;
-              parentLines = readTranscriptLinesSync(cascadeId);
-            }
-            return parentLines;
-          };
-
           for (const f of files) {
             if (!f.endsWith('.json')) continue;
             try {
               const subContent = readFileSync(path.join(subagentsDir, f), 'utf8');
               const parsedSub = JSON.parse(subContent);
-              if (parsedSub.state !== 'SUBAGENT_STATE_ALIVE') continue;
-              aliveCount++;
-
               const childId = String(parsedSub.conversationId || path.basename(f, '.json')).trim();
+              if (!childId) continue;
+              const normId = childId.toLowerCase();
               const spawnStepIndex =
                 typeof parsedSub.spawnStepIndex === 'number' ? parsedSub.spawnStepIndex : -1;
-              const childLines = childId ? readTranscriptLinesSync(childId) : undefined;
-              const returnedToParent = hasChildReturnedInParent(
-                getParentLines(),
-                childId,
-                spawnStepIndex,
-              );
-
-              if (childLines && childLines.length > 0) {
-                const childParsed = parseTranscript(childLines, -1, childId);
-                const childCanceled =
-                  Boolean(childParsed.hasCanceledStep) || hasStepsCanceledSync(childId);
-                const tailSettleable =
-                  childParsed.tailKind === 'assistant-text' ||
-                  childParsed.tailKind === 'checkpoint';
-                const childHasNoActiveTasks =
-                  !childParsed.activeBackgroundTasks ||
-                  childParsed.activeBackgroundTasks.length === 0;
-                const childTranscriptTerminal =
-                  childCanceled ||
-                  (Boolean(childParsed.isFinished || childParsed.checkpointAfterInput) &&
-                    !childParsed.pendingApproval &&
-                    !childParsed.error &&
-                    childHasNoActiveTasks &&
-                    tailSettleable &&
-                    childParsed.plannerContents.length > 0);
-
-                if (childTranscriptTerminal) {
-                  verifiedTerminalCount++;
-                  continue;
-                }
-
-                // Child transcript exists on disk and is still mid-turn / awaiting approval / running tasks
-                hasLiveChild = true;
-                break;
+              if (parsedSub.state === 'SUBAGENT_STATE_KILLED') {
+                killedChildIds.add(normId);
+              } else if (parsedSub.state === 'SUBAGENT_STATE_ALIVE') {
+                candidateChildrenMap.set(normId, { childId, spawnStepIndex });
               }
+            } catch {}
+          }
+        }
 
-              // No child transcript on disk: check if child already returned SYSTEM_MESSAGE in parent
-              if (returnedToParent) {
+        let parentHasUnnamedActiveChild = false;
+        const pLines = getParentLines();
+        if (pLines && pLines.length > 0) {
+          const parentParsed = parseTranscript(pLines, -1, cascadeId);
+          if (parentParsed.activeSubagentIds && parentParsed.activeSubagentIds.length > 0) {
+            for (const cid of parentParsed.activeSubagentIds) {
+              const normId = cid.trim().toLowerCase();
+              if (normId && !killedChildIds.has(normId) && !candidateChildrenMap.has(normId)) {
+                candidateChildrenMap.set(normId, { childId: cid.trim(), spawnStepIndex: -1 });
+              }
+            }
+          }
+          if (
+            parentParsed.hasActiveChildren &&
+            (!parentParsed.activeSubagentIds || parentParsed.activeSubagentIds.length === 0)
+          ) {
+            parentHasUnnamedActiveChild = true;
+          }
+        }
+
+        if (candidateChildrenMap.size > 0 || parentHasUnnamedActiveChild) {
+          const candidateDbDirs: string[] = [];
+          const parentOfBrain = path.dirname(brainDir);
+          if (parentOfBrain && parentOfBrain !== brainDir) {
+            candidateDbDirs.push(path.join(parentOfBrain, 'conversations'));
+          }
+          candidateDbDirs.push(brainDir);
+          const defaultBrain = path.join(getDefaultAppDataDir(), 'brain');
+          if (path.resolve(brainDir) === path.resolve(defaultBrain)) {
+            candidateDbDirs.push(path.join(getDefaultAppDataDir(), 'conversations'));
+          }
+
+          let hasLiveChild = parentHasUnnamedActiveChild;
+          let verifiedTerminalCount = 0;
+          const totalCandidates = candidateChildrenMap.size;
+
+          for (const [normId, { childId, spawnStepIndex }] of candidateChildrenMap.entries()) {
+            if (killedChildIds.has(normId)) {
+              verifiedTerminalCount++;
+              continue;
+            }
+
+            const childLines = readTranscriptLinesSync(childId);
+            if (childLines && childLines.length > 0) {
+              const childParsed = parseTranscript(childLines, -1, childId);
+              const childCanceled =
+                Boolean(childParsed.hasCanceledStep) || hasStepsCanceledSync(childId);
+              const tailSettleable =
+                childParsed.tailKind === 'assistant-text' ||
+                childParsed.tailKind === 'checkpoint';
+              const childHasNoActiveTasks =
+                !childParsed.activeBackgroundTasks ||
+                childParsed.activeBackgroundTasks.length === 0;
+              const childTranscriptTerminal =
+                childCanceled ||
+                (Boolean(childParsed.isFinished || childParsed.checkpointAfterInput) &&
+                  !childParsed.pendingApproval &&
+                  !childParsed.error &&
+                  childHasNoActiveTasks &&
+                  !childParsed.hasActiveChildren &&
+                  tailSettleable &&
+                  childParsed.plannerContents.length > 0);
+
+              if (childTranscriptTerminal) {
                 verifiedTerminalCount++;
                 continue;
               }
 
-              // Bare SUBAGENT_STATE_ALIVE file without child transcript or return message:
-              // Only non-authoritative fallback may treat bare ALIVE file as blocking evidence.
-              if (!res.authoritative) {
-                hasLiveChild = true;
-                break;
-              }
-            } catch {}
+              // Child transcript exists on disk and is still running / mid-turn / awaiting approval
+              hasLiveChild = true;
+              break;
+            }
+
+            // No child transcript on disk: inspect child SQLite trajectory if present
+            const sqliteState = inspectChildSqliteTerminalState(childId, candidateDbDirs);
+            if (sqliteState === 'terminal') {
+              verifiedTerminalCount++;
+              continue;
+            }
+            if (sqliteState === 'running') {
+              hasLiveChild = true;
+              break;
+            }
+
+            // Check if child already returned SYSTEM_MESSAGE in parent transcript
+            if (hasChildReturnedInParent(pLines, childId, spawnStepIndex)) {
+              verifiedTerminalCount++;
+              continue;
+            }
+
+            // Parent-child relationship exists (via SUBAGENT_STATE_ALIVE or unreturned
+            // INVOKE_SUBAGENT in parent transcript), but child has no verifiable terminal
+            // evidence in transcript, SQLite, or parent SYSTEM_MESSAGE (active flag unpublished
+            // or state conflict). Conservatively wait rather than emitting premature done.
+            hasLiveChild = true;
+            break;
           }
+
           if (hasLiveChild) {
             res.hasActiveChildren = true;
+            res.verifiedAllChildrenTerminal = false;
           } else if (
-            res.authoritative &&
-            res.hasActiveChildren &&
-            !res.isCascadeActive &&
-            aliveCount > 0 &&
-            verifiedTerminalCount === aliveCount
+            totalCandidates > 0 &&
+            verifiedTerminalCount === totalCandidates &&
+            !res.isCascadeActive
           ) {
             res.hasActiveChildren = false;
+            res.verifiedAllChildrenTerminal = true;
           }
         }
 
@@ -2299,12 +2371,16 @@ export class AntigravityService extends Service {
           structuredTasks.activeTasks,
           structuredTasks.allTasks,
         );
-        snap.hasActiveChildren = structuredTasks.hasActiveChildren;
+        snap.hasActiveChildren =
+          structuredTasks.hasActiveChildren ||
+          Boolean(snap.hasActiveChildren && !structuredTasks.verifiedAllChildrenTerminal);
       }
     } else if (structuredTasks.activeTasks.length > 0 || structuredTasks.allTasks.length > 0 || structuredTasks.hasActiveChildren) {
       if (snap) {
         snap.activeBackgroundTasks = mergeBackgroundTasks(snap.activeBackgroundTasks ?? [], structuredTasks.activeTasks);
-        snap.hasActiveChildren = structuredTasks.hasActiveChildren;
+        snap.hasActiveChildren =
+          structuredTasks.hasActiveChildren ||
+          Boolean(snap.hasActiveChildren && !structuredTasks.verifiedAllChildrenTerminal);
       }
     }
 
@@ -2778,12 +2854,16 @@ export class AntigravityService extends Service {
               structuredTasks.activeTasks,
               structuredTasks.allTasks,
             );
-            snap.hasActiveChildren = structuredTasks.hasActiveChildren;
+            snap.hasActiveChildren =
+              structuredTasks.hasActiveChildren ||
+              Boolean(snap.hasActiveChildren && !structuredTasks.verifiedAllChildrenTerminal);
           }
         } else if (structuredTasks.activeTasks.length > 0 || structuredTasks.allTasks.length > 0 || structuredTasks.hasActiveChildren) {
           if (snap) {
             snap.activeBackgroundTasks = mergeBackgroundTasks(snap.activeBackgroundTasks ?? [], structuredTasks.activeTasks);
-            snap.hasActiveChildren = structuredTasks.hasActiveChildren;
+            snap.hasActiveChildren =
+              structuredTasks.hasActiveChildren ||
+              Boolean(snap.hasActiveChildren && !structuredTasks.verifiedAllChildrenTerminal);
           }
         }
 
@@ -3197,6 +3277,10 @@ export class AntigravityService extends Service {
               (t) => !this.isTaskSilenced(cascadeId, t.taskId).infinite
             );
 
+            const freshHasActiveChildren =
+              freshTasks.hasActiveChildren ||
+              Boolean(freshSnap?.hasActiveChildren && !freshTasks.verifiedAllChildrenTerminal);
+
             const isConsistent =
               freshSnap &&
               !freshSnap.error &&
@@ -3206,7 +3290,7 @@ export class AntigravityService extends Service {
               freshStepNow === run.settleCandidateSnapshot.stepIndex &&
               freshHash === run.settleCandidateSnapshot.transcriptHash &&
               freshActiveTasks.length === 0 &&
-              !freshTasks.hasActiveChildren &&
+              !freshHasActiveChildren &&
               !freshTasks.isCascadeActive &&
               // D2: round 2 must agree that the launch observation window has
               // closed. `freshActiveTasks.length === 0` is only evidence of
@@ -3217,7 +3301,7 @@ export class AntigravityService extends Service {
               console.log(
                 `[antigravity] Cascade ${cascadeId} two-phase settle confirmation rejected: fresh read inconsistent with round 1 snapshot. `
                 + `(step: ${run.settleCandidateSnapshot.stepIndex} -> ${freshStepNow}, hashMatch: ${freshHash === run.settleCandidateSnapshot.transcriptHash}, `
-                + `tasks: ${freshActiveTasks.length}, activeChildren: ${freshTasks.hasActiveChildren}, cascadeActive: ${freshTasks.isCascadeActive}, authoritative: ${freshTasks.authoritative}). Resetting settle gate.`
+                + `tasks: ${freshActiveTasks.length}, activeChildren: ${freshHasActiveChildren}, cascadeActive: ${freshTasks.isCascadeActive}, authoritative: ${freshTasks.authoritative}). Resetting settle gate.`
               );
               run.settleCandidateSnapshot = undefined;
               stallSince = Date.now();
@@ -3524,10 +3608,14 @@ export class AntigravityService extends Service {
             structuredTasks.activeTasks,
             structuredTasks.allTasks,
           );
-          snap.hasActiveChildren = structuredTasks.hasActiveChildren;
+          snap.hasActiveChildren =
+            structuredTasks.hasActiveChildren ||
+            Boolean(snap.hasActiveChildren && !structuredTasks.verifiedAllChildrenTerminal);
         } else if (structuredTasks.activeTasks.length > 0 || structuredTasks.allTasks.length > 0 || structuredTasks.hasActiveChildren) {
           snap.activeBackgroundTasks = mergeBackgroundTasks(snap?.activeBackgroundTasks ?? [], structuredTasks.activeTasks);
-          snap.hasActiveChildren = structuredTasks.hasActiveChildren;
+          snap.hasActiveChildren =
+            structuredTasks.hasActiveChildren ||
+            Boolean(snap.hasActiveChildren && !structuredTasks.verifiedAllChildrenTerminal);
         }
       }
       const outsideGraceWindow = Date.now() - startedAt >= LAUNCH_OBSERVATION_GRACE_MS;

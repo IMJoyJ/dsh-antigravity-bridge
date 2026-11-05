@@ -98,6 +98,8 @@ export interface StructuredCascadeTasksResult {
   activeTasks: ActiveBackgroundTask[];
   allTasks: (ActiveBackgroundTask & { isActive?: boolean })[];
   hasActiveChildren: boolean;
+  /** True when all known child subagents have been positively verified terminal via child transcript/SQLite or parent return message. */
+  verifiedAllChildrenTerminal?: boolean;
   isCascadeActive?: boolean;
   /** Whether the cascade has been explicitly canceled or interrupted. */
   isCanceled?: boolean;
@@ -509,4 +511,66 @@ export function readStructuredTasksFromSqlite(
     console.warn(`[antigravity] Failed reading SQLite conversation ${cascadeId}:`, err);
     return undefined;
   }
+}
+
+/**
+ * Inspects a child subagent's SQLite conversation database to determine whether
+ * the child conversation is actively running, provably terminal, or unknown.
+ */
+export function inspectChildSqliteTerminalState(
+  childId: string,
+  candidateDbDirs: string[],
+): 'running' | 'terminal' | 'unknown' {
+  for (const dir of candidateDbDirs) {
+    if (!dir) continue;
+    const dbPath = join(dir, `${childId}.db`);
+    if (!existsSync(dbPath)) continue;
+    try {
+      const db = new DatabaseSync(dbPath, { readOnly: true });
+      try {
+        const rows = db
+          .prepare('SELECT idx, step_type, status, has_subtrajectory, task_details FROM steps ORDER BY idx ASC')
+          .all() as Array<{
+          idx: number;
+          step_type: number;
+          status: number;
+          has_subtrajectory: number;
+          task_details: Buffer | null;
+        }>;
+        if (rows.length === 0) return 'unknown';
+
+        const activeTaskIds = new Map<string, boolean>();
+        for (const row of rows) {
+          const active = isCortexStatusActive(row.status);
+          if (active) {
+            return 'running';
+          }
+          if (row.task_details) {
+            const td = decodeProtobufTaskDetails(Buffer.from(row.task_details));
+            if (td.id) {
+              const parts = td.id.split('/');
+              const rawId = (parts.length === 2 ? parts[1] : parts[0]).toLowerCase();
+              if (/^task-\d+$/.test(rawId)) {
+                activeTaskIds.set(rawId, active);
+              }
+            }
+          }
+        }
+        for (const [, isActive] of activeTaskIds) {
+          if (isActive) return 'running';
+        }
+
+        const lastRow = rows[rows.length - 1];
+        if (isCortexStatusTerminal(lastRow.status)) {
+          return 'terminal';
+        }
+        return 'unknown';
+      } finally {
+        db.close();
+      }
+    } catch {
+      return 'unknown';
+    }
+  }
+  return 'unknown';
 }

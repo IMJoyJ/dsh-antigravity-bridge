@@ -106,6 +106,8 @@ export interface TranscriptSnapshot {
   activeBackgroundTasks?: ActiveBackgroundTask[];
   /** 残余盲区①：whether subagent child sessions are currently active. */
   hasActiveChildren?: boolean;
+  /** Spawned subagent conversation IDs in this transcript that have not yet returned or been killed. */
+  activeSubagentIds?: string[];
   /** First created_at timestamp in transcript (anchors cascade start time). */
   firstCreatedAt?: string;
   /** Whether any step in the transcript carries explicit cancellation status. */
@@ -136,6 +138,8 @@ interface ParsedTranscript {
   activeBackgroundTasks: ActiveBackgroundTask[];
   /** 残余盲区①：whether subagent child sessions are currently active. */
   hasActiveChildren?: boolean;
+  /** Spawned subagent conversation IDs in this transcript that have not yet returned or been killed. */
+  activeSubagentIds?: string[];
   /** First created_at timestamp in transcript (anchors cascade start time). */
   firstCreatedAt?: string;
   /** Whether any step in the transcript carries explicit cancellation status. */
@@ -159,6 +163,8 @@ function classifyTranscriptStep(step: TranscriptStep): TranscriptTailKind {
  */
 export const OBSERVATIONAL_TOOL_NAMES = new Set([
   'manage_task',
+  'manage_subagents',
+  'invoke_subagent',
   'schedule',
   'view_file',
   'list_dir',
@@ -336,19 +342,38 @@ export function parseTranscript(
     }
   }
 
-  // Scan trajectory for active (uncompleted) background tasks
+  // Scan trajectory for active (uncompleted) background tasks and child subagents
   const tasksMap = new Map<string, TrackedBackgroundTask>();
+  interface TrackedSubagent {
+    childId: string;
+    startStepIndex: number;
+    lastDispatchStep: number;
+    returned: boolean;
+    killed: boolean;
+  }
+  const subagentsMap = new Map<string, TrackedSubagent>();
+  const pendingInvokeSubagentSteps: number[] = [];
   let lastTimerCondition: string | null = null;
   let lastToolWasSchedule = false;
   let lastDurationSeconds: number | undefined = undefined;
 
   for (const step of parsedSteps) {
+    const stepIdxForSub = step.step_index ?? 0;
     if (step.tool_calls) {
       for (const tc of step.tool_calls) {
-        const tName = tc.name || (tc as any).tool_name;
+        const tName = String(tc.name || (tc as any).tool_name || '').trim();
+        const rawTcArgs = tc.args ?? (tc as any).tool_args ?? (tc as any).arguments;
+        let tArgs: Record<string, any> | undefined;
+        if (typeof rawTcArgs === 'string') {
+          try {
+            tArgs = JSON.parse(rawTcArgs);
+          } catch {}
+        } else if (typeof rawTcArgs === 'object' && rawTcArgs !== null) {
+          tArgs = rawTcArgs as Record<string, any>;
+        }
+
         if (tName === 'schedule') {
           lastToolWasSchedule = true;
-          const tArgs = tc.args || (tc as any).tool_args;
           if (tArgs) {
             if (typeof tArgs.TimerCondition === 'string') {
               lastTimerCondition = tArgs.TimerCondition;
@@ -358,6 +383,49 @@ export function parseTranscript(
             } else if (typeof tArgs.DurationSeconds === 'string') {
               const parsedSec = parseInt(tArgs.DurationSeconds, 10);
               if (!Number.isNaN(parsedSec)) lastDurationSeconds = parsedSec;
+            }
+          }
+        } else if (tName === 'invoke_subagent' || tName === 'INVOKE_SUBAGENT') {
+          pendingInvokeSubagentSteps.push(stepIdxForSub);
+        } else if (tName === 'send_message' && tArgs) {
+          const rawRecipient = tArgs.Recipient ?? tArgs.recipient;
+          if (typeof rawRecipient === 'string') {
+            const recipient = rawRecipient.replace(/^"|"$/g, '').trim().toLowerCase();
+            if (
+              recipient &&
+              (subagentsMap.has(recipient) ||
+                /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(recipient))
+            ) {
+              const prev = subagentsMap.get(recipient);
+              subagentsMap.set(recipient, {
+                childId: recipient,
+                startStepIndex: prev?.startStepIndex ?? stepIdxForSub,
+                lastDispatchStep: stepIdxForSub,
+                returned: false,
+                killed: false,
+              });
+            }
+          }
+        } else if (tName === 'manage_subagents' && tArgs) {
+          const action = String(tArgs.Action ?? tArgs.action ?? '').replace(/^"|"$/g, '').trim().toLowerCase();
+          if (action === 'kill_all') {
+            for (const [, sub] of subagentsMap) {
+              sub.killed = true;
+            }
+            pendingInvokeSubagentSteps.length = 0;
+          } else if (action === 'kill') {
+            let convIds = tArgs.ConversationIds ?? tArgs.conversationIds;
+            if (typeof convIds === 'string') {
+              try {
+                convIds = JSON.parse(convIds);
+              } catch {}
+            }
+            if (Array.isArray(convIds)) {
+              for (const rawCid of convIds) {
+                const norm = String(rawCid ?? '').replace(/^"|"$/g, '').trim().toLowerCase();
+                const sub = subagentsMap.get(norm);
+                if (sub) sub.killed = true;
+              }
             }
           }
         }
@@ -372,6 +440,79 @@ export function parseTranscript(
       step.type === 'TOOL_RESULT' ||
       step.type === 'TOOL_EXECUTION' ||
       step.type === 'RUN_COMMAND';
+    const isSubagentStepType =
+      step.type === 'INVOKE_SUBAGENT' ||
+      step.type === 'CORTEX_STEP_TYPE_INVOKE_SUBAGENT' ||
+      step.type === 'MANAGE_SUBAGENTS';
+    const isViewFileOutput =
+      typeof step.content === 'string' &&
+      /(?:^|\n)File Path:\s*`?file:\/\/\//i.test(step.content.slice(0, 400));
+
+    if ((isLaunchStepType || isSubagentStepType) && !isViewFileOutput) {
+      const spawnedIds: string[] = [];
+      if (typeof step.content === 'string' && /Created the following subagents:/i.test(step.content)) {
+        const matches = step.content.matchAll(/"conversationId"\s*:\s*"([^"]+)"/gi);
+        for (const m of matches) {
+          if (m[1]) spawnedIds.push(m[1].trim().toLowerCase());
+        }
+      }
+      const structChildId =
+        (step as any).subagentDetails?.conversationId ||
+        (step as any).subagent_details?.conversation_id ||
+        (step as any).childConversationId ||
+        (step as any).child_conversation_id;
+      if (typeof structChildId === 'string' && structChildId.trim()) {
+        spawnedIds.push(structChildId.trim().toLowerCase());
+      }
+      if (spawnedIds.length > 0) {
+        if (pendingInvokeSubagentSteps.length > 0) {
+          pendingInvokeSubagentSteps.shift();
+        }
+        for (const cid of spawnedIds) {
+          subagentsMap.set(cid, {
+            childId: cid,
+            startStepIndex: stepIdxForSub,
+            lastDispatchStep: stepIdxForSub,
+            returned: false,
+            killed: false,
+          });
+        }
+      } else if (
+        (step.type === 'INVOKE_SUBAGENT' || step.type === 'CORTEX_STEP_TYPE_INVOKE_SUBAGENT') &&
+        pendingInvokeSubagentSteps.length === 0
+      ) {
+        pendingInvokeSubagentSteps.push(stepIdxForSub);
+      }
+
+      if (typeof step.content === 'string') {
+        if (/No active subagents|You have 0 active subagent/i.test(step.content)) {
+          for (const [, sub] of subagentsMap) {
+            if (sub.lastDispatchStep <= stepIdxForSub) {
+              sub.killed = true;
+            }
+          }
+          pendingInvokeSubagentSteps.length = 0;
+        } else {
+          const listMatch = step.content.match(/You have \d+ active subagent\(s\):\s*(\[[\s\S]*\])/i);
+          if (listMatch && listMatch[1]) {
+            try {
+              const listArr = JSON.parse(listMatch[1]);
+              if (Array.isArray(listArr)) {
+                for (const item of listArr) {
+                  const cid = String(item?.conversationId ?? '').trim().toLowerCase();
+                  const st = String(item?.state ?? '').trim().toLowerCase();
+                  if (cid && (st === 'idle' || st === 'errored' || st === 'subagent_state_killed')) {
+                    const sub = subagentsMap.get(cid);
+                    if (sub) sub.returned = true;
+                  }
+                }
+              }
+            } catch {}
+          }
+        }
+      }
+    }
+
     const structDetails = (step as any).taskDetails || (step as any).task_details;
     if (
       step.status === 'RUNNING' &&
@@ -569,15 +710,21 @@ export function parseTranscript(
     // 残余盲区②：结构化不可得的唯一例外。
     // IDE 层定时调度任务/计时器完成通知仅以 SYSTEM_MESSAGE 文本注入（携带 sender 或 Task id 引号文本），
     // 允许且仅保留这一条窄正则识别该通知，提取完成的任务 ID。
-    if (step.type === 'SYSTEM_MESSAGE' && typeof step.content === 'string') {
+    if (step.type === 'SYSTEM_MESSAGE') {
       const senders: string[] = [];
       if ((step as any).sender) senders.push(String((step as any).sender).trim());
 
-      const ideScheduleMatch = step.content.match(IDE_TIMER_SYSTEM_MESSAGE_REGEX);
-      if (ideScheduleMatch) {
-        const prefix = ideScheduleMatch[1]?.replace(/\/$/, '');
-        if (!prefix || !cascadeId || prefix === cascadeId) {
-          senders.push(ideScheduleMatch[2].toLowerCase());
+      if (typeof step.content === 'string') {
+        const ideScheduleMatch = step.content.match(IDE_TIMER_SYSTEM_MESSAGE_REGEX);
+        if (ideScheduleMatch) {
+          const prefix = ideScheduleMatch[1]?.replace(/\/$/, '');
+          if (!prefix || !cascadeId || prefix === cascadeId) {
+            senders.push(ideScheduleMatch[2].toLowerCase());
+          }
+        }
+        const subSenderMatches = step.content.matchAll(/(?:\bsender=|"sender"\s*:\s*")([a-zA-Z0-9_-]+)/gi);
+        for (const sm of subSenderMatches) {
+          if (sm[1]) senders.push(sm[1].trim());
         }
       }
 
@@ -588,6 +735,18 @@ export function parseTranscript(
           markTimerConditionSatisfied(matched.taskId);
         }
         markTimerConditionSatisfied(s);
+
+        const normSender = s.toLowerCase();
+        const trackedSub = subagentsMap.get(normSender);
+        if (trackedSub && stepIdxForSub > trackedSub.lastDispatchStep) {
+          trackedSub.returned = true;
+        } else if (
+          pendingInvokeSubagentSteps.length > 0 &&
+          pendingInvokeSubagentSteps[0] < stepIdxForSub &&
+          !/^task-\d+$/i.test(normSender)
+        ) {
+          pendingInvokeSubagentSteps.shift();
+        }
       }
     }
 
@@ -738,6 +897,16 @@ export function parseTranscript(
   }> = [];
 
   const cutIndex = result.userInputIndex >= 0 ? result.userInputIndex : baselineStepIndex;
+  const activeSubagentIds = Array.from(subagentsMap.values())
+    .filter((s) => !s.returned && !s.killed && s.lastDispatchStep > baselineStepIndex)
+    .map((s) => s.childId);
+  const hasPendingUnnamedInvoke = pendingInvokeSubagentSteps.some((idx) => idx > cutIndex);
+  if (activeSubagentIds.length > 0) {
+    result.activeSubagentIds = activeSubagentIds;
+    result.hasActiveChildren = true;
+  } else if (hasPendingUnnamedInvoke) {
+    result.hasActiveChildren = true;
+  }
   const relevantSteps = parsedSteps.filter((s) => s.step_index > cutIndex);
 
   for (const step of relevantSteps) {
@@ -1250,6 +1419,8 @@ export async function readCascadeTranscript(
     error: parsed.error,
     tailKind: parsed.tailKind,
     activeBackgroundTasks: activeTasks,
+    hasActiveChildren: parsed.hasActiveChildren,
+    activeSubagentIds: parsed.activeSubagentIds,
     firstCreatedAt: parsed.firstCreatedAt,
     hasCanceledStep: parsed.hasCanceledStep,
   };
@@ -1325,7 +1496,8 @@ export async function pollTranscript(
         const tailSettleable =
           latestParsed.tailKind !== 'tool-call' && latestParsed.tailKind !== 'tool-result';
         const hasActiveTasks =
-          Boolean(latestParsed.activeBackgroundTasks && latestParsed.activeBackgroundTasks.length > 0);
+          Boolean(latestParsed.activeBackgroundTasks && latestParsed.activeBackgroundTasks.length > 0) ||
+          Boolean(latestParsed.hasActiveChildren);
         if (
           !hasActiveTasks &&
           (latestParsed.checkpointAfterInput || (latestParsed.isFinished && tailSettleable && stable))
