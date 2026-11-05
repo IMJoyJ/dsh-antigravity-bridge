@@ -1,4 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { Context } from '@deepseek-ai/cordis';
 import {
   parseTranscript,
@@ -2555,5 +2558,599 @@ describe('AntigravityService Background Task Watcher Lifecycle', () => {
       expect(run.status).toBe('running');
       expect(notifySpy).not.toHaveBeenCalled();
     });
+
+    describe('6. Stale SUBAGENT_STATE_ALIVE vs Real Active Child Settlement Regression', () => {
+      let tempBrainDir: string;
+
+      beforeEach(() => {
+        tempBrainDir = mkdtempSync(join(tmpdir(), 'agy-subagent-test-'));
+      });
+
+      afterEach(() => {
+        if (tempBrainDir) {
+          rmSync(tempBrainDir, { recursive: true, force: true });
+        }
+      });
+
+      it('authoritative inactive + stale SUBAGENT_STATE_ALIVE file does not stick in waiting-background; read-only classify does not latch done and watcher notifies done once', async () => {
+        const { svc, sendMessage } = makeService();
+        const notifySpy = vi.spyOn(svc, 'notifySettlementToDsh');
+
+        const cid = 'cid-stale-subagent-alive';
+        const childId = 'child-stale-001';
+        const subagentsDir = join(tempBrainDir, cid, '.system_generated', 'subagents');
+        mkdirSync(subagentsDir, { recursive: true });
+        writeFileSync(
+          join(subagentsDir, `${childId}.json`),
+          JSON.stringify({
+            conversationId: childId,
+            state: 'SUBAGENT_STATE_ALIVE',
+            role: 'Codebase Researcher',
+            spawnStepIndex: 3,
+          }),
+          'utf8',
+        );
+
+        // Child transcript on disk is already terminally finished
+        const childLogsDir = join(tempBrainDir, childId, '.system_generated', 'logs');
+        mkdirSync(childLogsDir, { recursive: true });
+        writeFileSync(
+          join(childLogsDir, 'transcript.jsonl'),
+          [
+            JSON.stringify({
+              step_index: 0,
+              type: 'USER_INPUT',
+              status: 'DONE',
+              content: 'Investigate helper functions',
+              created_at: new Date(Date.now() - 60_000).toISOString(),
+            }),
+            JSON.stringify({
+              step_index: 5,
+              type: 'PLANNER_RESPONSE',
+              status: 'DONE',
+              content: 'Here is the complete research summary.',
+              created_at: new Date(Date.now() - 40_000).toISOString(),
+            }),
+          ].join('\n') + '\n',
+          'utf8',
+        );
+
+        // Authoritative Hub query reports parent inactive and no active children
+        (svc as any).getHubClient = async () => ({
+          sendMessage,
+          getCascadeTasks: async () => ({
+            activeTasks: [],
+            allTasks: [],
+            hasActiveChildren: false,
+            isCascadeActive: false,
+            authoritative: true,
+          }),
+        });
+
+        mockRead.mockResolvedValue(
+          snap({
+            maxStepIndex: 12,
+            isFinished: true,
+            engaged: true,
+            plannerContents: ['Final report after child completed.'],
+            tailKind: 'assistant-text',
+            activeBackgroundTasks: [],
+            lastActiveAt: new Date(Date.now() - 25_000).toISOString(),
+          }),
+        );
+
+        (svc as any).runs.set(cid, {
+          cascadeId: cid,
+          brainDir: tempBrainDir,
+          status: 'running',
+          startedAt: Date.now() - 35_000,
+          baselineStepIndex: -1,
+          turnSeq: 1,
+          priorContents: [],
+        });
+
+        // 1. Direct structured tasks check: stale ALIVE file must not flip hasActiveChildren to true
+        const taskRes = await svc.getStructuredCascadeTasks(cid, tempBrainDir, 12, true);
+        expect(taskRes.authoritative).toBe(true);
+        expect(taskRes.hasActiveChildren).toBe(false);
+
+        // 2. Read-only classifySnapshot must classify as 'done' (NOT 'waiting-background')
+        //    and must NOT latch run.status = 'done' before watcher settles
+        const classified = await (svc as any).classifySnapshot(tempBrainDir, cid, -1);
+        expect(classified.status).toBe('done');
+        expect(runOf(svc, cid).status).toBe('running');
+        expect(notifySpy).not.toHaveBeenCalled();
+
+        // 3. Watcher runs, enters done, and announces settlement exactly once
+        svc.ensureActiveWatcher(cid, undefined, -1);
+        await vi.advanceTimersByTimeAsync(30_000);
+
+        const run = runOf(svc, cid);
+        expect(run.status).toBe('done');
+        expect(notifySpy).toHaveBeenCalledTimes(1);
+      });
+
+      it('authoritative inactive + bare stale SUBAGENT_STATE_ALIVE file (without child dir) also settles to done once', async () => {
+        const { svc, sendMessage } = makeService();
+        const notifySpy = vi.spyOn(svc, 'notifySettlementToDsh');
+
+        const cid = 'cid-bare-stale-subagent';
+        const childId = 'child-bare-stale-002';
+        const subagentsDir = join(tempBrainDir, cid, '.system_generated', 'subagents');
+        mkdirSync(subagentsDir, { recursive: true });
+        writeFileSync(
+          join(subagentsDir, `${childId}.json`),
+          JSON.stringify({
+            conversationId: childId,
+            state: 'SUBAGENT_STATE_ALIVE',
+          }),
+          'utf8',
+        );
+
+        (svc as any).getHubClient = async () => ({
+          sendMessage,
+          getCascadeTasks: async () => ({
+            activeTasks: [],
+            allTasks: [],
+            hasActiveChildren: false,
+            isCascadeActive: false,
+            authoritative: true,
+          }),
+        });
+
+        mockRead.mockResolvedValue(
+          snap({
+            maxStepIndex: 9,
+            isFinished: true,
+            engaged: true,
+            plannerContents: ['Done.'],
+            tailKind: 'assistant-text',
+            activeBackgroundTasks: [],
+            lastActiveAt: new Date(Date.now() - 25_000).toISOString(),
+          }),
+        );
+
+        (svc as any).runs.set(cid, {
+          cascadeId: cid,
+          brainDir: tempBrainDir,
+          status: 'running',
+          startedAt: Date.now() - 35_000,
+          baselineStepIndex: -1,
+          turnSeq: 1,
+          priorContents: [],
+        });
+
+        svc.ensureActiveWatcher(cid, undefined, -1);
+        await vi.advanceTimersByTimeAsync(30_000);
+
+        expect(runOf(svc, cid).status).toBe('done');
+        expect(notifySpy).toHaveBeenCalledTimes(1);
+      });
+
+      it('real active child transcript on disk blocks settlement (waiting-background, no premature done) until child finishes', async () => {
+        const { svc, sendMessage } = makeService();
+        const notifySpy = vi.spyOn(svc, 'notifySettlementToDsh');
+
+        const cid = 'cid-real-active-child';
+        const childId = 'child-active-003';
+        const subagentsDir = join(tempBrainDir, cid, '.system_generated', 'subagents');
+        mkdirSync(subagentsDir, { recursive: true });
+        writeFileSync(
+          join(subagentsDir, `${childId}.json`),
+          JSON.stringify({
+            conversationId: childId,
+            state: 'SUBAGENT_STATE_ALIVE',
+            spawnStepIndex: 2,
+          }),
+          'utf8',
+        );
+
+        // Child transcript is currently mid-turn (tool-call tail, not finished)
+        const childLogsDir = join(tempBrainDir, childId, '.system_generated', 'logs');
+        mkdirSync(childLogsDir, { recursive: true });
+        const childTranscriptPath = join(childLogsDir, 'transcript.jsonl');
+        writeFileSync(
+          childTranscriptPath,
+          [
+            JSON.stringify({
+              step_index: 0,
+              type: 'USER_INPUT',
+              status: 'DONE',
+              content: 'Read files in repo',
+              created_at: new Date(Date.now() - 20_000).toISOString(),
+            }),
+            JSON.stringify({
+              step_index: 1,
+              type: 'PLANNER_RESPONSE',
+              status: 'DONE',
+              content: '',
+              tool_calls: [{ name: 'view_file', args: { AbsolutePath: '/tmp/a.ts' } }],
+              created_at: new Date(Date.now() - 10_000).toISOString(),
+            }),
+          ].join('\n') + '\n',
+          'utf8',
+        );
+
+        // Even though parent's INVOKE_SUBAGENT step is DONE in Hub (so Hub reports hasActiveChildren: false),
+        // the real active child transcript on disk MUST block premature done settlement!
+        (svc as any).getHubClient = async () => ({
+          sendMessage,
+          getCascadeTasks: async () => ({
+            activeTasks: [],
+            allTasks: [],
+            hasActiveChildren: false,
+            isCascadeActive: false,
+            authoritative: true,
+          }),
+        });
+
+        mockRead.mockResolvedValue(
+          snap({
+            maxStepIndex: 4,
+            isFinished: true,
+            engaged: true,
+            plannerContents: ['Waiting for read-only subagent...'],
+            tailKind: 'assistant-text',
+            activeBackgroundTasks: [],
+            lastActiveAt: new Date(Date.now() - 25_000).toISOString(),
+          }),
+        );
+
+        (svc as any).runs.set(cid, {
+          cascadeId: cid,
+          brainDir: tempBrainDir,
+          status: 'running',
+          startedAt: Date.now() - 35_000,
+          baselineStepIndex: -1,
+          turnSeq: 1,
+          priorContents: [],
+        });
+
+        const classifiedWhileActive = await (svc as any).classifySnapshot(tempBrainDir, cid, -1);
+        expect(classifiedWhileActive.status).toBe('waiting-background');
+
+        svc.ensureActiveWatcher(cid, undefined, -1);
+        await vi.advanceTimersByTimeAsync(35_000);
+
+        const run = runOf(svc, cid);
+        expect(run.status).toBe('waiting-background');
+        expect(notifySpy).not.toHaveBeenCalled();
+
+        // Now the child subagent finishes its turn and parent outputs final report
+        writeFileSync(
+          childTranscriptPath,
+          [
+            JSON.stringify({
+              step_index: 0,
+              type: 'USER_INPUT',
+              status: 'DONE',
+              content: 'Read files in repo',
+              created_at: new Date(Date.now() - 50_000).toISOString(),
+            }),
+            JSON.stringify({
+              step_index: 1,
+              type: 'PLANNER_RESPONSE',
+              status: 'DONE',
+              content: '',
+              tool_calls: [{ name: 'view_file', args: { AbsolutePath: '/tmp/a.ts' } }],
+              created_at: new Date(Date.now() - 40_000).toISOString(),
+            }),
+            JSON.stringify({
+              step_index: 2,
+              type: 'PLANNER_RESPONSE',
+              status: 'DONE',
+              content: 'Subagent finished reading all files.',
+              created_at: new Date(Date.now() - 5_000).toISOString(),
+            }),
+          ].join('\n') + '\n',
+          'utf8',
+        );
+
+        mockRead.mockResolvedValue(
+          snap({
+            maxStepIndex: 7,
+            isFinished: true,
+            engaged: true,
+            plannerContents: ['Waiting for read-only subagent...', 'All tasks complete.'],
+            tailKind: 'assistant-text',
+            activeBackgroundTasks: [],
+            lastActiveAt: new Date(Date.now() - 20_000).toISOString(),
+          }),
+        );
+
+        await vi.advanceTimersByTimeAsync(35_000);
+
+        expect(run.status).toBe('done');
+        expect(notifySpy).toHaveBeenCalledTimes(1);
+      });
+
+      it('authoritative active child (hasActiveChildren: true) keeps run in waiting-background without settling', async () => {
+        const { svc, sendMessage } = makeService();
+        const notifySpy = vi.spyOn(svc, 'notifySettlementToDsh');
+
+        const cid = 'cid-auth-active-child';
+        const childId = 'child-auth-active-004';
+        const subagentsDir = join(tempBrainDir, cid, '.system_generated', 'subagents');
+        mkdirSync(subagentsDir, { recursive: true });
+        writeFileSync(
+          join(subagentsDir, `${childId}.json`),
+          JSON.stringify({
+            conversationId: childId,
+            state: 'SUBAGENT_STATE_ALIVE',
+          }),
+          'utf8',
+        );
+
+        (svc as any).getHubClient = async () => ({
+          sendMessage,
+          getCascadeTasks: async () => ({
+            activeTasks: [],
+            allTasks: [],
+            hasActiveChildren: true,
+            isCascadeActive: false,
+            authoritative: true,
+          }),
+        });
+
+        mockRead.mockResolvedValue(
+          snap({
+            maxStepIndex: 6,
+            isFinished: true,
+            engaged: true,
+            plannerContents: ['Subagent still running according to Hub.'],
+            tailKind: 'assistant-text',
+            activeBackgroundTasks: [],
+            lastActiveAt: new Date(Date.now() - 25_000).toISOString(),
+          }),
+        );
+
+        (svc as any).runs.set(cid, {
+          cascadeId: cid,
+          brainDir: tempBrainDir,
+          status: 'running',
+          startedAt: Date.now() - 35_000,
+          baselineStepIndex: -1,
+          turnSeq: 1,
+          priorContents: [],
+        });
+
+        svc.ensureActiveWatcher(cid, undefined, -1);
+        await vi.advanceTimersByTimeAsync(35_000);
+
+        expect(runOf(svc, cid).status).toBe('waiting-background');
+        expect(notifySpy).not.toHaveBeenCalled();
+      });
+
+      it('T2: CANCELED step or output.txt context canceled + live child + waiting narration MUST NOT settle or latch done', async () => {
+        const { svc, sendMessage } = makeService();
+        const notifySpy = vi.spyOn(svc, 'notifySettlementToDsh');
+
+        const cid = 'cid-t2-canceled-step-live-child';
+        const childId = 'child-t2-live';
+        const subagentsDir = join(tempBrainDir, cid, '.system_generated', 'subagents');
+        mkdirSync(subagentsDir, { recursive: true });
+        writeFileSync(
+          join(subagentsDir, `${childId}.json`),
+          JSON.stringify({
+            conversationId: childId,
+            state: 'SUBAGENT_STATE_ALIVE',
+            spawnStepIndex: 10,
+          }),
+          'utf8',
+        );
+
+        // Step 5 output had "context canceled" earlier in the turn
+        const step5Dir = join(tempBrainDir, cid, '.system_generated', 'steps', '5');
+        mkdirSync(step5Dir, { recursive: true });
+        writeFileSync(join(step5Dir, 'output.txt'), 'Error: context canceled\n', 'utf8');
+
+        // Child subagent is actively running on disk
+        const childLogsDir = join(tempBrainDir, childId, '.system_generated', 'logs');
+        mkdirSync(childLogsDir, { recursive: true });
+        writeFileSync(
+          join(childLogsDir, 'transcript.jsonl'),
+          [
+            JSON.stringify({
+              step_index: 0,
+              type: 'USER_INPUT',
+              status: 'DONE',
+              content: 'Inspect test helpers',
+              created_at: new Date(Date.now() - 10_000).toISOString(),
+            }),
+          ].join('\n') + '\n',
+          'utf8',
+        );
+
+        (svc as any).getHubClient = async () => ({
+          sendMessage,
+          getCascadeTasks: async () => ({
+            activeTasks: [],
+            allTasks: [],
+            hasActiveChildren: false,
+            isCascadeActive: false,
+            hasCanceledStep: true,
+            isCanceled: true,
+            authoritative: true,
+          }),
+        });
+
+        mockRead.mockResolvedValue(
+          snap({
+            maxStepIndex: 12,
+            isFinished: true,
+            engaged: true,
+            hasCanceledStep: true,
+            plannerContents: ['等待只读子代理返回中...'],
+            tailKind: 'assistant-text',
+            activeBackgroundTasks: [],
+            lastActiveAt: new Date(Date.now() - 25_000).toISOString(),
+          }),
+        );
+
+        (svc as any).runs.set(cid, {
+          cascadeId: cid,
+          brainDir: tempBrainDir,
+          status: 'running',
+          startedAt: Date.now() - 35_000,
+          baselineStepIndex: -1,
+          turnSeq: 1,
+          priorContents: [],
+        });
+
+        // Read-only classify must return waiting-background, never done
+        const classified = await (svc as any).classifySnapshot(tempBrainDir, cid, -1);
+        expect(classified.status).toBe('waiting-background');
+
+        svc.ensureActiveWatcher(cid, undefined, -1);
+        await vi.advanceTimersByTimeAsync(35_000);
+
+        const run = runOf(svc, cid);
+        expect(run.status).toBe('waiting-background');
+        expect(notifySpy).not.toHaveBeenCalled();
+      });
+
+      it('T4: child-only waiting (empty activeTasks) emits waiting warning after 5m and emits timeout notice at watchMaxMs deadline', async () => {
+        const { svc, sendMessage } = makeService({ watchMaxMs: 360_000 });
+        const deliverSpy = vi.spyOn(svc, 'deliverMessageToAgent' as any).mockReturnValue(true);
+        const notifySpy = vi.spyOn(svc, 'notifySettlementToDsh');
+
+        const cid = 'cid-t4-child-only-wait';
+        (svc as any).getHubClient = async () => ({
+          sendMessage,
+          getCascadeTasks: async () => ({
+            activeTasks: [],
+            allTasks: [],
+            hasActiveChildren: true,
+            isCascadeActive: false,
+            authoritative: true,
+          }),
+        });
+
+        mockRead.mockResolvedValue(
+          snap({
+            maxStepIndex: 8,
+            isFinished: true,
+            engaged: true,
+            plannerContents: ['Waiting on child subagent...'],
+            tailKind: 'assistant-text',
+            activeBackgroundTasks: [],
+            lastActiveAt: new Date(Date.now() - 25_000).toISOString(),
+          }),
+        );
+
+        (svc as any).runs.set(cid, {
+          cascadeId: cid,
+          brainDir: tempBrainDir,
+          status: 'running',
+          startedAt: Date.now() - 35_000,
+          baselineStepIndex: -1,
+          turnSeq: 1,
+          priorContents: [],
+          callerAgentId: 'agent-main',
+        });
+
+        svc.ensureActiveWatcher(cid, undefined, -1);
+
+        // Advance 310s (> 5m episode threshold): child-only waiting warning MUST be emitted!
+        await vi.advanceTimersByTimeAsync(310_000);
+        expect(runOf(svc, cid).status).toBe('waiting-background');
+        expect(deliverSpy).toHaveBeenCalled();
+        const warnMsg = deliverSpy.mock.calls[0][1] as any;
+        expect(warnMsg.content[0].text).toContain('subagent');
+
+        // Advance past watchMaxMs (360s): waiting-background MUST transition to timeout and notify!
+        await vi.advanceTimersByTimeAsync(60_000);
+        expect(runOf(svc, cid).status).toBe('timeout');
+        expect(notifySpy).toHaveBeenCalledTimes(1);
+      });
+
+      it('T5: orphan waiting/running run with empty callerAgentId does not block other agents in hasActiveRuns/getActiveRuns', () => {
+        const { svc } = makeService();
+
+        (svc as any).runs.set('cid-orphan-subagent', {
+          cascadeId: 'cid-orphan-subagent',
+          status: 'running',
+          startedAt: Date.now() - 60_000,
+          turnSeq: 1,
+          priorContents: [],
+          // callerAgentId is undefined (orphan subagent run)
+        });
+
+        (svc as any).runs.set('cid-owned-by-alpha', {
+          cascadeId: 'cid-owned-by-alpha',
+          status: 'waiting-background',
+          callerAgentId: 'agent-alpha',
+          startedAt: Date.now() - 60_000,
+          turnSeq: 1,
+          priorContents: [],
+        });
+
+        // Orphan run must NOT make hasActiveRuns('agent-beta') true
+        expect(svc.hasActiveRuns('agent-beta')).toBe(false);
+        expect(svc.getActiveRuns('agent-beta')).toHaveLength(0);
+
+        // Agent alpha still sees its own active run
+        expect(svc.hasActiveRuns('agent-alpha')).toBe(true);
+        expect(svc.getActiveRuns('agent-alpha')).toHaveLength(1);
+
+        // Unfiltered hasActiveRuns() still sees active runs globally
+        expect(svc.hasActiveRuns()).toBe(true);
+      });
+
+      it('T7: false done followed by real done in same turn is not swallowed by transitionKey, and non-done status never renders Completed Successfully', () => {
+        const { svc } = makeService();
+        const deliverSpy = vi.spyOn(svc, 'deliverMessageToAgent' as any).mockReturnValue(true);
+
+        // 1. buildSettlementNotice on running / waiting-background must never say Completed Successfully
+        const runningNotice = buildSettlementNotice({
+          cascadeId: 'cid-t7-notice-check',
+          status: 'running',
+          startedAt: Date.now() - 30_000,
+          content: '等待只读子代理',
+          turnSeq: 1,
+          priorContents: [],
+        });
+        expect(runningNotice.summary).not.toContain('✅');
+        expect(runningNotice.summary).not.toContain('Completed Successfully');
+        expect(runningNotice.noticeText).not.toContain('Completed Successfully');
+
+        const waitingNotice = buildSettlementNotice({
+          cascadeId: 'cid-t7-notice-check',
+          status: 'waiting-background',
+          startedAt: Date.now() - 30_000,
+          content: '等待只读子代理',
+          turnSeq: 1,
+          priorContents: [],
+        });
+        expect(waitingNotice.summary).not.toContain('✅');
+        expect(waitingNotice.noticeText).not.toContain('Completed Successfully');
+
+        // 2. Suppose an earlier false done was recorded in turn 1 at step 23 with interim text
+        const run: HubRun = {
+          cascadeId: 'cid-t7-idempotency',
+          status: 'done',
+          startedAt: Date.now() - 60_000,
+          settledStepIndex: 23,
+          content: '等待只读子代理...',
+          turnSeq: 1,
+          priorContents: [],
+          callerAgentId: 'agent-main',
+        };
+        svc.notifySettlementToDsh(run);
+        expect(deliverSpy).toHaveBeenCalledTimes(1);
+
+        // Duplicate notification of the exact same state is still idempotent
+        svc.notifySettlementToDsh(run);
+        expect(deliverSpy).toHaveBeenCalledTimes(1);
+
+        // True done later in the same turn (step 45 or updated final content) MUST NOT be swallowed!
+        run.settledStepIndex = 45;
+        run.content = '最终完整报告：A 与 B 均已修复通过。';
+        svc.notifySettlementToDsh(run);
+        expect(deliverSpy).toHaveBeenCalledTimes(2);
+      });
+    });
   });
 });
+
+

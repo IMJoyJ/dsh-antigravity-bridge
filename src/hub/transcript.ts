@@ -320,6 +320,11 @@ export function parseTranscript(
           (typeof step.content === 'string' && /context canceled|explicitly canceled by the user/i.test(step.content))
         ) {
           hasCanceledStep = true;
+        } else if (
+          (step.type === 'USER_INPUT' || step.type === 'PLANNER_RESPONSE') &&
+          step.status === 'DONE'
+        ) {
+          hasCanceledStep = false;
         }
         fileMaxStepIndex = Math.max(fileMaxStepIndex, step.step_index);
         if (step.type === 'USER_INPUT' && step.status === 'DONE') {
